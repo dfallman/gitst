@@ -417,3 +417,17 @@ fn relevance_respects_info_exclude() {
     assert!(!rel.is_relevant(&root.join("scratch/x.tmp")));
     assert!(rel.is_relevant(&root.join("scratch/x.rs")));
 }
+
+#[test]
+fn fetch_times_out_and_returns() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.git(&["remote", "add", "origin", "ssh://example.invalid/x.git"]);
+    r.git(&["config", "core.sshCommand", "sh -c 'sleep 30' --"]);
+    let t = Instant::now();
+    let err = backend(&r)
+        .fetch(false, Duration::from_millis(500))
+        .unwrap_err();
+    assert_eq!(err, FetchError::Timeout);
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}

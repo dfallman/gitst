@@ -16,6 +16,8 @@ use crate::model::{
 
 /// Largest untracked file whose lines are counted for the `+N` column.
 const MAX_COUNTED_FILE: u64 = 1 << 20;
+/// How long a timed-out fetch gets to exit after SIGTERM.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Upper bound on remote-tracking reflogs read per refresh.
 const MAX_REMOTE_REFLOGS: usize = 10;
 
@@ -156,6 +158,23 @@ impl CliBackend {
                 .collect(),
             _ => meta_line(format!("binary · {}", human_size(meta.len()))),
         }
+    }
+
+    /// `git fetch` as run in the background.
+    pub(crate) fn fetch_command(&self, prune: bool) -> Command {
+        let mut cmd = self.command();
+        // No askpass helper, GUI credential manager or ssh passphrase dialog
+        // may pop up for a fetch the user did not start.
+        cmd.args(["-c", "credential.interactive=false", "fetch", "--quiet"])
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env("GCM_INTERACTIVE", "never");
+        if prune {
+            cmd.arg("--prune");
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd
     }
 
     /// Line count of a small text file, for untracked files' `+N`.
@@ -414,12 +433,7 @@ impl GitBackend for CliBackend {
     }
 
     fn fetch(&self, prune: bool, timeout: Duration) -> Result<(), FetchError> {
-        let mut cmd = self.command();
-        cmd.args(["fetch", "--quiet"]);
-        if prune {
-            cmd.arg("--prune");
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut cmd = self.fetch_command(prune);
         // A new session has no controlling terminal, so neither git nor ssh
         // can ever prompt over the TUI; it also lets us kill the whole group.
         unsafe {
@@ -447,10 +461,20 @@ impl GitBackend for CliBackend {
                     };
                 }
                 Ok(None) if start.elapsed() >= timeout => {
+                    // SIGTERM first: git removes its ref lock files on
+                    // SIGTERM but not on SIGKILL, and a leftover lock would
+                    // break the user's own next fetch.
+                    let group = -(child.id() as i32);
                     unsafe {
-                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                        libc::kill(group, libc::SIGTERM);
                     }
-                    let _ = child.kill();
+                    let grace = Instant::now();
+                    while grace.elapsed() < KILL_GRACE && matches!(child.try_wait(), Ok(None)) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    unsafe {
+                        libc::kill(group, libc::SIGKILL);
+                    }
                     let _ = child.wait();
                     return Err(FetchError::Timeout);
                 }
@@ -458,5 +482,44 @@ impl GitBackend for CliBackend {
                 Err(e) => return Err(FetchError::Other(e.to_string())),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    fn backend() -> CliBackend {
+        let p = std::path::PathBuf::from("/tmp");
+        CliBackend::new(Repo {
+            root: p.clone(),
+            git_dir: p.clone(),
+            common_dir: p,
+        })
+    }
+
+    #[test]
+    fn fetch_disables_every_prompt() {
+        let cmd = backend().fetch_command(false);
+        let envs: HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+        let env = |k: &str| {
+            envs.get(OsStr::new(k))
+                .copied()
+                .flatten()
+                .and_then(OsStr::to_str)
+        };
+        assert_eq!(env("GIT_TERMINAL_PROMPT"), Some("0"));
+        assert_eq!(
+            env("GIT_ASKPASS"),
+            Some(""),
+            "empty disables core.askPass and SSH_ASKPASS in git"
+        );
+        assert_eq!(env("SSH_ASKPASS"), Some(""));
+        assert_eq!(env("SSH_ASKPASS_REQUIRE"), Some("never"));
+        assert_eq!(env("GCM_INTERACTIVE"), Some("never"));
+        let args: Vec<_> = cmd.get_args().filter_map(OsStr::to_str).collect();
+        assert!(args.contains(&"credential.interactive=false"), "{args:?}");
     }
 }
