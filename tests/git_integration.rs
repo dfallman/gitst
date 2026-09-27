@@ -471,3 +471,43 @@ fn diff_details_survive_colour_and_blank_line_config() {
             .any(|l| l.kind == DiffKind::Add && l.text == "4")
     );
 }
+
+#[test]
+fn untracked_fifo_and_symlink_do_not_hang_detail() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let fifo = r.path().join("pipe");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::os::unix::fs::symlink("/dev/zero", r.path().join("zero")).unwrap();
+    let b = Arc::new(backend(&r));
+    for path in ["pipe", "zero"] {
+        let (tx, rx) = channel();
+        let b = b.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(b.detail(&DetailReq::File { path: path.into() }));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|_| panic!("{path}: detail hung"));
+        let DetailData::File(blocks) = got.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            blocks[0].lines[0].kind,
+            DiffKind::Meta,
+            "{path}: {blocks:?}"
+        );
+    }
+    // Snapshotting (which counts untracked lines) must not hang either.
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(b.snapshot(&opts()).is_ok());
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(true));
+}

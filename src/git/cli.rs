@@ -143,7 +143,9 @@ impl CliBackend {
 
     fn untracked_lines(&self, rel: &str) -> Vec<DiffLine> {
         let path = self.repo.root.join(rel);
-        let Ok(meta) = std::fs::metadata(&path) else {
+        // Never follow links or open special files: a FIFO or a link to
+        // /dev/zero would block or never end.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             return Vec::new();
         };
         let meta_line = |text: String| {
@@ -152,8 +154,17 @@ impl CliBackend {
                 text,
             }]
         };
+        if meta.is_symlink() {
+            let target = std::fs::read_link(&path)
+                .map(|t| t.display().to_string())
+                .unwrap_or_default();
+            return meta_line(format!("symlink → {target}"));
+        }
         if meta.is_dir() {
             return meta_line("directory".into());
+        }
+        if !meta.is_file() {
+            return meta_line("not a regular file".into());
         }
         if meta.len() > MAX_COUNTED_FILE {
             return meta_line(format!("large file · {}", human_size(meta.len())));
@@ -204,7 +215,7 @@ impl CliBackend {
     /// Line count of a small text file, for untracked files' `+N`.
     fn count_lines(&self, rel: &str) -> Option<u32> {
         let path = self.repo.root.join(rel);
-        let meta = std::fs::metadata(&path).ok()?;
+        let meta = std::fs::symlink_metadata(&path).ok()?;
         if !meta.is_file() || meta.len() > MAX_COUNTED_FILE {
             return None;
         }
