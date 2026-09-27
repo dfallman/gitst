@@ -1,5 +1,6 @@
 mod common;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -7,6 +8,7 @@ use std::time::{Duration, Instant};
 use common::TestRepo;
 use gitst::git::{CliBackend, DiscoverError, FetchError, GitBackend, Repo, SnapshotOpts};
 use gitst::model::*;
+use gitst::watch::{self, Relevance};
 use gitst::worker::{self, FetchStatus, UiMsg, WorkerConfig, WorkerMsg};
 
 fn opts() -> SnapshotOpts {
@@ -371,4 +373,47 @@ fn worker_manual_fetch_reports_status() {
     });
     assert_eq!(live.text, "fetch · up to date");
     w.send(WorkerMsg::Shutdown).unwrap();
+}
+
+#[test]
+fn relevance_respects_gitignore() {
+    let r = TestRepo::new();
+    r.write(".gitignore", "target/\n");
+    r.write("sub/.gitignore", "*.log\n!keep.log\n");
+    r.commit_file("a", "1", "one");
+    let root = r.path().canonicalize().unwrap();
+    let mut rel = Relevance::new(&Repo::discover(&root).ok().unwrap());
+    assert!(rel.is_relevant(&root.join("src/main.rs")));
+    assert!(!rel.is_relevant(&root.join("target/debug/x")));
+    assert!(!rel.is_relevant(&root.join("sub/x.log")));
+    assert!(rel.is_relevant(&root.join("sub/keep.log")));
+    assert!(rel.is_relevant(&root.join(".gitignore")));
+    assert!(rel.is_relevant(&root.join(".git/HEAD")));
+    assert!(!rel.is_relevant(&root.join(".git/objects/aa/bb")));
+    assert!(!rel.is_relevant(Path::new("/somewhere/else")));
+}
+
+#[test]
+fn watcher_signals_refresh() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let (tx, rx) = channel();
+    let _h = watch::spawn(&Repo::discover(&r.path()).ok().unwrap(), tx).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    r.write("a", "2");
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Ok(WorkerMsg::Refresh)
+    ));
+}
+
+#[test]
+fn relevance_respects_info_exclude() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    std::fs::write(r.path().join(".git/info/exclude"), "*.tmp\n").unwrap();
+    let root = r.path().canonicalize().unwrap();
+    let mut rel = Relevance::new(&Repo::discover(&root).ok().unwrap());
+    assert!(!rel.is_relevant(&root.join("scratch/x.tmp")));
+    assert!(rel.is_relevant(&root.join("scratch/x.rs")));
 }
