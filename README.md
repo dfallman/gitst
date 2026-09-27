@@ -1,6 +1,6 @@
 # gitst
 
-A live, glanceable git status monitor for a small terminal pane.
+A real-time, glanceable interactive **git status monitor** typically used in a small terminal pane alongside a coding agent and other terminal panes.
 
 Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, herdr, WezTerm etc.) next to for instance a coding agent and a shell, and show what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges and rebases.
 
