@@ -1,0 +1,30 @@
+[package]
+name = "gitst"
+version = "0.1.0"
+edition = "2024"
+description = "Live, glanceable git status TUI for small terminal panes"
+license = "MIT"
+repository = "https://github.com/dfallman/gitst"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+dirs = "6"
+ignore = "0.4"
+libc = "0.2"
+notify = "8"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+terminal-colorsaurus = "1.0"
+toml = "1"
+unicode-width = "0.2"
+
+[dev-dependencies]
+insta = "1"
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
