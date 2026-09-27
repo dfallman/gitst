@@ -9,8 +9,9 @@ read-only monitor. Apart from `git fetch`, it never changes your repository, and
 never takes git's `index.lock`, so it cannot get in the way of git commands run in
 other panes.
 
-<img width="800" alt="gitst screenshot" src="https://github.com/user-attachments/assets/8eb005f3-d29d-4fd4-85c3-6c548edb6217" />
-
+<p align="center">
+<img width="600" alt="gitst screenshot" src="https://github.com/user-attachments/assets/8eb005f3-d29d-4fd4-85c3-6c548edb6217" />
+</p>
 
 ## Install
 
