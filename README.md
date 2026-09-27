@@ -12,7 +12,7 @@ Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, h
   <img width="600" alt="gitst" src="https://github.com/user-attachments/assets/0c8e5064-4fa1-4c00-8bbd-d9a40ce6797b" />
 </p>
 
-Note that by design, gitst is **read-only monitor**. The purpose of gitst is to *monitor*, not *manipulate* git. This has a number of benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or you want to control git manually. As gitst is read only, apart from `git fetch`, it never changes your git repository, and it never takes git's `index.lock`, so it cannot get in the way or obstruct git commands run elsewhere.
+Note that by design, the purpose of gitst is to *monitor*, not *manipulate* git. This has a number of benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or you want to control git manually. As gitst is read only, apart from `git fetch`, it never changes your git repository, and it never takes git's `index.lock`, so it cannot get in the way or obstruct git commands run elsewhere.
 
 ## Install
 
@@ -38,8 +38,8 @@ Run `gitst` inside a repository, or `gitst <path>`. If the directory is not a
 repository yet, gitst waits and picks it up once `git init` or `git clone` has
 run there.
 
-It adapts to the pane: sections collapse, borders give way to rules, and columns
-drop out as the pane shrinks, down to a single `branch ↑1 ●` line.
+It does its best to adapt to the terminal window it operates in: sections collapse, borders give way to rules, and columns
+drop out as the pane shrinks, down to a single `branch ↑1 ●` line. Mouse support is enabled by default, so you can easily click around in the interface, collapse and expand panels, and view details by clicking on items. Gitst is also entirely operable using its keyboard shortcuts (see below).
 
 The dashboard has five sections:
 
