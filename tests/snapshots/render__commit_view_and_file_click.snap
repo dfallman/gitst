@@ -1,0 +1,20 @@
+---
+source: tests/render.rs
+expression: out
+---
+ ‹ back  commit 4de1e3c                ↻ 2m 
+ commit 4de1e3c00000000000000000000000000000
+ Dan · 2m ago · 04:43                       
+                                            
+ icons: jug on cream                        
+                                            
+ All ten sizes, soft shadow.                
+                                            
+── 2 files ─────────────────────────────────
+ Assets/icon.png                  bin       
+ project.yml                    +4 −1 ■■■   
+                                            
+                                            
+                                            
+                                            
+ esc back  w wrap  q quit

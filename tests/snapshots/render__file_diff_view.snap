@@ -1,0 +1,18 @@
+---
+source: tests/render.rs
+expression: "draw(&mut app, 44, 14)"
+---
+ ‹ back  src/app.rs                    ↻ 2m 
+── Staged ──────────────────────────────────
+@@ -1 +1 @@ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+-use a;                                     
++use b;                                     
+                                            
+── Unstaged ────────────────────────────────
+@@ -10,3 +10,3 @@ fn main() { ╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+     let x = 1;                             
+-    old();                                 
++    new();                                 
+\ No newline at end of file                 
+                                            
+ esc back  w wrap  q quit

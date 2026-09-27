@@ -14,7 +14,7 @@ use super::theme::Theme;
 use super::{line_lr, now_secs, spans_width, truncate_spans};
 use crate::activity::{ActivityKind, merged};
 use crate::app::{Action, App, NavItem, ScrollTarget, Target};
-use crate::model::{Change, Snapshot};
+use crate::model::{Change, Commit, Snapshot};
 
 /// Most activity rows kept in the section.
 const ACTIVITY_ROWS: usize = 100;
@@ -288,7 +288,7 @@ fn build(
 
 /// A row of `left`, a flexible `middle` cut to fit, and `right` flush right,
 /// all within `w` cells after a one-space indent.
-fn row(
+pub(crate) fn row(
     left: Vec<Span<'static>>,
     middle: Vec<Span<'static>>,
     right: Vec<Span<'static>>,
@@ -324,7 +324,11 @@ fn status_spans(c: &Change, theme: &Theme) -> Vec<Span<'static>> {
     ]
 }
 
-fn stats_spans(added: Option<u32>, removed: Option<u32>, theme: &Theme) -> Vec<Span<'static>> {
+pub(crate) fn stats_spans(
+    added: Option<u32>,
+    removed: Option<u32>,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     match (added, removed) {
         (Some(a), Some(r)) => {
             let mut v = Vec::new();
@@ -344,7 +348,7 @@ fn stats_spans(added: Option<u32>, removed: Option<u32>, theme: &Theme) -> Vec<S
 }
 
 /// Up to five cells, more for bigger changes, split green/red by ratio.
-fn meter(added: Option<u32>, removed: Option<u32>, theme: &Theme) -> Vec<Span<'static>> {
+pub(crate) fn meter(added: Option<u32>, removed: Option<u32>, theme: &Theme) -> Vec<Span<'static>> {
     let (a, r) = (added.unwrap_or(0) as f64, removed.unwrap_or(0) as f64);
     let total = a + r;
     let cells = if total == 0.0 {
@@ -507,36 +511,44 @@ fn commits(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> V
     }
     snap.commits
         .iter()
-        .map(|c| {
-            let marker = if c.unpushed {
-                Span::styled("↑", Style::new().fg(theme.accent))
-            } else if c.parents > 1 {
-                Span::styled("◇", theme.dim)
-            } else {
-                Span::raw(" ")
-            };
-            let left = vec![
-                Span::styled(c.short.clone(), Style::new().fg(theme.modified)),
-                Span::raw(" "),
-                marker,
-                Span::raw(" "),
-            ];
-            let mut middle = vec![Span::raw(c.subject.clone())];
-            if w >= 48 {
-                for tag in c.refs.iter().filter_map(|r| r.strip_prefix("tag: ")) {
-                    middle.push(Span::styled(
-                        format!(" [{tag}]"),
-                        Style::new().fg(theme.accent),
-                    ));
-                }
-            }
-            let line = row(left, middle, age_span(c.time, app, theme, d), w);
-            Row {
-                line,
-                target: Some(Target::Commit(c.oid.clone())),
-            }
+        .map(|c| Row {
+            line: commit_row(c, app, theme, w, d),
+            target: Some(Target::Commit(c.oid.clone())),
         })
         .collect()
+}
+
+/// `4de1e3c ↑ subject [tag]   2m`
+pub(crate) fn commit_row(
+    c: &Commit,
+    app: &App,
+    theme: &Theme,
+    w: usize,
+    d: Density,
+) -> Line<'static> {
+    let marker = if c.unpushed {
+        Span::styled("↑", Style::new().fg(theme.accent))
+    } else if c.parents > 1 {
+        Span::styled("◇", theme.dim)
+    } else {
+        Span::raw(" ")
+    };
+    let left = vec![
+        Span::styled(c.short.clone(), Style::new().fg(theme.modified)),
+        Span::raw(" "),
+        marker,
+        Span::raw(" "),
+    ];
+    let mut middle = vec![Span::raw(c.subject.clone())];
+    if w >= 48 {
+        for tag in c.refs.iter().filter_map(|r| r.strip_prefix("tag: ")) {
+            middle.push(Span::styled(
+                format!(" [{tag}]"),
+                Style::new().fg(theme.accent),
+            ));
+        }
+    }
+    row(left, middle, age_span(c.time, app, theme, d), w)
 }
 
 fn branches(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> Vec<Row> {

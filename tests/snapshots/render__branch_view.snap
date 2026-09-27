@@ -1,0 +1,16 @@
+---
+source: tests/render.rs
+expression: "draw(&mut app, 44, 12)"
+---
+ ‹ back  branch main                   ↻ 2m 
+── ahead of origin/main (2) ────────────────
+ 4de1e3c ↑ icons: jug on cream           2m 
+ ebf9d60 ↑ pin engine to v0.1.9          1h 
+                                            
+                                            
+                                            
+                                            
+                                            
+                                            
+                                            
+ esc back  w wrap  q quit

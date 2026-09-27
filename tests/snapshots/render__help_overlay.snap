@@ -1,0 +1,26 @@
+---
+source: tests/render.rs
+expression: "draw(&mut app, 44, 22)"
+---
+ main ↑2 ↓0 ●                          ↻ 2m 
+ origin/main · v0.1.9+4 · stash 1           
+╭ ▾ Changes (5) ────────────────── +64 −12 ╮
+│ ?╭ gitst ─────────────────────────────╮  │
+│  │ click       open · fold · button   │  │
+│  │ wheel       scroll                 │  │
+│  │ right-click back                   │  │
+│ A│                                    │  │
+╰──│ j k ↑ ↓     move                   │──╯
+╭ ▾│ enter l     open                   │──╮
+│ 0│ esc h       back                   │m │
+│ 0│ tab         next section           │… │
+│ 0│ space       fold section           │  │
+│ 0│ g G         top / bottom           │  │
+╰──│ f           fetch now              │──╯
+╭ ▾│ w           wrap long lines        │2 ╮
+│ 4│ ?           close help             │m │
+│ +│ q           quit                   │  │
+╰──╰────────────────────────────────────╯──╯
+  ▸ Branches (4)                            
+  ▸ Stashes (1)                             
+ ? help  f fetch  q quit

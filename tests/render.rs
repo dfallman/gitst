@@ -368,3 +368,176 @@ fn loading_before_first_snapshot() {
     let out = draw(&mut app, 44, 10);
     assert!(out.contains("loading"), "{out}");
 }
+
+fn open(app: &mut App, target: Target) {
+    app.perform(gitst::app::Action::Open(target));
+}
+
+fn diff_block(title: &str, lines: &[(DiffKind, &str)]) -> DiffBlock {
+    DiffBlock {
+        title: title.into(),
+        lines: lines
+            .iter()
+            .map(|(k, t)| DiffLine {
+                kind: *k,
+                text: t.to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn file_data() -> DetailData {
+    DetailData::File(vec![
+        diff_block(
+            "Staged",
+            &[
+                (DiffKind::Hunk, "@@ -1 +1 @@"),
+                (DiffKind::Del, "use a;"),
+                (DiffKind::Add, "use b;"),
+            ],
+        ),
+        diff_block(
+            "Unstaged",
+            &[
+                (DiffKind::Hunk, "@@ -10,3 +10,3 @@ fn main() {"),
+                (DiffKind::Context, "    let x = 1;"),
+                (DiffKind::Del, "    old();"),
+                (DiffKind::Add, "    new();"),
+                (DiffKind::Meta, "\\ No newline at end of file"),
+            ],
+        ),
+    ])
+}
+
+#[test]
+fn file_diff_view() {
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("src/app.rs".into()));
+    assert!(draw(&mut app, 44, 14).contains("loading"));
+    app.handle(UiMsg::Detail(
+        DetailReq::File {
+            path: "src/app.rs".into(),
+        },
+        Ok(file_data()),
+    ));
+    insta::assert_snapshot!(draw(&mut app, 44, 14));
+}
+
+#[test]
+fn clean_file_shows_no_changes() {
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("a".into()));
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Ok(DetailData::File(vec![])),
+    ));
+    assert!(draw(&mut app, 44, 10).contains("✓ no changes"));
+}
+
+#[test]
+fn detail_error_is_shown() {
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("a".into()));
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Err("bad revision".into()),
+    ));
+    assert!(draw(&mut app, 44, 10).contains("bad revision"));
+}
+
+#[test]
+fn commit_view_and_file_click() {
+    let mut app = new_app(fixture());
+    let oid = "4de1e3c0000000000000000000000000000000000".to_string();
+    open(&mut app, Target::Commit(oid.clone()));
+    let detail = CommitDetail {
+        oid: oid.clone(),
+        author: "Dan".into(),
+        time: at(120),
+        message: "icons: jug on cream\n\nAll ten sizes, soft shadow.".into(),
+        files: vec![
+            ("Assets/icon.png".into(), None, None),
+            ("project.yml".into(), Some(4), Some(1)),
+        ],
+    };
+    app.handle(UiMsg::Detail(
+        DetailReq::Commit { rev: oid.clone() },
+        Ok(DetailData::Commit(detail)),
+    ));
+    let out = draw(&mut app, 44, 16);
+    insta::assert_snapshot!(out);
+    let y = out.lines().position(|l| l.contains("project.yml")).unwrap() as u16;
+    app.handle(click(5, y));
+    assert_eq!(
+        app.stack.last().unwrap().target,
+        Target::CommitFile {
+            rev: oid,
+            path: "project.yml".into()
+        }
+    );
+}
+
+#[test]
+fn branch_view() {
+    let mut app = new_app(fixture());
+    open(
+        &mut app,
+        Target::Branch {
+            name: "main".into(),
+            upstream: Some("origin/main".into()),
+        },
+    );
+    let snap = fixture();
+    let data = DetailData::Branch {
+        ahead: snap.commits[..2].to_vec(),
+        behind: vec![],
+    };
+    app.handle(UiMsg::Detail(
+        DetailReq::Branch {
+            name: "main".into(),
+            upstream: "origin/main".into(),
+        },
+        Ok(data),
+    ));
+    insta::assert_snapshot!(draw(&mut app, 44, 12));
+}
+
+#[test]
+fn help_overlay() {
+    let mut app = new_app(fixture());
+    app.handle(key('?'));
+    insta::assert_snapshot!(draw(&mut app, 44, 22));
+    app.handle(click(1, 1));
+    assert!(!app.help);
+}
+
+#[test]
+fn wrap_toggle_changes_output() {
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("a".into()));
+    let long = "x".repeat(70);
+    let data = DetailData::File(vec![diff_block("Unstaged", &[(DiffKind::Add, &long)])]);
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Ok(data),
+    ));
+    let clipped = draw(&mut app, 30, 10);
+    app.handle(key('w'));
+    let wrapped = draw(&mut app, 30, 10);
+    assert_ne!(clipped, wrapped);
+    assert!(wrapped.matches("xxxxxxxxxx").count() > clipped.matches("xxxxxxxxxx").count());
+}
+
+#[test]
+fn detail_scroll_is_clamped() {
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("a".into()));
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Ok(file_data()),
+    ));
+    app.handle(key('G'));
+    let out = draw(&mut app, 44, 8);
+    assert!(app.stack[0].scroll <= 10, "{}", app.stack[0].scroll);
+    assert!(out.contains("new();"), "{out}");
+}
