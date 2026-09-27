@@ -1,0 +1,69 @@
+#!/bin/sh
+#
+# post-commit hook: bumps the version in Cargo.toml on every commit.
+#
+# Versions are X.Y.Z. Each commit bumps Z and is amended to carry the bump,
+# so the working tree stays clean.
+#
+#   MINOR_VERSION_UPGRADE in the message bumps Y and resets Z.
+#   MAJOR_VERSION_UPGRADE in the message bumps X and resets Y and Z.
+#   A commit that already changes the version (set by hand, or an amend of a
+#   bumped commit) is left alone.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+# The amend below runs post-commit again.
+[ -n "$GITST_VERSION_BUMP" ] && exit 0
+
+GIT_DIR="$(git rev-parse --git-dir)"
+
+# Leave commits made by rebase, cherry-pick, revert and merge alone.
+if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ] \
+	|| [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] || [ -f "$GIT_DIR/REVERT_HEAD" ]; then
+	exit 0
+fi
+git rev-parse -q --verify HEAD^2 >/dev/null && exit 0
+# A root commit keeps the version it was made with.
+git rev-parse -q --verify HEAD^ >/dev/null || exit 0
+
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+version_at() {
+	git show "$1:Cargo.toml" 2>/dev/null \
+		| sed -n 's/^version = "\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' | head -n 1
+}
+
+VERSION="$(version_at HEAD)"
+[ -n "$VERSION" ] || exit 0
+
+# Amending would sweep uncommitted edits to these files into the commit.
+if [ -n "$(git status --porcelain -- Cargo.toml Cargo.lock)" ]; then
+	echo "post-commit: Cargo.toml or Cargo.lock has local changes; version not bumped" >&2
+	exit 0
+fi
+
+NEW="$VERSION"
+if [ "$VERSION" = "$(version_at HEAD^)" ]; then
+	MAJOR="$(echo "$VERSION" | cut -d. -f1)"
+	MINOR="$(echo "$VERSION" | cut -d. -f2)"
+	PATCH="$(echo "$VERSION" | cut -d. -f3)"
+	MSG="$(git log -1 --pretty=%B)"
+	if echo "$MSG" | grep -q "MAJOR_VERSION_UPGRADE"; then
+		MAJOR=$((MAJOR + 1)) MINOR=0 PATCH=0
+	elif echo "$MSG" | grep -q "MINOR_VERSION_UPGRADE"; then
+		MINOR=$((MINOR + 1)) PATCH=0
+	else
+		PATCH=$((PATCH + 1))
+	fi
+	NEW="$MAJOR.$MINOR.$PATCH"
+	# Only the first `version =` line: the [package] one.
+	perl -pi -e "\$d ||= s/^version = \"[0-9.]+\"/version = \"$NEW\"/" Cargo.toml
+fi
+# Keep Cargo.lock in step, also after a hand edit, so release builds can use
+# --locked.
+perl -0pi -e "s/(\[\[package\]\]\nname = \"gitst\"\nversion = \")[0-9.]+/\${1}$NEW/" Cargo.lock
+
+git diff --quiet -- Cargo.toml Cargo.lock && exit 0
+git add Cargo.toml Cargo.lock
+GITST_VERSION_BUMP=1 git commit --amend --no-edit --no-verify --quiet
+[ "$NEW" = "$VERSION" ] || echo "gitst $VERSION -> $NEW"

@@ -16,8 +16,18 @@ Note that by design, gitst is **read-only monitor**. The purpose of gitst is to 
 
 ## Install
 
+With Homebrew (macOS and Linux):
+
 ```sh
-cargo install --path .
+brew install dfallman/tap/gitst
+```
+
+Prebuilt binaries for macOS, Linux and Windows are on the
+[releases page](https://github.com/dfallman/gitst/releases). Or build from source
+with Cargo:
+
+```sh
+cargo install --git https://github.com/dfallman/gitst
 ```
 
 Requires `git` on your `PATH`.
@@ -72,10 +82,12 @@ than 10 seconds, failed fetches and config errors.
 
 ```
 gitst [PATH] [--no-fetch] [--interval <DURATION>]
+gitst --version
 ```
 
 - `--no-fetch` turns off background fetching. `↻` and `f` still fetch.
 - `--interval 10m` sets the time between background fetches (`30s`, `5m`, `1h`).
+- `-V` / `--version` prints the version.
 
 ## Config
 
@@ -114,3 +126,19 @@ and `stashes`. An invalid file is reported in the UI and the defaults are used.
   records them in the remote-tracking reflog.
 - Changes are picked up by watching the working tree and `.git`, skipping
   ignored paths. If the watcher cannot start, gitst polls every 3 seconds.
+
+## Versioning
+
+Versions are `X.Y.Z`, kept in `Cargo.toml`. With the repository's hooks turned on
+(`git config core.hooksPath .githooks`), every commit bumps `Z`. Put
+`MINOR_VERSION_UPGRADE` in a commit message to bump `Y`, or
+`MAJOR_VERSION_UPGRADE` to bump `X`. A commit that sets the version by hand keeps
+it.
+
+Pushing a tag that matches the version builds a GitHub release for macOS, Linux
+and Windows and updates the Homebrew formula in
+[dfallman/homebrew-tap](https://github.com/dfallman/homebrew-tap):
+
+```sh
+git tag 0.1.1 && git push origin 0.1.1
+```

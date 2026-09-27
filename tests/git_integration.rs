@@ -472,6 +472,7 @@ fn diff_details_survive_colour_and_blank_line_config() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn untracked_fifo_and_symlink_do_not_hang_detail() {
     let r = TestRepo::new();

@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -17,6 +16,7 @@ use crate::model::{
 /// Largest untracked file whose lines are counted for the `+N` column.
 const MAX_COUNTED_FILE: u64 = 1 << 20;
 /// How long a timed-out fetch gets to exit after SIGTERM.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Upper bound on remote-tracking reflogs read per refresh.
 const MAX_REMOTE_REFLOGS: usize = 10;
@@ -470,14 +470,7 @@ impl GitBackend for CliBackend {
 
     fn fetch(&self, prune: bool, timeout: Duration) -> Result<(), FetchError> {
         let mut cmd = self.fetch_command(prune);
-        // A new session has no controlling terminal, so neither git nor ssh
-        // can ever prompt over the TUI; it also lets us kill the whole group.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        detach(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| FetchError::Other(e.to_string()))?;
         let mut stderr = child.stderr.take().expect("stderr is piped");
         let reader = std::thread::spawn(move || {
@@ -497,20 +490,7 @@ impl GitBackend for CliBackend {
                     };
                 }
                 Ok(None) if start.elapsed() >= timeout => {
-                    // SIGTERM first: git removes its ref lock files on
-                    // SIGTERM but not on SIGKILL, and a leftover lock would
-                    // break the user's own next fetch.
-                    let group = -(child.id() as i32);
-                    unsafe {
-                        libc::kill(group, libc::SIGTERM);
-                    }
-                    let grace = Instant::now();
-                    while grace.elapsed() < KILL_GRACE && matches!(child.try_wait(), Ok(None)) {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    unsafe {
-                        libc::kill(group, libc::SIGKILL);
-                    }
+                    terminate(&mut child);
                     let _ = child.wait();
                     return Err(FetchError::Timeout);
                 }
@@ -519,6 +499,53 @@ impl GitBackend for CliBackend {
             }
         }
     }
+}
+
+/// Cuts a fetch off from the terminal so neither git nor ssh can ever prompt
+/// over the TUI.
+#[cfg(unix)]
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // A new session has no controlling terminal; it also lets `terminate`
+    // kill the whole group.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Without a console there is nothing for git or ssh to prompt on.
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// Stops a timed-out fetch and everything it started.
+#[cfg(unix)]
+fn terminate(child: &mut std::process::Child) {
+    // SIGTERM first: git removes its ref lock files on SIGTERM but not on
+    // SIGKILL, and a leftover lock would break the user's own next fetch.
+    let group = -(child.id() as i32);
+    unsafe {
+        libc::kill(group, libc::SIGTERM);
+    }
+    let grace = Instant::now();
+    while grace.elapsed() < KILL_GRACE && matches!(child.try_wait(), Ok(None)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn terminate(child: &mut std::process::Child) {
+    // Windows has no gentle stop for a console process without a console.
+    let _ = child.kill();
 }
 
 #[cfg(test)]
