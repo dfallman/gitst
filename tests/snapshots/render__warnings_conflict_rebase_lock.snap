@@ -1,0 +1,24 @@
+---
+source: tests/render.rs
+expression: "render(44, 20, s)"
+---
+ @4de1e3c rebase 3/7 ↑2 ↓0 ●           ↻ 2m 
+ origin/main · v0.1.9+4 · stash 1           
+ ⚠ 1 conflict                               
+ ⚠ index.lock held 42s                      
+╭ ▾ Changes (6) ────────────────── +67 −13 ╮
+│ UU conflict.rs             +3 −1 ■■■     │
+│ ?? notes.md                   +3 ■■      │
+│ +4 more                                  │
+╰──────────────────────────────────────────╯
+╭ ▾ Activity ──────────────────────────────╮
+│ 04:43 commit 4de1e3c icons: jug on cream │
+│ +3 more                                  │
+╰──────────────────────────────────────────╯
+╭ ▾ Commits ─────────────────────────── ↑2 ╮
+│ 4de1e3c ↑ icons: jug on cream         2m │
+│ +3 more                                  │
+╰──────────────────────────────────────────╯
+  ▸ Branches (4)                            
+  ▸ Stashes (1)                             
+ ? help  f fetch  q quit

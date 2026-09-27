@@ -29,6 +29,8 @@ pub struct ActivityEvent {
     pub time: i64,
     pub kind: ActivityKind,
     pub text: String,
+    /// Commit the event refers to, when clicking it can open one.
+    pub rev: Option<String>,
 }
 
 /// Turns a reflog entry into a timeline event, or `None` for noise such as
@@ -39,6 +41,7 @@ pub fn classify(e: &ReflogEntry) -> Option<ActivityEvent> {
             time: e.time,
             kind,
             text,
+            rev: Some(e.short.clone()),
         })
     };
     if let Some(remote) = e.refname.strip_prefix("refs/remotes/") {
@@ -118,6 +121,7 @@ pub fn diff_snapshots(
         time: now,
         kind,
         text,
+        rev: None,
     };
     if !changed.is_empty() {
         let moved_to_index = |to_index: bool| {
@@ -271,6 +275,21 @@ mod tests {
     }
 
     #[test]
+    fn reflog_events_carry_their_commit() {
+        assert_eq!(
+            classify(&e("HEAD", "commit: x")).unwrap().rev.as_deref(),
+            Some("abc1234")
+        );
+        assert_eq!(
+            classify(&e("refs/remotes/origin/main", "update by push"))
+                .unwrap()
+                .rev
+                .as_deref(),
+            Some("abc1234")
+        );
+    }
+
+    #[test]
     fn classify_remote_messages() {
         assert_eq!(
             classify(&e("refs/remotes/origin/main", "update by push"))
@@ -296,7 +315,8 @@ mod tests {
             vec![ActivityEvent {
                 time: 5,
                 kind: ActivityKind::Files,
-                text: "2 files changed".into()
+                text: "2 files changed".into(),
+                rev: None
             }]
         );
         assert_eq!(paths, vec!["a", "b"]);
@@ -349,11 +369,13 @@ mod tests {
                 time: 20,
                 kind: ActivityKind::Files,
                 text: "x".into(),
+                rev: None,
             },
             ActivityEvent {
                 time: 20,
                 kind: ActivityKind::Files,
                 text: "x".into(),
+                rev: None,
             },
         ];
         let m = merged(

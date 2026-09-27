@@ -1,0 +1,12 @@
+---
+source: tests/render.rs
+expression: "render(24, 8, fixture())"
+---
+ main ↑2 ↓0 ●      ↻ 2m 
+ ▾ Changes (5) ──────── 
+ ?? notes.md            
+ +4 more                
+ ▸ Activity             
+ ▸ Commits           ↑2 
+ ▸ Branches (4)         
+ ▸ Stashes (1)

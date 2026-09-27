@@ -749,6 +749,7 @@ mod tests {
             time: 1,
             kind: crate::activity::ActivityKind::Fetch,
             text: "x".into(),
+            rev: None,
         }));
         assert_eq!(a.live.len(), 1);
         a.handle(UiMsg::Fetch(FetchStatus {

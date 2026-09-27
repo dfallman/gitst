@@ -1,0 +1,32 @@
+---
+source: tests/render.rs
+expression: "render(44, 28, fixture())"
+---
+ main ↑2 ↓0 ●                          ↻ 2m 
+ origin/main · v0.1.9+4 · stash 1           
+╭ ▾ Changes (5) ────────────────── +64 −12 ╮
+│ ?? notes.md                   +3 ■■      │
+│  D old.rs                     −2 ■■      │
+│  M src/app.rs             +42 −7 ■■■■■   │
+│  M src/git.rs              +9 −3 ■■■■    │
+│ A  src/watch.rs              +10 ■■■■    │
+╰──────────────────────────────────────────╯
+╭ ▾ Activity ──────────────────────────────╮
+│ 04:43 commit 4de1e3c icons: jug on cream │
+│ 03:45 commit ebf9d60 pin engine to v0.1… │
+│ 03:40 pushed origin/main 59eb9c3         │
+│ 03:22 checkout main                      │
+╰──────────────────────────────────────────╯
+╭ ▾ Commits ─────────────────────────── ↑2 ╮
+│ 4de1e3c ↑ icons: jug on cream         2m │
+│ ebf9d60 ↑ pin engine to v0.1.9        1h │
+│ 59eb9c3   xcode settings in project.… 1h │
+│ 8e6bbde   release v0.1.9              2h │
+╰──────────────────────────────────────────╯
+  ▸ Branches (4)                            
+  ▸ Stashes (1)                             
+                                            
+                                            
+                                            
+                                            
+ ? help  f fetch  q quit

@@ -167,6 +167,7 @@ impl Worker {
                         time: now,
                         kind: ActivityKind::Fetch,
                         text,
+                        rev: None,
                     }));
                 }
                 self.schedule_first_fetch(&snap);
