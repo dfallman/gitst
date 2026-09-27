@@ -127,18 +127,3 @@ and `stashes`. An invalid file is reported in the UI and the defaults are used.
 - Changes are picked up by watching the working tree and `.git`, skipping
   ignored paths. If the watcher cannot start, gitst polls every 3 seconds.
 
-## Versioning
-
-Versions are `X.Y.Z`, kept in `Cargo.toml`. With the repository's hooks turned on
-(`git config core.hooksPath .githooks`), every commit bumps `Z`. Put
-`MINOR_VERSION_UPGRADE` in a commit message to bump `Y`, or
-`MAJOR_VERSION_UPGRADE` to bump `X`. A commit that sets the version by hand keeps
-it.
-
-Pushing a tag that matches the version builds a GitHub release for macOS, Linux
-and Windows and updates the Homebrew formula in
-[dfallman/homebrew-tap](https://github.com/dfallman/homebrew-tap):
-
-```sh
-git tag 0.1.1 && git push origin 0.1.1
-```
