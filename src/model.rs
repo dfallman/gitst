@@ -21,7 +21,10 @@ pub struct Upstream {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepoOp {
     Merge,
-    Rebase { step: Option<u32>, total: Option<u32> },
+    Rebase {
+        step: Option<u32>,
+        total: Option<u32>,
+    },
     CherryPick,
     Revert,
     Bisect,
@@ -43,7 +46,13 @@ impl Change {
     pub fn conflicted(&self) -> bool {
         matches!(
             (self.x, self.y),
-            ('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U')
+            ('D', 'D')
+                | ('A', 'U')
+                | ('U', 'D')
+                | ('U', 'A')
+                | ('D', 'U')
+                | ('A', 'A')
+                | ('U', 'U')
         )
     }
 
@@ -146,4 +155,65 @@ impl Snapshot {
     pub fn is_dirty(&self) -> bool {
         !self.changes.is_empty()
     }
+}
+
+/// Something the UI can ask the worker to load for a detail view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DetailReq {
+    /// Staged, unstaged or untracked contents of a working-tree path.
+    File {
+        path: String,
+    },
+    Commit {
+        rev: String,
+    },
+    CommitFile {
+        rev: String,
+        path: String,
+    },
+    Branch {
+        name: String,
+        upstream: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffKind {
+    Add,
+    Del,
+    Context,
+    Hunk,
+    Meta,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffBlock {
+    pub title: String,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub oid: String,
+    pub author: String,
+    pub time: i64,
+    pub message: String,
+    pub files: Vec<(String, Option<u32>, Option<u32>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DetailData {
+    File(Vec<DiffBlock>),
+    Commit(CommitDetail),
+    CommitFile(Vec<DiffBlock>),
+    Branch {
+        ahead: Vec<Commit>,
+        behind: Vec<Commit>,
+    },
 }

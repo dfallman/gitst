@@ -1,6 +1,6 @@
 //! Pure parsers for git's machine-readable output.
 
-use crate::model::{Branch, Change, Commit, ReflogEntry, Stash, TagInfo};
+use crate::model::{Branch, Change, Commit, DiffKind, DiffLine, ReflogEntry, Stash, TagInfo};
 
 pub const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%at%x1f%an%x1f%D%x1f%s%x1e";
 pub const BRANCH_FORMAT: &str = "%(refname:short)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(committerdate:unix)%1f%(HEAD)%1e";
@@ -22,7 +22,9 @@ pub struct StatusHeader {
 pub fn parse_status(raw: &[u8]) -> (StatusHeader, Vec<Change>) {
     let mut header = StatusHeader::default();
     let mut changes = Vec::new();
-    let mut fields = raw.split(|b| *b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .map(|f| String::from_utf8_lossy(f).into_owned());
 
     while let Some(field) = fields.next() {
         if let Some(h) = field.strip_prefix("# ") {
@@ -120,9 +122,11 @@ fn count(s: &str) -> Option<u32> {
 /// Parses `git diff --numstat -z`. Renames report the new path.
 pub fn parse_numstat(raw: &[u8]) -> Vec<NumstatEntry> {
     let mut out = Vec::new();
-    let mut fields = raw.split(|b| *b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .map(|f| String::from_utf8_lossy(f).into_owned());
     while let Some(field) = fields.next() {
-        let mut parts = field.splitn(3, '\t');
+        let mut parts = field.trim_start_matches('\n').splitn(3, '\t');
         let (Some(a), Some(r), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
@@ -221,7 +225,49 @@ pub fn parse_describe(s: &str) -> Option<TagInfo> {
     if !hash.starts_with('g') || name.is_empty() {
         return None;
     }
-    Some(TagInfo { name: name.to_string(), distance })
+    Some(TagInfo {
+        name: name.to_string(),
+        distance,
+    })
+}
+
+/// Parses unified diff output into display lines, dropping file headers.
+pub fn parse_diff(raw: &[u8]) -> Vec<DiffLine> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = Vec::new();
+    let mut in_header = false;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with("diff ") {
+            in_header = true;
+            continue;
+        }
+        let (kind, body) = if line.starts_with("@@") {
+            in_header = false;
+            (DiffKind::Hunk, line)
+        } else if in_header {
+            if line.starts_with("Binary files") {
+                (DiffKind::Meta, line)
+            } else {
+                continue;
+            }
+        } else if let Some(rest) = line.strip_prefix('+') {
+            (DiffKind::Add, rest)
+        } else if let Some(rest) = line.strip_prefix('-') {
+            (DiffKind::Del, rest)
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            (DiffKind::Context, rest)
+        } else if line.starts_with('\\') {
+            (DiffKind::Meta, line)
+        } else {
+            continue;
+        };
+        out.push(DiffLine {
+            kind,
+            text: body.replace('\t', "    "),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -248,7 +294,10 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
     fn entries() {
         let (_, c) = parse_status(S);
         assert_eq!(c.len(), 5);
-        assert_eq!((c[0].path.as_str(), c[0].x, c[0].y), ("src/app.rs", ' ', 'M'));
+        assert_eq!(
+            (c[0].path.as_str(), c[0].x, c[0].y),
+            ("src/app.rs", ' ', 'M')
+        );
         assert_eq!(c[1].path, "new file.rs");
         assert!(c[1].staged());
         assert_eq!(c[2].path, "r.txt");
@@ -306,7 +355,10 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
             "refs/remotes/origin/main",
             b"730d813\x1forigin/main@{1790484333}\x1fupdate by push\x1e\n",
         );
-        assert_eq!((r[0].time, r[0].message.as_str()), (1790484333, "update by push"));
+        assert_eq!(
+            (r[0].time, r[0].message.as_str()),
+            (1790484333, "update by push")
+        );
         assert_eq!(r[0].refname, "refs/remotes/origin/main");
         assert_eq!(r[0].short, "730d813");
     }
@@ -317,5 +369,32 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         assert_eq!((t.name.as_str(), t.distance), ("v0.1.9", 4));
         assert_eq!(parse_describe("rel-2-0-12-gdead").unwrap().name, "rel-2-0");
         assert!(parse_describe("garbage").is_none());
+    }
+
+    #[test]
+    fn diff_lines() {
+        let raw = b"diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@ fn\n ctx\n-old\n+new\n\\ No newline at end of file\n";
+        let d = parse_diff(raw);
+        let kinds: Vec<_> = d.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DiffKind::Hunk,
+                DiffKind::Context,
+                DiffKind::Del,
+                DiffKind::Add,
+                DiffKind::Meta
+            ]
+        );
+        assert_eq!(d[0].text, "@@ -1,2 +1,2 @@ fn");
+        assert_eq!(d[2].text, "old");
+    }
+
+    #[test]
+    fn diff_expands_tabs_and_keeps_binary_note() {
+        let d =
+            parse_diff(b"diff --git a/i b/i\nBinary files a/i and b/i differ\n@@ -1 +1 @@\n+\tx\n");
+        assert_eq!(d[0].kind, DiffKind::Meta);
+        assert_eq!(d[2].text, "    x");
     }
 }

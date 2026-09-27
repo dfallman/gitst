@@ -5,7 +5,11 @@ use gitst::git::{CliBackend, DiscoverError, GitBackend, Repo, SnapshotOpts};
 use gitst::model::*;
 
 fn opts() -> SnapshotOpts {
-    SnapshotOpts { max_changes: 1000, numstat_max_files: 500, commits: 50 }
+    SnapshotOpts {
+        max_changes: 1000,
+        numstat_max_files: 500,
+        commits: 50,
+    }
 }
 
 fn backend(r: &TestRepo) -> CliBackend {
@@ -21,7 +25,11 @@ fn unborn_repo() {
     let r = TestRepo::new();
     r.write("a.txt", "x\n");
     let s = snap(&r);
-    assert!(matches!(s.head, Head::Unborn(ref b) if b == "main"), "{:?}", s.head);
+    assert!(
+        matches!(s.head, Head::Unborn(ref b) if b == "main"),
+        "{:?}",
+        s.head
+    );
     assert_eq!(s.changes.len(), 1);
     assert_eq!(s.changes[0].added, Some(1));
     assert!(s.commits.is_empty());
@@ -37,7 +45,13 @@ fn changes_numstat_and_commits() {
     let s = snap(&r);
     let a = s.changes.iter().find(|c| c.path == "a.txt").unwrap();
     assert_eq!((a.added, a.removed), (Some(2), Some(1)));
-    assert!(s.changes.iter().find(|c| c.path == "b.txt").unwrap().staged());
+    assert!(
+        s.changes
+            .iter()
+            .find(|c| c.path == "b.txt")
+            .unwrap()
+            .staged()
+    );
     assert_eq!(s.commits[0].subject, "first");
     assert!(matches!(s.head, Head::Branch(ref b) if b == "main"));
     assert!(s.oid.is_some());
@@ -50,17 +64,26 @@ fn push_ahead_behind_and_reflog() {
     r.with_bare_remote();
     r.commit_file("a", "2", "two");
     let s = snap(&r);
-    assert_eq!(s.upstream.as_ref().map(|u| (u.ahead, u.behind)), Some((1, 0)));
+    assert_eq!(
+        s.upstream.as_ref().map(|u| (u.ahead, u.behind)),
+        Some((1, 0))
+    );
     assert!(s.commits[0].unpushed && !s.commits[1].unpushed);
     r.git(&["push", "-q"]);
     let s = snap(&r);
     assert!(
-        s.reflog.iter().any(|e| e.refname == "refs/remotes/origin/main" && e.message == "update by push"),
+        s.reflog
+            .iter()
+            .any(|e| e.refname == "refs/remotes/origin/main" && e.message == "update by push"),
         "{:?}",
         s.reflog
     );
     assert!(s.has_remote);
-    assert!(s.reflog.iter().any(|e| e.refname == "HEAD" && e.message == "commit: two"));
+    assert!(
+        s.reflog
+            .iter()
+            .any(|e| e.refname == "HEAD" && e.message == "commit: two")
+    );
 }
 
 #[test]
@@ -88,7 +111,17 @@ fn stopped_rebase() {
     r.git(&["checkout", "-q", "c1"]);
     let _ = r.try_git(&["rebase", "main"]);
     let s = snap(&r);
-    assert!(matches!(s.op, Some(RepoOp::Rebase { step: Some(1), total: Some(1) })), "{:?}", s.op);
+    assert!(
+        matches!(
+            s.op,
+            Some(RepoOp::Rebase {
+                step: Some(1),
+                total: Some(1)
+            })
+        ),
+        "{:?}",
+        s.op
+    );
     assert!(matches!(s.head, Head::Detached(_)));
 }
 
@@ -119,7 +152,10 @@ fn stale_index_lock_detected() {
 #[test]
 fn discover_errors() {
     let d = tempfile::tempdir().unwrap();
-    assert!(matches!(Repo::discover(d.path()), Err(DiscoverError::NotARepo)));
+    assert!(matches!(
+        Repo::discover(d.path()),
+        Err(DiscoverError::NotARepo)
+    ));
 }
 
 #[test]
@@ -137,7 +173,96 @@ fn max_changes_caps_list() {
         r.write(&format!("f{i}"), "x");
     }
     let s = backend(&r)
-        .snapshot(&SnapshotOpts { max_changes: 3, numstat_max_files: 500, commits: 50 })
+        .snapshot(&SnapshotOpts {
+            max_changes: 3,
+            numstat_max_files: 500,
+            commits: 50,
+        })
         .unwrap();
     assert_eq!((s.changes.len(), s.changes_omitted), (3, 2));
+}
+
+#[test]
+fn file_and_commit_details() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1\n", "one");
+    r.write("a", "2\n");
+    r.write("u.txt", "hi\n");
+    let b = backend(&r);
+    let DetailData::File(blocks) = b.detail(&DetailReq::File { path: "a".into() }).unwrap() else {
+        panic!()
+    };
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].title, "Unstaged");
+    assert!(
+        blocks[0]
+            .lines
+            .iter()
+            .any(|l| l.kind == DiffKind::Add && l.text == "2")
+    );
+    let DetailData::File(u) = b
+        .detail(&DetailReq::File {
+            path: "u.txt".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(u[0].title, "Untracked");
+    assert_eq!(u[0].lines[0].text, "hi");
+    let DetailData::Commit(c) = b.detail(&DetailReq::Commit { rev: "HEAD".into() }).unwrap() else {
+        panic!()
+    };
+    assert_eq!(c.message.trim(), "one");
+    assert_eq!(c.files[0].0, "a");
+    let DetailData::CommitFile(cf) = b
+        .detail(&DetailReq::CommitFile {
+            rev: "HEAD".into(),
+            path: "a".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(
+        cf[0]
+            .lines
+            .iter()
+            .any(|l| l.kind == DiffKind::Add && l.text == "1")
+    );
+}
+
+#[test]
+fn staged_and_unstaged_blocks() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1\n", "one");
+    r.write("a", "2\n");
+    r.git(&["add", "a"]);
+    r.write("a", "3\n");
+    let DetailData::File(blocks) = backend(&r)
+        .detail(&DetailReq::File { path: "a".into() })
+        .unwrap()
+    else {
+        panic!()
+    };
+    let titles: Vec<_> = blocks.iter().map(|b| b.title.as_str()).collect();
+    assert_eq!(titles, vec!["Staged", "Unstaged"]);
+}
+
+#[test]
+fn branch_detail() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.with_bare_remote();
+    r.commit_file("a", "2", "two");
+    let DetailData::Branch { ahead, behind } = backend(&r)
+        .detail(&DetailReq::Branch {
+            name: "main".into(),
+            upstream: "origin/main".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!((ahead.len(), behind.len()), (1, 0));
 }

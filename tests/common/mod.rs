@@ -19,16 +19,29 @@ fn git_cmd(cwd: &Path) -> Command {
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "T")
         .env("GIT_COMMITTER_EMAIL", "t@t")
-        .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main", "-c", "advice.detachedHead=false"]);
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "advice.detachedHead=false",
+        ]);
     c
 }
 
 impl TestRepo {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let out = git_cmd(dir.path()).args(["init", "-q", "-b", "main", "w"]).output().unwrap();
+        let out = git_cmd(dir.path())
+            .args(["init", "-q", "-b", "main", "w"])
+            .output()
+            .unwrap();
         assert!(out.status.success());
-        TestRepo { dir, name: "w".into() }
+        TestRepo {
+            dir,
+            name: "w".into(),
+        }
     }
 
     /// Clones `remote` into a sibling working copy.
@@ -38,8 +51,15 @@ impl TestRepo {
             .args(["clone", "-q", remote.to_str().unwrap(), "w"])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        TestRepo { dir, name: "w".into() }
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        TestRepo {
+            dir,
+            name: "w".into(),
+        }
     }
 
     pub fn path(&self) -> PathBuf {
@@ -56,7 +76,8 @@ impl TestRepo {
     }
 
     pub fn git(&self, args: &[&str]) -> String {
-        self.try_git(args).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+        self.try_git(args)
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
     }
 
     pub fn write(&self, rel: &str, content: &str) {
@@ -75,7 +96,10 @@ impl TestRepo {
     /// and pushes `main` with upstream tracking.
     pub fn with_bare_remote(&self) -> PathBuf {
         let remote = self.dir.path().join("remote.git");
-        let out = git_cmd(self.dir.path()).args(["init", "-q", "--bare", "remote.git"]).output().unwrap();
+        let out = git_cmd(self.dir.path())
+            .args(["init", "-q", "--bare", "remote.git"])
+            .output()
+            .unwrap();
         assert!(out.status.success());
         self.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
         self.git(&["push", "-q", "-u", "origin", "main"]);
