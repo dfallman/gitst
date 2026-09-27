@@ -33,6 +33,10 @@ pub(crate) fn base_command(cwd: &Path) -> Command {
             "-c",
             "color.ui=false",
             "-c",
+            "color.diff=false",
+            "-c",
+            "diff.suppressBlankEmpty=false",
+            "-c",
             "core.quotePath=false",
             "-c",
             "log.showSignature=false",
@@ -106,8 +110,15 @@ impl CliBackend {
 
     /// Staged and unstaged diffs of one path, or its contents when untracked.
     fn file_detail(&self, path: &str) -> Result<Vec<DiffBlock>, GitError> {
-        let staged = self.git(&["diff", "--no-ext-diff", "--cached", "--", path])?;
-        let unstaged = self.git(&["diff", "--no-ext-diff", "--", path])?;
+        let staged = self.git(&[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--cached",
+            "--",
+            path,
+        ])?;
+        let unstaged = self.git(&["diff", "--no-color", "--no-ext-diff", "--", path])?;
         let mut blocks = nonempty_block("Staged".into(), parse::parse_diff(&staged));
         blocks.extend(nonempty_block(
             "Unstaged".into(),
@@ -157,6 +168,19 @@ impl CliBackend {
                 })
                 .collect(),
             _ => meta_line(format!("binary · {}", human_size(meta.len()))),
+        }
+    }
+
+    /// Untracked-file listing that follows `status.showUntrackedFiles`, but
+    /// lists individual files (`all`) when it is not set.
+    fn untracked_mode(&self) -> &'static str {
+        let value = self
+            .git(&["config", "--get", "status.showUntrackedFiles"])
+            .unwrap_or_default();
+        match String::from_utf8_lossy(&value).trim() {
+            "no" | "false" | "off" | "0" => "--untracked-files=no",
+            "normal" | "true" | "on" | "1" => "--untracked-files=normal",
+            _ => "--untracked-files=all",
         }
     }
 
@@ -231,7 +255,7 @@ impl GitBackend for CliBackend {
             "-z",
             "--branch",
             "--show-stash",
-            "--untracked-files=all",
+            self.untracked_mode(),
         ])?;
         let (header, mut changes) = parse::parse_status(&raw);
 
@@ -406,6 +430,7 @@ impl GitBackend for CliBackend {
                 let out = self.git(&[
                     "show",
                     "--format=",
+                    "--no-color",
                     "--no-ext-diff",
                     "--diff-merges=first-parent",
                     rev,

@@ -431,3 +431,43 @@ fn fetch_times_out_and_returns() {
     assert_eq!(err, FetchError::Timeout);
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
 }
+
+#[test]
+fn honours_show_untracked_files_config() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.write("new/deep/file.txt", "x\n");
+    r.git(&["config", "status.showUntrackedFiles", "no"]);
+    assert!(snap(&r).changes.is_empty());
+    r.git(&["config", "status.showUntrackedFiles", "normal"]);
+    let paths: Vec<_> = snap(&r).changes.into_iter().map(|c| c.path).collect();
+    assert_eq!(paths, vec!["new/"]);
+}
+
+#[test]
+fn diff_details_survive_colour_and_blank_line_config() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1\n\n3\n", "one");
+    r.write("a", "1\n\n4\n");
+    r.git(&["config", "color.diff", "always"]);
+    r.git(&["config", "diff.suppressBlankEmpty", "true"]);
+    let DetailData::File(blocks) = backend(&r)
+        .detail(&DetailReq::File { path: "a".into() })
+        .unwrap()
+    else {
+        panic!()
+    };
+    let lines = &blocks[0].lines;
+    assert!(lines.iter().all(|l| !l.text.contains('\x1b')), "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.kind == DiffKind::Context && l.text.is_empty()),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.kind == DiffKind::Add && l.text == "4")
+    );
+}
