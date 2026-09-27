@@ -1,37 +1,14 @@
 # gitst
 
-A live, glanceable git status for a small terminal pane.
+A live, glanceable git status monitor for a small terminal pane.
 
-gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, WezTerm…)
-next to a coding agent and a shell, and show what is happening to the repository
-as it happens: changed files, commits, pushes, fetches, merges and rebases. It is a
-read-only monitor. Apart from `git fetch`, it never changes your repository, and it
-never takes git's `index.lock`, so it cannot get in the way of git commands run in
-other panes.
+Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, herdr, WezTerm etc.) next to for instance a coding agent and a shell, and show what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges and rebases.
 
-```
- main ↑2 ↓0 ●                          ↻ 2m
- origin/main · v0.1.9+4 · stash 1
-╭ ▾ Changes (5) ────────────────── +64 −12 ╮
-│ ?? notes.md                   +3 ■■      │
-│  D old.rs                     −2 ■■      │
-│  M src/app.rs             +42 −7 ■■■■■ • │
-│  M src/git.rs              +9 −3 ■■■■    │
-│ A  src/watch.rs              +10 ■■■■    │
-╰──────────────────────────────────────────╯
-╭ ▾ Activity ──────────────────────────────╮
-│ 12:18 src/app.rs +42 −7               1m │
-│ 12:17 commit 4de1e3c icons: jug on c… 2m │
-│ 11:20 pushed origin/main 59eb9c3      1h │
-╰──────────────────────────────────────────╯
-╭ ▾ Commits ─────────────────────────── ↑2 ╮
-│ 4de1e3c ↑ icons: jug on cream         2m │
-│ ebf9d60 ↑ pin engine to v0.1.9        1h │
-╰──────────────────────────────────────────╯
-  ▸ Branches (4)
-  ▸ Stashes (1)
- ? help  f fetch  q quit
-```
+Note that by design, gitst is read-only monitor. The purpose of gitst is to monitor git, not manipulate it. This has a number of benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or you want to control git manually. As gits is read only, apart from git fetch, it never changes your repository, and it never takes git's index.lock, so it cannot get in the way of git commands run in other panes.
+
+<p align="center">
+<img width="600" alt="gitst" src="https://github.com/user-attachments/assets/f0785c99-979c-4230-a9cc-887dda6cb9aa" />
+</p>
 
 ## Install
 
