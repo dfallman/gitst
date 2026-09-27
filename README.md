@@ -2,13 +2,17 @@
 
 A real-time, glanceable interactive **git status monitor** typically used in a small terminal pane alongside a coding agent and other terminal panes.
 
+<p align="center">
+  <img width="600" alt="gitst" src="https://github.com/user-attachments/assets/f0785c99-979c-4230-a9cc-887dda6cb9aa" />
+</p>
+
 Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, herdr, WezTerm etc.) next to for instance a coding agent and a shell, and show what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges and rebases.
 
-Note that by design, gitst is read-only monitor. The purpose of gitst is to monitor git, not manipulate it. This has a number of benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or you want to control git manually. As gits is read only, apart from git fetch, it never changes your repository, and it never takes git's index.lock, so it cannot get in the way of git commands run in other panes.
-
 <p align="center">
-<img width="600" alt="gitst" src="https://github.com/user-attachments/assets/f0785c99-979c-4230-a9cc-887dda6cb9aa" />
+  <img width="600" alt="gitst" src="https://github.com/user-attachments/assets/bd4263b5-8e78-48e7-ac86-e4a1c4638d81" />
 </p>
+
+Note that by design, gitst is read-only monitor. The purpose of gitst is to monitor git, not manipulate it. This has a number of benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or you want to control git manually. As gits is read only, apart from git fetch, it never changes your repository, and it never takes git's index.lock, so it cannot get in the way of git commands run in other panes.
 
 ## Install
 
