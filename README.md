@@ -1,16 +1,16 @@
 # gitst
 
-A live, glanceable git status for a small terminal pane.
+A live, glanceable git status monitor for a small terminal pane. 
 
-gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, WezTerm…)
-next to a coding agent and a shell, and show what is happening to the repository
-as it happens: changed files, commits, pushes, fetches, merges and rebases. It is a
-read-only monitor. Apart from `git fetch`, it never changes your repository, and it
-never takes git's `index.lock`, so it cannot get in the way of git commands run in
-other panes.
+Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, herdr, WezTerm etc.)
+next to for instance a coding agent and a shell, and show what is happening to the repository
+as it happens: changed files, commits, pushes, fetches, merges and rebases. 
+
+Note that by design, gitst is **read-only monitor**. Apart from `git fetch`, it never changes your repository, and it
+never takes git's `index.lock`, so it cannot get in the way of git commands run in other panes. 
 
 <p align="center">
-<img width="600" alt="gitst screenshot" src="https://github.com/user-attachments/assets/8eb005f3-d29d-4fd4-85c3-6c548edb6217" />
+  <img width="600" alt="gitst screenshot" src="https://github.com/user-attachments/assets/8eb005f3-d29d-4fd4-85c3-6c548edb6217" />
 </p>
 
 ## Install
