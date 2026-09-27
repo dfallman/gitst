@@ -9,24 +9,8 @@ read-only monitor. Apart from `git fetch`, it never changes your repository, and
 never takes git's `index.lock`, so it cannot get in the way of git commands run in
 other panes.
 
-```
- main ↑2 ↓0 ●                          ↻ 2m
- origin/main · v0.1.9+4 · stash 1
-╭ ▾ Changes (5) ────────────────── +64 −12 ╮
-│ ?? notes.md                   +3 ■■      │
-│  M src/app.rs             +42 −7 ■■■■■ • │
-│ A  src/watch.rs              +10 ■■■■    │
-╰──────────────────────────────────────────╯
-╭ ▾ Activity ──────────────────────────────╮
-│ 12:19 pushed origin/main d16a9b8         │
-│ 12:18 commit 4de1e3c icons: jug on cream │
-╰──────────────────────────────────────────╯
-╭ ▾ Commits ─────────────────────────── ↑2 ╮
-│ 4de1e3c ↑ icons: jug on cream         2m │
-╰──────────────────────────────────────────╯
-  ▸ Branches (4)
- ? help  f fetch  q quit
-```
+<img width="800" alt="gitst screenshot" src="https://github.com/user-attachments/assets/8eb005f3-d29d-4fd4-85c3-6c548edb6217" />
+
 
 ## Install
 
