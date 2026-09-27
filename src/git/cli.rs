@@ -266,15 +266,15 @@ impl GitBackend for CliBackend {
             let n = format!("-n{}", opts.commits);
             let fmt = format!("--format={LOG_FORMAT}");
             commits = parse::parse_log(&self.git(&["log", &n, &fmt, "HEAD"])?);
-            if upstream.is_some() {
-                if let Ok(out) = self.git(&["rev-list", "-n500", "@{upstream}..HEAD"]) {
-                    let ahead: BTreeSet<String> = String::from_utf8_lossy(&out)
-                        .lines()
-                        .map(str::to_string)
-                        .collect();
-                    for c in &mut commits {
-                        c.unpushed = ahead.contains(&c.oid);
-                    }
+            if upstream.is_some()
+                && let Ok(out) = self.git(&["rev-list", "-n500", "@{upstream}..HEAD"])
+            {
+                let ahead: BTreeSet<String> = String::from_utf8_lossy(&out)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                for c in &mut commits {
+                    c.unpushed = ahead.contains(&c.oid);
                 }
             }
         }
@@ -299,20 +299,20 @@ impl GitBackend for CliBackend {
 
         let reflog_fmt = format!("--format={REFLOG_FORMAT}");
         let mut reflog = Vec::new();
-        if !unborn {
-            if let Ok(out) = self.git(&["log", "-g", "--date=unix", "-n50", &reflog_fmt, "HEAD"]) {
-                reflog.extend(parse::parse_reflog("HEAD", &out));
-            }
+        if !unborn
+            && let Ok(out) = self.git(&["log", "-g", "--date=unix", "-n50", &reflog_fmt, "HEAD"])
+        {
+            reflog.extend(parse::parse_reflog("HEAD", &out));
         }
         let mut upstreams: Vec<&str> = Vec::new();
         if let Some(u) = &upstream {
             upstreams.push(&u.name);
         }
         for b in &branches {
-            if let Some(u) = &b.upstream {
-                if !upstreams.contains(&u.as_str()) {
-                    upstreams.push(u);
-                }
+            if let Some(u) = &b.upstream
+                && !upstreams.contains(&u.as_str())
+            {
+                upstreams.push(u);
             }
         }
         for u in upstreams.into_iter().take(MAX_REMOTE_REFLOGS) {

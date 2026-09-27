@@ -145,10 +145,13 @@ pub fn diff_snapshots(
                 format!("unstaged {}", plural(changed.len(), "file")),
             ));
         } else if let [(c, _)] = changed[..] {
-            let text = match (c.added, c.removed) {
-                (Some(a), Some(r)) => format!("{} +{a} −{r}", c.path),
-                _ => c.path.clone(),
-            };
+            let mut text = c.path.clone();
+            if let Some(a) = c.added.filter(|a| *a > 0) {
+                text.push_str(&format!(" +{a}"));
+            }
+            if let Some(r) = c.removed.filter(|r| *r > 0) {
+                text.push_str(&format!(" −{r}"));
+            }
             events.push(event(ActivityKind::Files, text));
         } else {
             events.push(event(
@@ -176,7 +179,7 @@ pub fn merged(reflog: &[ReflogEntry], live: &[ActivityEvent], limit: usize) -> V
         .filter_map(classify)
         .chain(live.iter().cloned())
         .collect();
-    all.sort_by(|a, b| b.time.cmp(&a.time));
+    all.sort_by_key(|e| std::cmp::Reverse(e.time));
     let mut seen = HashSet::new();
     all.retain(|e| seen.insert((e.time, e.text.clone())));
     all.truncate(limit);
@@ -322,6 +325,15 @@ mod tests {
         assert_eq!(paths, vec!["a", "b"]);
         let c = snap_with(vec![ch("a", ' ', 'M', 4, 1), ch("b", '?', '?', 1, 0)]);
         assert_eq!(diff_snapshots(&b, &c, 6).0[0].text, "a +4 −1");
+    }
+
+    #[test]
+    fn single_file_event_omits_zero_counts() {
+        let a = snap_with(vec![]);
+        let b = snap_with(vec![ch("new.md", '?', '?', 1, 0)]);
+        assert_eq!(diff_snapshots(&a, &b, 5).0[0].text, "new.md +1");
+        let c = snap_with(vec![ch("gone.rs", ' ', 'D', 0, 7)]);
+        assert_eq!(diff_snapshots(&a, &c, 5).0[0].text, "gone.rs −7");
     }
 
     #[test]

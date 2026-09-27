@@ -77,6 +77,9 @@ pub enum Slot {
     Expanded { rows: usize },
 }
 
+/// Content rows every expanded section may have before any gets more.
+const FAIR_SHARE: usize = 5;
+
 /// Shares `avail` rows between sections in priority order. `overhead` is
 /// what an expanded section costs beyond its content rows (2 with borders,
 /// 1 with a title rule); a collapsed section costs 1 row.
@@ -105,11 +108,15 @@ pub fn allocate(avail: usize, overhead: usize, reqs: &[SectionReq]) -> Vec<Slot>
             *slot = Slot::Expanded { rows };
         }
     }
-    for (slot, req) in slots.iter_mut().zip(reqs) {
-        if let Slot::Expanded { rows } = slot {
-            let more = (req.content - *rows).min(left);
-            *rows += more;
-            left -= more;
+    // Spare rows go out in priority order, first up to a fair share each so
+    // one long section cannot starve the rest, then without limit.
+    for cap in [FAIR_SHARE, usize::MAX] {
+        for (slot, req) in slots.iter_mut().zip(reqs) {
+            if let Slot::Expanded { rows } = slot {
+                let more = req.content.min(cap).saturating_sub(*rows).min(left);
+                *rows += more;
+                left -= more;
+            }
         }
     }
     slots
@@ -152,6 +159,15 @@ mod tests {
                 Slot::Collapsed
             ]
         );
+    }
+
+    #[test]
+    fn long_section_does_not_starve_the_next() {
+        // Activity has 100 rows; Commits still gets a useful share.
+        let s = allocate(24, 2, &five([3, 100, 14, 0, 0]));
+        assert_eq!(s[2], Slot::Expanded { rows: 5 });
+        assert_eq!(s[0], Slot::Expanded { rows: 3 });
+        assert!(matches!(s[1], Slot::Expanded { rows } if rows > 5));
     }
 
     #[test]
