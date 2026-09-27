@@ -1,7 +1,7 @@
 //! UI state and input handling. Drawing fills in the hit map and navigation
 //! list; input is resolved against whatever was drawn last.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,7 +10,7 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use crate::activity::ActivityEvent;
+use crate::activity::{ActivityEvent, ActivityKind, describe_files};
 use crate::config::Config;
 use crate::model::{DetailData, DetailReq, Snapshot};
 use crate::ui::layout::SectionId;
@@ -18,6 +18,8 @@ use crate::worker::{FetchStatus, UiMsg, WorkerMsg};
 
 /// An `index.lock` older than this is reported.
 pub const STALE_LOCK: Duration = Duration::from_secs(10);
+/// File events this close together (seconds) merge into one Activity row.
+const BURST_SECS: i64 = 60;
 /// Most live events kept for the Activity section.
 const MAX_LIVE: usize = 200;
 const SCROLL_STEP: usize = 3;
@@ -150,6 +152,8 @@ pub struct App {
     pub fetch: FetchStatus,
     pub live: Vec<ActivityEvent>,
     pub pulses: HashMap<String, Instant>,
+    /// Paths edited in the current burst of file events.
+    burst: BTreeSet<String>,
     pub folded: HashSet<SectionId>,
     pub scroll: HashMap<SectionId, usize>,
     pub selected: Option<NavItem>,
@@ -187,6 +191,7 @@ impl App {
             fetch,
             live: Vec::new(),
             pulses: HashMap::new(),
+            burst: BTreeSet::new(),
             folded,
             scroll: HashMap::new(),
             selected: None,
@@ -218,7 +223,9 @@ impl App {
                 self.snap = Some(snap);
                 self.snap_at = self.now;
                 self.error = None;
-                self.live.extend(events);
+                for e in events {
+                    self.add_live(e, &changed);
+                }
                 let excess = self.live.len().saturating_sub(MAX_LIVE);
                 self.live.drain(..excess);
                 let now = Instant::now();
@@ -267,6 +274,34 @@ impl App {
             .map(|a| (STALE_LOCK - a).max(Duration::from_millis(200)));
         let wake = self.base_wakeup(ttl);
         lock.map_or(wake, |l| l.min(wake))
+    }
+
+    /// Appends a live event. File events close together in time merge into
+    /// one row, so an agent editing for a minute leaves one line, not dozens.
+    fn add_live(&mut self, e: ActivityEvent, changed: &[String]) {
+        if e.kind != ActivityKind::Files {
+            self.live.push(e);
+            return;
+        }
+        let joins = self.live.last().is_some_and(|last| {
+            last.kind == ActivityKind::Files && e.time - last.time <= BURST_SECS
+        });
+        if !joins {
+            self.burst.clear();
+        }
+        self.burst.extend(changed.iter().cloned());
+        let paths: Vec<String> = self.burst.iter().cloned().collect();
+        let text = match &self.snap {
+            Some(snap) if !paths.is_empty() => describe_files(&paths, snap),
+            _ => e.text.clone(),
+        };
+        match self.live.last_mut() {
+            Some(last) if joins => {
+                last.time = e.time;
+                last.text = text;
+            }
+            _ => self.live.push(ActivityEvent { text, ..e }),
+        }
     }
 
     /// How long `index.lock` has existed, as of `now`.
@@ -787,7 +822,7 @@ mod tests {
         let mut a = app();
         a.handle(UiMsg::Live(ActivityEvent {
             time: 1,
-            kind: crate::activity::ActivityKind::Fetch,
+            kind: ActivityKind::Fetch,
             text: "x".into(),
             rev: None,
         }));
@@ -800,5 +835,62 @@ mod tests {
         assert!(a.next_wakeup() <= Duration::from_millis(200));
         a.handle(UiMsg::RefreshError("bad".into()));
         assert_eq!(a.error.as_deref(), Some("bad"));
+    }
+
+    fn files_snapshot(
+        a: &mut App,
+        changes: &[(&str, u32)],
+        time: i64,
+        text: &str,
+        changed: &[&str],
+    ) {
+        let changes = changes
+            .iter()
+            .map(|(p, n)| crate::model::Change {
+                path: p.to_string(),
+                orig_path: None,
+                x: ' ',
+                y: 'M',
+                added: Some(*n),
+                removed: Some(0),
+            })
+            .collect();
+        let event = ActivityEvent {
+            time,
+            kind: ActivityKind::Files,
+            text: text.into(),
+            rev: None,
+        };
+        a.handle(UiMsg::Snapshot {
+            snap: Arc::new(Snapshot {
+                changes,
+                ..Snapshot::default()
+            }),
+            events: vec![event],
+            changed: changed.iter().map(|s| s.to_string()).collect(),
+        });
+    }
+
+    #[test]
+    fn file_edits_in_a_burst_coalesce() {
+        let mut a = app();
+        files_snapshot(&mut a, &[("a.rs", 1)], 100, "a.rs +1", &["a.rs"]);
+        files_snapshot(&mut a, &[("a.rs", 3)], 110, "a.rs +3", &["a.rs"]);
+        assert_eq!(a.live.len(), 1);
+        assert_eq!(a.live[0].text, "a.rs +3");
+        files_snapshot(
+            &mut a,
+            &[("a.rs", 3), ("b.rs", 1)],
+            120,
+            "b.rs +1",
+            &["b.rs"],
+        );
+        assert_eq!(a.live.len(), 1);
+        assert_eq!(
+            (a.live[0].text.as_str(), a.live[0].time),
+            ("2 files changed", 120)
+        );
+        files_snapshot(&mut a, &[("c.rs", 1)], 400, "c.rs +1", &["c.rs"]);
+        assert_eq!(a.live.len(), 2);
     }
 }

@@ -100,6 +100,23 @@ fn plural(n: usize, word: &str) -> String {
     }
 }
 
+/// `path +a −r` for one changed path (counts from `snap`), or `N files changed`.
+pub fn describe_files(paths: &[String], snap: &Snapshot) -> String {
+    let [path] = paths else {
+        return format!("{} changed", plural(paths.len(), "file"));
+    };
+    let mut text = path.clone();
+    if let Some(c) = snap.changes.iter().find(|c| &c.path == path) {
+        if let Some(a) = c.added.filter(|a| *a > 0) {
+            text.push_str(&format!(" +{a}"));
+        }
+        if let Some(r) = c.removed.filter(|r| *r > 0) {
+            text.push_str(&format!(" −{r}"));
+        }
+    }
+    text
+}
+
 /// Events describing what changed between two snapshots, plus the paths
 /// whose status or line counts changed (for the change pulse).
 pub fn diff_snapshots(
@@ -144,20 +161,9 @@ pub fn diff_snapshots(
                 ActivityKind::Stage,
                 format!("unstaged {}", plural(changed.len(), "file")),
             ));
-        } else if let [(c, _)] = changed[..] {
-            let mut text = c.path.clone();
-            if let Some(a) = c.added.filter(|a| *a > 0) {
-                text.push_str(&format!(" +{a}"));
-            }
-            if let Some(r) = c.removed.filter(|r| *r > 0) {
-                text.push_str(&format!(" −{r}"));
-            }
-            events.push(event(ActivityKind::Files, text));
         } else {
-            events.push(event(
-                ActivityKind::Files,
-                format!("{} changed", plural(changed.len(), "file")),
-            ));
+            let paths: Vec<String> = changed.iter().map(|(c, _)| c.path.clone()).collect();
+            events.push(event(ActivityKind::Files, describe_files(&paths, next)));
         }
     }
     if next.stash_count > prev.stash_count {
