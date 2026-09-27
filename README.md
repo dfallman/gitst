@@ -12,7 +12,7 @@ Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, h
   <img width="600" alt="gitst" src="https://github.com/user-attachments/assets/bd4263b5-8e78-48e7-ac86-e4a1c4638d81" />
 </p>
 
-Note that by design, gitst is read-only monitor. The purpose of gitst is to monitor git, not manipulate it. This has a number of benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or you want to control git manually. As gits is read only, apart from git fetch, it never changes your repository, and it never takes git's index.lock, so it cannot get in the way of git commands run in other panes.
+Note that by design, gitst is **read-only monitor**. The purpose of gitst is to *monitor*, not *manipulate* git. This has a number of benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or you want to control git manually. As gitst is read only, apart from `git fetch`, it never changes your git repository, and it never takes git's `index.lock`, so it cannot get in the way or obstruct git commands run elsewhere.
 
 ## Install
 
