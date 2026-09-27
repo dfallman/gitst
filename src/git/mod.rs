@@ -2,6 +2,7 @@ pub mod cli;
 pub mod parse;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::model::{DetailData, DetailReq, Snapshot};
 
@@ -71,6 +72,62 @@ impl std::fmt::Display for GitError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    Auth,
+    Offline,
+    Timeout,
+    Other(String),
+}
+
+impl FetchError {
+    /// Short reason shown on the warning line.
+    pub fn label(&self) -> String {
+        match self {
+            FetchError::Auth => "auth".into(),
+            FetchError::Offline => "offline".into(),
+            FetchError::Timeout => "timeout".into(),
+            FetchError::Other(m) => m.clone(),
+        }
+    }
+}
+
+/// Classifies `git fetch` stderr (produced under `LC_ALL=C`).
+pub fn classify_fetch_stderr(stderr: &str) -> FetchError {
+    const AUTH: &[&str] = &[
+        "Authentication failed",
+        "Permission denied",
+        "could not read Username",
+        "could not read Password",
+        "terminal prompts disabled",
+        "Host key verification failed",
+    ];
+    const OFFLINE: &[&str] = &[
+        "Could not resolve host",
+        "Network is unreachable",
+        "Connection refused",
+        "Connection timed out",
+        "Operation timed out",
+        "Failed to connect",
+    ];
+    if AUTH.iter().any(|p| stderr.contains(p)) {
+        FetchError::Auth
+    } else if OFFLINE.iter().any(|p| stderr.contains(p)) {
+        FetchError::Offline
+    } else {
+        let line = stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("fetch failed");
+        FetchError::Other(
+            line.trim_start_matches("fatal: ")
+                .trim_start_matches("error: ")
+                .to_string(),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SnapshotOpts {
     pub max_changes: usize,
@@ -83,4 +140,45 @@ pub trait GitBackend: Send + Sync {
     fn repo(&self) -> &Repo;
     fn snapshot(&self, opts: &SnapshotOpts) -> Result<Snapshot, GitError>;
     fn detail(&self, req: &DetailReq) -> Result<DetailData, GitError>;
+    /// Runs `git fetch`, killing it after `timeout`.
+    fn fetch(&self, prune: bool, timeout: Duration) -> Result<(), FetchError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_stderr() {
+        assert_eq!(
+            classify_fetch_stderr(
+                "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n"
+            ),
+            FetchError::Auth
+        );
+        assert_eq!(
+            classify_fetch_stderr(
+                "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n"
+            ),
+            FetchError::Auth
+        );
+        assert_eq!(
+            classify_fetch_stderr(
+                "ssh: Could not resolve hostname x: nodename nor servname provided\n"
+            ),
+            FetchError::Offline
+        );
+        assert_eq!(
+            classify_fetch_stderr(
+                "fatal: unable to access 'https://x/': Could not resolve host: x\n"
+            ),
+            FetchError::Offline
+        );
+        assert_eq!(
+            classify_fetch_stderr(
+                "fatal: '/nope' does not appear to be a git repository\nfatal: Could not read from remote repository.\n"
+            ),
+            FetchError::Other("'/nope' does not appear to be a git repository".into())
+        );
+    }
 }

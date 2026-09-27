@@ -1,12 +1,14 @@
 //! `GitBackend` implemented by running the `git` command.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use super::parse::{self, BRANCH_FORMAT, LOG_FORMAT, REFLOG_FORMAT, STASH_FORMAT};
-use super::{GitBackend, GitError, Repo, SnapshotOpts};
+use super::{FetchError, GitBackend, GitError, Repo, SnapshotOpts, classify_fetch_stderr};
 use crate::model::{
     CommitDetail, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, RepoOp, Snapshot,
     Upstream,
@@ -407,6 +409,53 @@ impl GitBackend for CliBackend {
                     ahead: parse::parse_log(&ahead),
                     behind: parse::parse_log(&behind),
                 })
+            }
+        }
+    }
+
+    fn fetch(&self, prune: bool, timeout: Duration) -> Result<(), FetchError> {
+        let mut cmd = self.command();
+        cmd.args(["fetch", "--quiet"]);
+        if prune {
+            cmd.arg("--prune");
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        // A new session has no controlling terminal, so neither git nor ssh
+        // can ever prompt over the TUI; it also lets us kill the whole group.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().map_err(|e| FetchError::Other(e.to_string()))?;
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+        let reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            s
+        });
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let err = reader.join().unwrap_or_default();
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(classify_fetch_stderr(&err))
+                    };
+                }
+                Ok(None) if start.elapsed() >= timeout => {
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(FetchError::Timeout);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => return Err(FetchError::Other(e.to_string())),
             }
         }
     }

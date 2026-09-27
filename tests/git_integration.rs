@@ -1,8 +1,13 @@
 mod common;
 
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
+
 use common::TestRepo;
-use gitst::git::{CliBackend, DiscoverError, GitBackend, Repo, SnapshotOpts};
+use gitst::git::{CliBackend, DiscoverError, FetchError, GitBackend, Repo, SnapshotOpts};
 use gitst::model::*;
+use gitst::worker::{self, FetchStatus, UiMsg, WorkerConfig, WorkerMsg};
 
 fn opts() -> SnapshotOpts {
     SnapshotOpts {
@@ -265,4 +270,105 @@ fn branch_detail() {
         panic!()
     };
     assert_eq!((ahead.len(), behind.len()), (1, 0));
+}
+
+#[test]
+fn fetch_updates_behind() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let remote = r.with_bare_remote();
+    let other = TestRepo::clone_from(&remote);
+    other.commit_file("a", "2", "two");
+    other.git(&["push", "-q"]);
+    backend(&r).fetch(false, Duration::from_secs(30)).unwrap();
+    let s = snap(&r);
+    assert_eq!(s.upstream.unwrap().behind, 1);
+    assert!(s.last_fetch.is_some());
+}
+
+#[test]
+fn fetch_unreachable_remote_fails_cleanly() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.git(&["remote", "add", "origin", "/nonexistent/remote.git"]);
+    let t = Instant::now();
+    let err = backend(&r)
+        .fetch(false, Duration::from_secs(30))
+        .unwrap_err();
+    assert!(
+        matches!(err, FetchError::Other(ref m) if m.contains("does not appear")),
+        "{err:?}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(10));
+}
+
+fn recv_until<T>(rx: &Receiver<UiMsg>, mut f: impl FnMut(UiMsg) -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let msg = rx.recv_timeout(left).expect("timed out waiting for worker");
+        if let Some(v) = f(msg) {
+            return v;
+        }
+    }
+}
+
+#[test]
+fn worker_sends_snapshot_and_detail() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let (tx, rx) = channel();
+    let cfg = WorkerConfig {
+        opts: opts(),
+        interval: Duration::ZERO,
+        prune: false,
+    };
+    let w = worker::spawn(Arc::new(backend(&r)), cfg, tx);
+    recv_until(&rx, |m| matches!(m, UiMsg::Snapshot { .. }).then_some(()));
+    w.send(WorkerMsg::Detail(DetailReq::Commit { rev: "HEAD".into() }))
+        .unwrap();
+    let d = recv_until(&rx, |m| match m {
+        UiMsg::Detail(_, d) => Some(d),
+        _ => None,
+    });
+    assert!(d.is_ok());
+    // A refresh after a file edit reports the change as a live event.
+    r.write("a", "2");
+    w.send(WorkerMsg::Refresh).unwrap();
+    let changed = recv_until(&rx, |m| match m {
+        UiMsg::Snapshot { changed, .. } => Some(changed),
+        _ => None,
+    });
+    assert_eq!(changed, vec!["a"]);
+    w.send(WorkerMsg::Shutdown).unwrap();
+}
+
+#[test]
+fn worker_manual_fetch_reports_status() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.with_bare_remote();
+    let (tx, rx) = channel();
+    let cfg = WorkerConfig {
+        opts: opts(),
+        interval: Duration::ZERO,
+        prune: false,
+    };
+    let w = worker::spawn(Arc::new(backend(&r)), cfg, tx);
+    recv_until(&rx, |m| matches!(m, UiMsg::Snapshot { .. }).then_some(()));
+    w.send(WorkerMsg::Fetch { manual: true }).unwrap();
+    recv_until(&rx, |m| {
+        matches!(m, UiMsg::Fetch(FetchStatus { running: true, .. })).then_some(())
+    });
+    let done = recv_until(&rx, |m| match m {
+        UiMsg::Fetch(s) if !s.running => Some(s),
+        _ => None,
+    });
+    assert_eq!(done.last_error, None);
+    let live = recv_until(&rx, |m| match m {
+        UiMsg::Live(e) => Some(e),
+        _ => None,
+    });
+    assert_eq!(live.text, "fetch · up to date");
+    w.send(WorkerMsg::Shutdown).unwrap();
 }
