@@ -19,6 +19,7 @@ ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 terminal-colorsaurus = "1.0"
 toml = "1"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]

@@ -1,7 +1,8 @@
 //! Text fitting and time formatting, all measured in terminal cells.
 
 use chrono::{Local, TimeZone};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub fn width(s: &str) -> usize {
     s.width()
@@ -25,6 +26,12 @@ pub fn truncate_left(path: &str, max: usize) -> String {
     best.unwrap_or_else(|| tail(path, max))
 }
 
+/// User-perceived characters with their display widths, so emoji
+/// sequences are measured and cut as a whole.
+pub fn clusters(s: &str) -> impl DoubleEndedIterator<Item = (usize, &str, usize)> {
+    s.grapheme_indices(true).map(|(i, g)| (i, g, g.width()))
+}
+
 /// `…` followed by as much of the end of `s` as fits in `max` cells.
 fn tail(s: &str, max: usize) -> String {
     if max == 0 {
@@ -32,8 +39,7 @@ fn tail(s: &str, max: usize) -> String {
     }
     let mut used = 1;
     let mut start = s.len();
-    for (i, c) in s.char_indices().rev() {
-        let w = c.width().unwrap_or(0);
+    for (i, _, w) in clusters(s).rev() {
         if used + w > max {
             break;
         }
@@ -51,18 +57,16 @@ pub fn truncate_right(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    let mut out = String::new();
     let mut used = 1;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
+    let mut end = 0;
+    for (i, g, w) in clusters(s) {
         if used + w > max {
             break;
         }
         used += w;
-        out.push(c);
+        end = i + g.len();
     }
-    out.push('…');
-    out
+    format!("{}…", &s[..end])
 }
 
 /// Compact age: `now`, `45s`, `12m`, `3h`, `2d`, `5w`, `3mo`, `2y`.
@@ -117,6 +121,21 @@ mod tests {
         assert_eq!(truncate_right("hello", 5), "hello");
         assert_eq!(truncate_right("hello", 0), "");
         assert!(width(&truncate_right("日本語のテキスト", 5)) <= 5);
+    }
+
+    #[test]
+    fn emoji_sequences_are_measured_and_cut_whole() {
+        let heart = "❤\u{fe0f}"; // emoji presentation: 2 cells
+        let s = format!("{heart}{heart}{heart}{heart} fix");
+        let r = truncate_right(&s, 8);
+        assert!(width(&r) <= 8, "{r:?} is {} wide", width(&r));
+        assert!(!r.contains("❤…"), "cut inside a cluster: {r:?}");
+        let l = truncate_left(&s, 8);
+        assert!(width(&l) <= 8, "{l:?}");
+        assert!(!l.starts_with("…\u{fe0f}"), "{l:?}");
+        let family = "👨\u{200d}👩\u{200d}👧 kids.md";
+        let f = truncate_left(family, 9);
+        assert!(width(&f) <= 9 && !f.contains('\u{200d}'), "{f:?}");
     }
 
     #[test]

@@ -7,10 +7,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use unicode_width::UnicodeWidthChar;
 
 use super::dashboard::{commit_row, meter, row, stats_spans};
-use super::fmt::{clock, rel_age, truncate_left, width};
+use super::fmt::{clock, clusters, rel_age, truncate_left, width};
 use super::layout::Density;
 use super::theme::Theme;
 use super::{now_secs, spans_width};
@@ -100,19 +99,18 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density)
     selected_rect
 }
 
-/// Splits `s` into pieces of at most `max` cells.
+/// Splits `s` into pieces of at most `max` cells, never inside a cluster.
 fn wrap_text(s: &str, max: usize) -> Vec<String> {
     let max = max.max(1);
     let mut out = vec![String::new()];
     let mut used = 0;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
-        if used + cw > max {
+    for (_, g, w) in clusters(s) {
+        if used + w > max && used > 0 {
             out.push(String::new());
             used = 0;
         }
-        out.last_mut().expect("non-empty").push(c);
-        used += cw;
+        out.last_mut().expect("non-empty").push_str(g);
+        used += w;
     }
     out
 }
@@ -328,4 +326,18 @@ pub fn draw_help(f: &mut Frame, _app: &mut App, theme: &Theme, area: Rect) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_keeps_clusters_whole_and_within_width() {
+        let s = "♻\u{fe0f}".repeat(7);
+        for piece in wrap_text(&s, 5) {
+            assert!(width(&piece) <= 5, "{piece:?}");
+            assert!(!piece.starts_with('\u{fe0f}'), "{piece:?}");
+        }
+    }
 }

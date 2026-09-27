@@ -677,6 +677,7 @@ dependencies = [
  "tempfile",
  "terminal-colorsaurus",
  "toml",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
