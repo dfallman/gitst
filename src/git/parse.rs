@@ -1,6 +1,11 @@
 //! Pure parsers for git's machine-readable output.
 
-use crate::model::Change;
+use crate::model::{Branch, Change, Commit, ReflogEntry, Stash, TagInfo};
+
+pub const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%at%x1f%an%x1f%D%x1f%s%x1e";
+pub const BRANCH_FORMAT: &str = "%(refname:short)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(committerdate:unix)%1f%(HEAD)%1e";
+pub const STASH_FORMAT: &str = "%gd%x1f%ct%x1f%gs%x1e";
+pub const REFLOG_FORMAT: &str = "%h%x1f%gd%x1f%gs%x1e";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatusHeader {
@@ -86,6 +91,139 @@ fn ordinary_entry(rest: &str, skip: usize, orig_path: Option<String>) -> Option<
     })
 }
 
+pub type NumstatEntry = (String, Option<u32>, Option<u32>);
+
+/// Splits `\x1e`-terminated records into `\x1f`-separated fields.
+fn records(raw: &[u8]) -> impl Iterator<Item = Vec<String>> + '_ {
+    raw.split(|b| *b == 0x1e).filter_map(|rec| {
+        let rec = String::from_utf8_lossy(rec);
+        let rec = rec.trim_start_matches('\n');
+        if rec.is_empty() {
+            None
+        } else {
+            Some(rec.split('\x1f').map(str::to_string).collect())
+        }
+    })
+}
+
+/// Number inside the first `{…}`, as in `stash@{3}` or `HEAD@{1790484333}`.
+fn braced_number(s: &str) -> Option<i64> {
+    let open = s.find('{')?;
+    let close = s[open..].find('}')? + open;
+    s[open + 1..close].parse().ok()
+}
+
+fn count(s: &str) -> Option<u32> {
+    s.parse().ok()
+}
+
+/// Parses `git diff --numstat -z`. Renames report the new path.
+pub fn parse_numstat(raw: &[u8]) -> Vec<NumstatEntry> {
+    let mut out = Vec::new();
+    let mut fields = raw.split(|b| *b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
+    while let Some(field) = fields.next() {
+        let mut parts = field.splitn(3, '\t');
+        let (Some(a), Some(r), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let _old = fields.next();
+            match fields.next() {
+                Some(new) => new,
+                None => continue,
+            }
+        } else {
+            path.to_string()
+        };
+        out.push((path, count(a), count(r)));
+    }
+    out
+}
+
+/// Parses `git log --format=LOG_FORMAT`.
+pub fn parse_log(raw: &[u8]) -> Vec<Commit> {
+    records(raw)
+        .filter(|f| f.len() >= 7)
+        .map(|f| Commit {
+            oid: f[0].clone(),
+            short: f[1].clone(),
+            parents: f[2].split_whitespace().count(),
+            time: f[3].parse().unwrap_or(0),
+            author: f[4].clone(),
+            refs: f[5]
+                .split(", ")
+                .filter(|r| !r.is_empty() && *r != "HEAD")
+                .map(|r| r.strip_prefix("HEAD -> ").unwrap_or(r).to_string())
+                .collect(),
+            subject: f[6..].join("\x1f"),
+            unpushed: false,
+        })
+        .collect()
+}
+
+/// Parses `git for-each-ref --format=BRANCH_FORMAT refs/heads`.
+pub fn parse_branches(raw: &[u8]) -> Vec<Branch> {
+    records(raw)
+        .filter(|f| f.len() >= 5)
+        .map(|f| {
+            let (mut ahead, mut behind) = (0, 0);
+            for part in f[2].split(", ") {
+                if let Some(n) = part.strip_prefix("ahead ") {
+                    ahead = n.parse().unwrap_or(0);
+                } else if let Some(n) = part.strip_prefix("behind ") {
+                    behind = n.parse().unwrap_or(0);
+                }
+            }
+            Branch {
+                name: f[0].clone(),
+                upstream: (!f[1].is_empty()).then(|| f[1].clone()),
+                ahead,
+                behind,
+                gone: f[2] == "gone",
+                time: f[3].parse().unwrap_or(0),
+                is_head: f[4] == "*",
+            }
+        })
+        .collect()
+}
+
+/// Parses `git stash list --format=STASH_FORMAT`.
+pub fn parse_stashes(raw: &[u8]) -> Vec<Stash> {
+    records(raw)
+        .filter(|f| f.len() >= 3)
+        .map(|f| Stash {
+            index: braced_number(&f[0]).unwrap_or(0) as usize,
+            time: f[1].parse().unwrap_or(0),
+            message: f[2..].join("\x1f"),
+        })
+        .collect()
+}
+
+/// Parses `git log -g --date=unix --format=REFLOG_FORMAT <refname>`.
+pub fn parse_reflog(refname: &str, raw: &[u8]) -> Vec<ReflogEntry> {
+    records(raw)
+        .filter(|f| f.len() >= 3)
+        .map(|f| ReflogEntry {
+            refname: refname.to_string(),
+            short: f[0].clone(),
+            time: braced_number(&f[1]).unwrap_or(0),
+            message: f[2..].join("\x1f"),
+        })
+        .collect()
+}
+
+/// Parses `git describe --tags --long` output such as `v0.1.9-4-gabc1234`.
+pub fn parse_describe(s: &str) -> Option<TagInfo> {
+    let mut parts = s.trim().rsplitn(3, '-');
+    let hash = parts.next()?;
+    let distance = parts.next()?.parse().ok()?;
+    let name = parts.next()?;
+    if !hash.starts_with('g') || name.is_empty() {
+        return None;
+    }
+    Some(TagInfo { name: name.to_string(), distance })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +263,59 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         let (h, _) = parse_status(b"# branch.oid (initial)\0# branch.head (detached)\0");
         assert_eq!(h.oid, None);
         assert_eq!(h.head, None);
+    }
+
+    #[test]
+    fn numstat_plain_binary_rename() {
+        let v = parse_numstat(b"5\t0\tb.txt\0-\t-\timg.png\0");
+        assert_eq!(v[0], ("b.txt".into(), Some(5), Some(0)));
+        assert_eq!(v[1], ("img.png".into(), None, None));
+        let r = parse_numstat(b"1\t2\t\0a.txt\0r.txt\0");
+        assert_eq!(r, vec![("r.txt".into(), Some(1), Some(2))]);
+    }
+
+    #[test]
+    fn log_records() {
+        let raw = b"ce2b\x1fce2\x1fp1 p2\x1f1790484333\x1fAnn\x1fHEAD -> main, tag: v0.1, origin/main\x1fmerge it\x1e\nabcd\x1fabc\x1f\x1f1790484000\x1fBo\x1f\x1froot\x1e\n";
+        let c = parse_log(raw);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].parents, 2);
+        assert_eq!(c[0].refs, vec!["main", "tag: v0.1", "origin/main"]);
+        assert_eq!(c[0].time, 1790484333);
+        assert_eq!(c[1].parents, 0);
+        assert!(c[1].refs.is_empty());
+        assert_eq!(c[1].subject, "root");
+    }
+
+    #[test]
+    fn branches_track() {
+        let raw = b"feat\x1f\x1f\x1f1790484333\x1f \x1e\nmain\x1forigin/main\x1fahead 2, behind 3\x1f1790484333\x1f*\x1e\nold\x1forigin/old\x1fgone\x1f1\x1f \x1e\n";
+        let b = parse_branches(raw);
+        assert_eq!(b.len(), 3);
+        assert_eq!((b[0].upstream.clone(), b[0].is_head), (None, false));
+        assert_eq!((b[1].ahead, b[1].behind, b[1].is_head), (2, 3, true));
+        assert!(b[2].gone);
+    }
+
+    #[test]
+    fn stash_and_reflog() {
+        let s = parse_stashes(b"stash@{1}\x1f1790484333\x1fWIP on main: ce2 x\x1e\n");
+        assert_eq!((s[0].index, s[0].time), (1, 1790484333));
+        assert_eq!(s[0].message, "WIP on main: ce2 x");
+        let r = parse_reflog(
+            "refs/remotes/origin/main",
+            b"730d813\x1forigin/main@{1790484333}\x1fupdate by push\x1e\n",
+        );
+        assert_eq!((r[0].time, r[0].message.as_str()), (1790484333, "update by push"));
+        assert_eq!(r[0].refname, "refs/remotes/origin/main");
+        assert_eq!(r[0].short, "730d813");
+    }
+
+    #[test]
+    fn describe() {
+        let t = parse_describe("v0.1.9-4-gabc1234\n").unwrap();
+        assert_eq!((t.name.as_str(), t.distance), ("v0.1.9", 4));
+        assert_eq!(parse_describe("rel-2-0-12-gdead").unwrap().name, "rel-2-0");
+        assert!(parse_describe("garbage").is_none());
     }
 }
