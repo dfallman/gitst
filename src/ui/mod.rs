@@ -12,15 +12,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{Action, App};
+use crate::app::{Action, App, STALE_LOCK};
 use crate::model::{Head, RepoOp, Snapshot};
 use fmt::{rel_age, truncate_right, width};
 use layout::Density;
 use theme::Theme;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// An `index.lock` older than this is reported.
-const STALE_LOCK_SECS: u64 = 10;
 
 /// Draws the whole UI and records the hit map for the next input.
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
@@ -248,10 +246,7 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme) -> Vec<Line<'static>> {
         let s = if conflicts == 1 { "" } else { "s" };
         out.push(line(format!("{conflicts} conflict{s}"), err));
     }
-    if let Some(age) = snap
-        .index_lock_age
-        .filter(|a| a.as_secs() >= STALE_LOCK_SECS)
-    {
+    if let Some(age) = app.lock_age().filter(|a| *a >= STALE_LOCK) {
         out.push(line(
             format!("index.lock held {}", rel_age(age.as_secs() as i64)),
             warn,

@@ -16,6 +16,8 @@ use crate::model::{DetailData, DetailReq, Snapshot};
 use crate::ui::layout::SectionId;
 use crate::worker::{FetchStatus, UiMsg, WorkerMsg};
 
+/// An `index.lock` older than this is reported.
+pub const STALE_LOCK: Duration = Duration::from_secs(10);
 /// Most live events kept for the Activity section.
 const MAX_LIVE: usize = 200;
 const SCROLL_STEP: usize = 3;
@@ -158,6 +160,8 @@ pub struct App {
     pub pulse_secs: u64,
     /// Wall-clock time used for ages; set before each draw.
     pub now: SystemTime,
+    /// `now` when the current snapshot arrived.
+    pub snap_at: SystemTime,
     /// Filled by draw.
     pub hits: HitMap,
     /// Filled by draw: selectable dashboard items in screen order.
@@ -192,6 +196,7 @@ impl App {
             wrap: false,
             pulse_secs: cfg.pulse_seconds,
             now: SystemTime::now(),
+            snap_at: SystemTime::now(),
             hits: HitMap::default(),
             nav: Vec::new(),
             row_targets: HashMap::new(),
@@ -211,6 +216,7 @@ impl App {
                 changed,
             } => {
                 self.snap = Some(snap);
+                self.snap_at = self.now;
                 self.error = None;
                 self.live.extend(events);
                 let excess = self.live.len().saturating_sub(MAX_LIVE);
@@ -254,6 +260,22 @@ impl App {
     /// How long the UI may sleep before something on screen changes by itself.
     pub fn next_wakeup(&self) -> Duration {
         let ttl = Duration::from_secs(self.pulse_secs);
+        // Wake when a held index.lock becomes old enough to report.
+        let lock = self
+            .lock_age()
+            .filter(|a| *a < STALE_LOCK)
+            .map(|a| (STALE_LOCK - a).max(Duration::from_millis(200)));
+        let wake = self.base_wakeup(ttl);
+        lock.map_or(wake, |l| l.min(wake))
+    }
+
+    /// How long `index.lock` has existed, as of `now`.
+    pub fn lock_age(&self) -> Option<Duration> {
+        let since = self.now.duration_since(self.snap_at).unwrap_or_default();
+        self.snap.as_ref()?.index_lock_age.map(|a| a + since)
+    }
+
+    fn base_wakeup(&self, ttl: Duration) -> Duration {
         if self.fetch.running {
             Duration::from_millis(100)
         } else if self.pulses.values().any(|t| t.elapsed() < ttl) {

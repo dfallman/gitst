@@ -541,3 +541,15 @@ fn detail_scroll_is_clamped() {
     assert!(app.stack[0].scroll <= 10, "{}", app.stack[0].scroll);
     assert!(out.contains("new();"), "{out}");
 }
+
+#[test]
+fn stale_lock_warning_appears_without_a_new_snapshot() {
+    let mut s = fixture();
+    s.index_lock_age = Some(Duration::from_secs(2));
+    let mut app = new_app(s);
+    assert!(!draw(&mut app, 44, 20).contains("index.lock"));
+    let wake = app.next_wakeup();
+    assert!(wake <= Duration::from_secs(8), "{wake:?}");
+    app.now += Duration::from_secs(9);
+    assert!(draw(&mut app, 44, 20).contains("index.lock held 11s"));
+}

@@ -141,6 +141,7 @@ fn run(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         let mut quit = false;
+        app.now = SystemTime::now();
         for msg in first
             .into_iter()
             .chain(std::iter::from_fn(|| ui_rx.try_recv().ok()))
