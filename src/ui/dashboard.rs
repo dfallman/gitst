@@ -252,7 +252,7 @@ fn build(
             id,
             count: None,
             summary: Vec::new(),
-            rows: activity(snap, app, theme, w),
+            rows: activity(snap, app, theme, w, d),
         },
         SectionId::Commits => {
             let unpushed = snap.commits.iter().filter(|c| c.unpushed).count();
@@ -454,7 +454,7 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
     }
 }
 
-fn activity(snap: &Snapshot, app: &App, theme: &Theme, w: usize) -> Vec<Row> {
+fn activity(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> Vec<Row> {
     let events = merged(&snap.reflog, &app.live, ACTIVITY_ROWS);
     if events.is_empty() {
         return vec![Row {
@@ -487,7 +487,7 @@ fn activity(snap: &Snapshot, app: &App, theme: &Theme, w: usize) -> Vec<Row> {
                 Span::raw(format!(" {rest}")),
             ];
             Row {
-                line: row(left, middle, Vec::new(), w),
+                line: row(left, middle, age_span(e.time, app, theme, d), w),
                 target: e.rev.map(Target::Commit),
             }
         })

@@ -13,9 +13,9 @@ expression: "draw(&mut app, 44, 22)"
 ╰──│ j k ↑ ↓     move                   │──╯
 ╭ ▾│ enter l     open                   │──╮
 │ 0│ esc h       back                   │m │
-│ 0│ tab         next section           │… │
-│ 0│ space       fold section           │  │
-│ 0│ g G         top / bottom           │  │
+│ 0│ tab         next section           │h │
+│ 0│ space       fold section           │h │
+│ 0│ g G         top / bottom           │h │
 ╰──│ f           fetch now              │──╯
 ╭ ▾│ w           wrap long lines        │2 ╮
 │ 4│ ?           close help             │m │

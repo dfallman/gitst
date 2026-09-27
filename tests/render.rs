@@ -553,3 +553,18 @@ fn stale_lock_warning_appears_without_a_new_snapshot() {
     app.now += Duration::from_secs(9);
     assert!(draw(&mut app, 44, 20).contains("index.lock held 11s"));
 }
+
+#[test]
+fn activity_rows_show_clock_and_age() {
+    let out = render(44, 28, fixture());
+    let row = out
+        .lines()
+        .find(|l| l.contains("04:43 commit"))
+        .expect("activity row");
+    assert!(row.trim_end().ends_with("2m │"), "{row}");
+    let push = out
+        .lines()
+        .find(|l| l.contains("pushed origin/main"))
+        .unwrap();
+    assert!(push.trim_end().ends_with("1h │"), "{push}");
+}
