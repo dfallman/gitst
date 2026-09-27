@@ -448,8 +448,14 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => step(view, true, 1),
             KeyCode::Char('k') | KeyCode::Up => step(view, false, 1),
-            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll += page,
-            KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(page),
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                view.selected = None;
+                view.scroll += page;
+            }
+            KeyCode::PageUp => {
+                view.selected = None;
+                view.scroll = view.scroll.saturating_sub(page);
+            }
             KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
             KeyCode::Char('G') | KeyCode::End => view.scroll = usize::MAX / 2,
             KeyCode::Char('w') => return self.perform(Action::ToggleWrap),
@@ -490,9 +496,21 @@ impl App {
                     }
                 };
                 match self.hits.scroll_at(x, y) {
-                    Some(ScrollTarget::Section(id)) => apply(self.scroll.entry(id).or_insert(0)),
+                    // Scrolling moves the view away from a selected row, so the
+                    // selection steps back to the section title (or is dropped)
+                    // instead of pulling the view back on the next draw.
+                    Some(ScrollTarget::Section(id)) => {
+                        if self.selected.is_some_and(|s| s.section == id) {
+                            self.selected = Some(NavItem {
+                                section: id,
+                                row: None,
+                            });
+                        }
+                        apply(self.scroll.entry(id).or_insert(0));
+                    }
                     Some(ScrollTarget::Detail) => {
                         if let Some(v) = self.stack.last_mut() {
+                            v.selected = None;
                             apply(&mut v.scroll);
                         }
                     }

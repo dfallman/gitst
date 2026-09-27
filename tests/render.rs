@@ -568,3 +568,38 @@ fn activity_rows_show_clock_and_age() {
         .unwrap();
     assert!(push.trim_end().ends_with("1h │"), "{push}");
 }
+
+fn wheel_down(x: u16, y: u16) -> UiMsg {
+    UiMsg::Input(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }))
+}
+
+#[test]
+fn wheel_still_scrolls_after_keyboard_selection() {
+    let mut app = new_app(fixture());
+    let out = draw(&mut app, 44, 16);
+    let y = out.lines().position(|l| l.contains("notes.md")).unwrap() as u16;
+    app.handle(key('j'));
+    app.handle(key('j'));
+    draw(&mut app, 44, 16);
+    app.handle(wheel_down(5, y));
+    draw(&mut app, 44, 16);
+    assert!(app.scroll[&gitst::ui::layout::SectionId::Changes] > 0);
+
+    open(&mut app, Target::File("a".into()));
+    let long: Vec<(DiffKind, &str)> = (0..40).map(|_| (DiffKind::Add, "line")).collect();
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Ok(DetailData::File(vec![diff_block("Unstaged", &long)])),
+    ));
+    draw(&mut app, 44, 16);
+    app.handle(key('j'));
+    draw(&mut app, 44, 16);
+    app.handle(wheel_down(5, 5));
+    draw(&mut app, 44, 16);
+    assert!(app.stack[0].scroll > 0);
+}
