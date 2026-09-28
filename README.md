@@ -1,6 +1,6 @@
 # gitst
 
-A real-time, glanceable interactive **git status monitor** typically used in a small terminal pane alongside your coding editor of IDE, your coding agent, and other terminal panes.
+A real-time, glanceable interactive **git status monitor** typically used in a small terminal pane alongside your coding editor or IDE, your coding agent, and other terminal panes.
 
 <p align="center">
   <img width="496" alt="gitst-front" src="https://github.com/user-attachments/assets/3a474e6b-669e-4591-80eb-9f74018e6213" />
