@@ -193,7 +193,12 @@ pub fn git_internal_relevant(rel: &Path) -> bool {
 }
 
 fn own_git_path_relevant(rel: &Path) -> bool {
-    let s = rel.to_string_lossy();
+    // Compared as git writes them, with `/`, whatever the platform uses.
+    let parts: Vec<_> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    let s = parts.join("/");
     matches!(
         s.as_ref(),
         "HEAD"
@@ -489,6 +494,17 @@ mod tests {
             "modules/sub/HEAD",
             "modules/libs/foo/refs/heads/main",
             "modules/a/modules/b/index",
+        ] {
+            assert!(git_internal_relevant(Path::new(p)), "{p}");
+        }
+        // Event paths on Windows use backslashes.
+        #[cfg(windows)]
+        for p in [
+            r"refs\heads\main",
+            r"logs\HEAD",
+            r"info\exclude",
+            r"rebase-merge\msgnum",
+            r"modules\libs\foo\refs\heads\main",
         ] {
             assert!(git_internal_relevant(Path::new(p)), "{p}");
         }

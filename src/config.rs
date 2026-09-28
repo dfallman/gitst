@@ -159,21 +159,23 @@ mod tests {
 
     #[test]
     fn config_paths_prefer_xdg_then_platform_then_home() {
-        let p = |s: &str| PathBuf::from(s);
+        // Absolute on this platform: `/x`, or `C:\x` on Windows.
+        let root = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
+        let p = |s: &str| root.join(s);
         assert_eq!(
-            config_paths(Some(&p("/x")), Some(&p("/h")), None),
-            vec![p("/x/gitst/config.toml"), p("/h/.config/gitst/config.toml")]
+            config_paths(Some(&p("x")), Some(&p("h")), None),
+            vec![p("x/gitst/config.toml"), p("h/.config/gitst/config.toml")]
         );
         // A relative XDG_CONFIG_HOME is invalid and ignored.
         assert_eq!(
-            config_paths(Some(&p("rel")), Some(&p("/h")), None),
-            vec![p("/h/.config/gitst/config.toml")]
+            config_paths(Some(Path::new("rel")), Some(&p("h")), None),
+            vec![p("h/.config/gitst/config.toml")]
         );
         assert_eq!(
-            config_paths(None, Some(&p("/h")), Some(&p("/h/AppData"))),
+            config_paths(None, Some(&p("h")), Some(&p("h/AppData"))),
             vec![
-                p("/h/AppData/gitst/config.toml"),
-                p("/h/.config/gitst/config.toml")
+                p("h/AppData/gitst/config.toml"),
+                p("h/.config/gitst/config.toml")
             ]
         );
     }

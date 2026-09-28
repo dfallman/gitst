@@ -1,6 +1,6 @@
 [package]
 name = "gitst"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "Live, glanceable git status TUI for small terminal panes"
 license = "MIT"
