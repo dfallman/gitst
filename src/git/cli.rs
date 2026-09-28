@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 use super::parse::{self, BRANCH_FORMAT, LOG_FORMAT, REFLOG_FORMAT, STASH_FORMAT};
 use super::{FetchError, GitBackend, GitError, Repo, SnapshotOpts, classify_fetch_stderr};
 use crate::model::{
-    CommitDetail, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, RepoOp, Snapshot,
-    Upstream,
+    CommitDetail, Counts, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, RepoOp,
+    Snapshot, Upstream,
 };
 
 /// Largest untracked file whose lines are counted for the `+N` column.
@@ -143,8 +143,9 @@ impl CliBackend {
 
     fn untracked_lines(&self, rel: &str) -> Vec<DiffLine> {
         let path = self.repo.root.join(rel);
-        // Never follow links or open special files: a FIFO or a link to
-        // /dev/zero would block or never end.
+        // Links, directories and special files are described, not read: a
+        // FIFO or a link to /dev/zero would block or never end.
+        // `read_regular` checks again on the file it opens.
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             return Vec::new();
         };
@@ -166,10 +167,15 @@ impl CliBackend {
         if !meta.is_file() {
             return meta_line("not a regular file".into());
         }
-        if meta.len() > MAX_COUNTED_FILE {
-            return meta_line(format!("large file · {}", human_size(meta.len())));
-        }
-        let bytes = std::fs::read(&path).unwrap_or_default();
+        let bytes = match read_regular(&path, MAX_COUNTED_FILE) {
+            FileRead::Contents(bytes) => bytes,
+            FileRead::TooLarge(size) => {
+                return meta_line(format!("large file · {}", human_size(size)));
+            }
+            // It changed after the check above.
+            FileRead::NotRegular => return meta_line("not a regular file".into()),
+        };
+        let size = bytes.len() as u64;
         match String::from_utf8(bytes) {
             Ok(text) if !text.contains('\0') => text
                 .lines()
@@ -178,7 +184,7 @@ impl CliBackend {
                     text: l.replace('\t', "    "),
                 })
                 .collect(),
-            _ => meta_line(format!("binary · {}", human_size(meta.len()))),
+            _ => meta_line(format!("binary · {}", human_size(size))),
         }
     }
 
@@ -213,20 +219,71 @@ impl CliBackend {
     }
 
     /// Line count of a small text file, for untracked files' `+N`.
-    fn count_lines(&self, rel: &str) -> Option<u32> {
-        let path = self.repo.root.join(rel);
-        let meta = std::fs::symlink_metadata(&path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_COUNTED_FILE {
-            return None;
-        }
-        let bytes = std::fs::read(&path).ok()?;
+    fn count_lines(&self, rel: &str) -> Counts {
+        let FileRead::Contents(bytes) = read_regular(&self.repo.root.join(rel), MAX_COUNTED_FILE)
+        else {
+            return Counts::Unknown;
+        };
         if bytes.contains(&0) {
-            return None;
+            return Counts::Binary;
         }
         let newlines = bytes.iter().filter(|b| **b == b'\n').count();
         let trailing = !bytes.is_empty() && !bytes.ends_with(b"\n");
-        Some((newlines + trailing as usize) as u32)
+        Counts::lines((newlines + trailing as usize) as u32, 0)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FileRead {
+    Contents(Vec<u8>),
+    /// Over the cap; the size seen, which may be the cap plus one if the
+    /// file grew while being read.
+    TooLarge(u64),
+    /// Missing, unreadable, a directory, a link or a special file.
+    NotRegular,
+}
+
+/// Reads a regular file of at most `cap` bytes without following a link or
+/// waiting on a FIFO or device. Every check is made on the opened file, so
+/// swapping `path` for a link or FIFO after an earlier look cannot block
+/// the caller.
+fn read_regular(path: &Path, cap: u64) -> FileRead {
+    let Ok(file) = open_no_follow(path) else {
+        return FileRead::NotRegular;
+    };
+    match file.metadata() {
+        Ok(m) if !m.is_file() => return FileRead::NotRegular,
+        Ok(m) if m.len() > cap => return FileRead::TooLarge(m.len()),
+        Ok(_) => {}
+        Err(_) => return FileRead::NotRegular,
+    }
+    let mut bytes = Vec::new();
+    match file.take(cap + 1).read_to_end(&mut bytes) {
+        Ok(n) if n as u64 > cap => FileRead::TooLarge(n as u64),
+        Ok(_) => FileRead::Contents(bytes),
+        Err(_) => FileRead::NotRegular,
+    }
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Without O_NONBLOCK, opening a FIFO waits for a writer.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Opens a link itself, which then does not pass as a regular file.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 fn nonempty_block(title: String, lines: Vec<DiffLine>) -> Vec<DiffBlock> {
@@ -238,20 +295,22 @@ fn nonempty_block(title: String, lines: Vec<DiffLine>) -> Vec<DiffBlock> {
 }
 
 pub(crate) fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1 << 10;
+    const MB: u64 = 1 << 20;
+    const GB: u64 = 1 << 30;
+    const TB: u64 = 1 << 40;
+    let scaled = |unit: u64, name: &str| format!("{:.1} {name}", bytes as f64 / unit as f64);
     match bytes {
-        b if b < 1024 => format!("{b} B"),
-        b if b < 1024 * 1024 => format!("{} KB", b.div_ceil(1024)),
-        b => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
+        b if b < KB => format!("{b} B"),
+        b if b < MB => format!("{} KB", b.div_ceil(KB)),
+        b if b < GB => scaled(MB, "MB"),
+        b if b < TB => scaled(GB, "GB"),
+        _ => scaled(TB, "TB"),
     }
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
-}
-
-/// Adds two numstat counts; `None` (binary) wins.
-fn add_counts(a: Option<u32>, b: Option<u32>) -> Option<u32> {
-    Some(a? + b?)
 }
 
 impl GitBackend for CliBackend {
@@ -278,25 +337,26 @@ impl GitBackend for CliBackend {
         };
         let unborn = matches!(head, Head::Unborn(_));
 
+        // Paths left out stay `Counts::Unknown`, which shows as blank.
         if changes.len() <= opts.numstat_max_files {
-            let mut counts: HashMap<String, (Option<u32>, Option<u32>)> = HashMap::new();
-            for args in [
-                &["diff", "--no-ext-diff", "--numstat", "-z"][..],
-                &["diff", "--no-ext-diff", "--cached", "--numstat", "-z"][..],
-            ] {
-                if let Ok(out) = self.git(args) {
-                    for (path, a, r) in parse::parse_numstat(&out) {
-                        let e = counts.entry(path).or_insert((Some(0), Some(0)));
-                        *e = (add_counts(e.0, a), add_counts(e.1, r));
-                    }
+            let unstaged = self.git(&["diff", "--no-ext-diff", "--numstat", "-z"]);
+            let staged = self.git(&["diff", "--no-ext-diff", "--cached", "--numstat", "-z"]);
+            // Half a count would be wrong, so both diffs or neither.
+            let mut counts: HashMap<String, Counts> = HashMap::new();
+            if let (Ok(unstaged), Ok(staged)) = (unstaged, staged) {
+                for (path, n) in parse::parse_numstat(&unstaged)
+                    .into_iter()
+                    .chain(parse::parse_numstat(&staged))
+                {
+                    let e = counts.entry(path).or_insert(Counts::lines(0, 0));
+                    *e = e.plus(n);
                 }
             }
             for c in &mut changes {
-                if let Some((a, r)) = counts.get(&c.path) {
-                    (c.added, c.removed) = (*a, *r);
+                if let Some(n) = counts.get(&c.path) {
+                    c.counts = *n;
                 } else if c.untracked() {
-                    c.added = self.count_lines(&c.path);
-                    c.removed = c.added.map(|_| 0);
+                    c.counts = self.count_lines(&c.path);
                 }
             }
         }
@@ -406,7 +466,8 @@ impl GitBackend for CliBackend {
             tag,
             stash_count: header.stash,
             index_lock_age,
-            last_fetch: mtime(&self.repo.common_dir.join("FETCH_HEAD")),
+            // FETCH_HEAD is per worktree, like HEAD.
+            last_fetch: mtime(&self.repo.git_dir.join("FETCH_HEAD")),
             has_remote,
         })
     }
@@ -685,6 +746,57 @@ mod tests {
             git_dir: p.clone(),
             common_dir: p,
         })
+    }
+
+    /// Runs `read_regular` on another thread so a blocking open fails the
+    /// test instead of hanging it.
+    fn read_soon(path: &Path, cap: u64) -> FileRead {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        std::thread::spawn(move || tx.send(read_regular(&path, cap)));
+        rx.recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|_| panic!("read_regular blocked"))
+    }
+
+    #[test]
+    fn read_regular_reads_small_files_and_caps_large_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, "abc").unwrap();
+        assert_eq!(read_soon(&p, 3), FileRead::Contents(b"abc".to_vec()));
+        assert_eq!(read_soon(&p, 2), FileRead::TooLarge(3));
+        assert_eq!(read_soon(dir.path(), 10), FileRead::NotRegular);
+        assert_eq!(
+            read_soon(&dir.path().join("missing"), 10),
+            FileRead::NotRegular
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_never_follows_links_or_opens_fifos() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        assert_eq!(read_soon(&fifo, 10), FileRead::NotRegular);
+        let zero = dir.path().join("zero");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        assert_eq!(read_soon(&zero, 10), FileRead::NotRegular);
+        let target = dir.path().join("t");
+        std::fs::write(&target, "x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_soon(&link, 10), FileRead::NotRegular);
+    }
+
+    #[test]
+    fn human_sizes() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1500), "2 KB");
+        assert_eq!(human_size(5 << 20), "5.0 MB");
+        assert_eq!(human_size(3 << 30), "3.0 GB");
+        assert_eq!(human_size(2 << 40), "2.0 TB");
     }
 
     #[test]

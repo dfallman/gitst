@@ -141,7 +141,7 @@ pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>)
                 prev: None,
                 fetch,
                 next_fetch: None,
-                scheduled: false,
+                fetch_queued: false,
                 manual_pending: false,
             }
             .run(rx)
@@ -159,8 +159,8 @@ struct Worker {
     prev: Option<Arc<Snapshot>>,
     fetch: FetchStatus,
     next_fetch: Option<Instant>,
-    /// Whether the first timed fetch has been scheduled.
-    scheduled: bool,
+    /// A manual fetch was asked for while another was running.
+    fetch_queued: bool,
     /// A manual fetch succeeded and the next refresh should say whether it changed anything.
     manual_pending: bool,
 }
@@ -187,6 +187,9 @@ impl Worker {
                     WorkerMsg::Fetch { manual } => self.start_fetch(manual),
                     WorkerMsg::FetchDone { manual, result } => {
                         self.finish_fetch(manual, result);
+                        if std::mem::take(&mut self.fetch_queued) {
+                            self.start_fetch(true);
+                        }
                         refresh = true;
                     }
                     WorkerMsg::Detail(req) => {
@@ -225,7 +228,7 @@ impl Worker {
                         rev: None,
                     }));
                 }
-                self.schedule_first_fetch(&snap);
+                self.arm_fetch_timer(&snap);
                 let snap = Arc::new(snap);
                 self.prev = Some(snap.clone());
                 let _ = self.ui.send(UiMsg::Snapshot {
@@ -240,13 +243,18 @@ impl Worker {
         }
     }
 
-    /// The first timed fetch is due one interval after the last fetch
-    /// (by anyone), or immediately if that is already past.
-    fn schedule_first_fetch(&mut self, snap: &Snapshot) {
-        if self.scheduled || self.cfg.interval.is_zero() || !snap.has_remote {
+    /// Sets the fetch timer if it is off while it should be on: at startup,
+    /// and when a remote appears after a stretch without one. The fetch is
+    /// due one interval after the last fetch (by anyone), or immediately if
+    /// that is already past. After a fetch, `finish_fetch` sets the timer.
+    fn arm_fetch_timer(&mut self, snap: &Snapshot) {
+        if self.next_fetch.is_some()
+            || self.fetch.running
+            || self.cfg.interval.is_zero()
+            || !snap.has_remote
+        {
             return;
         }
-        self.scheduled = true;
         let since = snap
             .last_fetch
             .and_then(|t| t.elapsed().ok())
@@ -255,11 +263,15 @@ impl Worker {
     }
 
     fn start_fetch(&mut self, manual: bool) {
-        let has_remote = self.prev.as_ref().is_some_and(|p| p.has_remote);
-        if self.fetch.running || !has_remote {
-            if !self.fetch.running {
-                self.next_fetch = None;
-            }
+        if self.fetch.running {
+            // A manual fetch should see the remote as it is now, which the
+            // running one may have read before a push.
+            self.fetch_queued |= manual;
+            return;
+        }
+        if !self.prev.as_ref().is_some_and(|p| p.has_remote) {
+            // `arm_fetch_timer` sets it again once a remote appears.
+            self.next_fetch = None;
             return;
         }
         // Holding the slot keeps shutdown from missing a fetch that starts
@@ -305,6 +317,142 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{GitError, Repo};
+    use crate::model::DetailData;
+
+    /// A backend whose remote comes and goes, and whose fetches report
+    /// when they start and wait to be released.
+    struct Fake {
+        repo: Repo,
+        has_remote: AtomicBool,
+        last_fetch: Option<SystemTime>,
+        started: Mutex<Sender<()>>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl GitBackend for Fake {
+        fn repo(&self) -> &Repo {
+            &self.repo
+        }
+        fn snapshot(&self, _: &SnapshotOpts) -> Result<Snapshot, GitError> {
+            Ok(Snapshot {
+                has_remote: self.has_remote.load(Ordering::SeqCst),
+                last_fetch: self.last_fetch,
+                ..Snapshot::default()
+            })
+        }
+        fn detail(&self, _: &DetailReq) -> Result<DetailData, GitError> {
+            Err(GitError("none".into()))
+        }
+        fn fetch(&self, _: bool, _: Duration, _: &AtomicBool) -> Result<(), FetchError> {
+            let _ = self.started.lock().unwrap().send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            Ok(())
+        }
+    }
+
+    struct Harness {
+        fake: Arc<Fake>,
+        worker: WorkerHandle,
+        ui: Receiver<UiMsg>,
+        started: Receiver<()>,
+        release: Sender<()>,
+    }
+
+    fn harness(interval: Duration, last_fetch: Option<SystemTime>) -> Harness {
+        let (started_tx, started) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let fake = Arc::new(Fake {
+            repo: Repo {
+                root: "/r".into(),
+                git_dir: "/r/.git".into(),
+                common_dir: "/r/.git".into(),
+            },
+            has_remote: AtomicBool::new(true),
+            last_fetch,
+            started: Mutex::new(started_tx),
+            release: Mutex::new(release_rx),
+        });
+        let (ui_tx, ui) = mpsc::channel();
+        let cfg = WorkerConfig {
+            opts: SnapshotOpts {
+                max_changes: 10,
+                numstat_max_files: 10,
+                commits: 10,
+            },
+            interval,
+            prune: false,
+        };
+        let worker = spawn(fake.clone(), cfg, ui_tx);
+        let h = Harness {
+            fake,
+            worker,
+            ui,
+            started,
+            release,
+        };
+        h.next_snapshot();
+        h
+    }
+
+    impl Harness {
+        fn next_snapshot(&self) -> Arc<Snapshot> {
+            loop {
+                match self.ui.recv_timeout(Duration::from_secs(5)) {
+                    Ok(UiMsg::Snapshot { snap, .. }) => return snap,
+                    Ok(_) => {}
+                    Err(e) => panic!("no snapshot: {e}"),
+                }
+            }
+        }
+
+        fn fetch_starts(&self, within: Duration) -> bool {
+            self.started.recv_timeout(within).is_ok()
+        }
+    }
+
+    #[test]
+    fn manual_fetch_during_a_fetch_runs_after_it() {
+        let h = harness(Duration::ZERO, None);
+        h.worker.send(WorkerMsg::Fetch { manual: true }).unwrap();
+        assert!(h.fetch_starts(Duration::from_secs(5)));
+        h.worker.send(WorkerMsg::Fetch { manual: true }).unwrap();
+        h.worker.send(WorkerMsg::Fetch { manual: true }).unwrap();
+        h.release.send(()).unwrap();
+        assert!(
+            h.fetch_starts(Duration::from_secs(5)),
+            "queued fetch never ran"
+        );
+        h.release.send(()).unwrap();
+        assert!(
+            !h.fetch_starts(Duration::from_millis(300)),
+            "presses during one fetch queue one more, not one each"
+        );
+    }
+
+    #[test]
+    fn timed_fetch_resumes_when_a_remote_returns() {
+        let interval = Duration::from_millis(300);
+        let h = harness(interval, Some(SystemTime::now()));
+        for _ in 0..4 {
+            h.release.send(()).unwrap();
+        }
+        // The remote goes away before the first timed fetch is due.
+        h.fake.has_remote.store(false, Ordering::SeqCst);
+        h.worker.send(WorkerMsg::Refresh).unwrap();
+        h.next_snapshot();
+        assert!(!h.fetch_starts(interval * 2));
+        h.fake.has_remote.store(true, Ordering::SeqCst);
+        h.worker.send(WorkerMsg::Refresh).unwrap();
+        assert!(
+            h.fetch_starts(Duration::from_secs(3)),
+            "timer never resumed"
+        );
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

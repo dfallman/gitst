@@ -1,0 +1,7 @@
+---
+source: tests/render.rs
+expression: "draw(&mut app, 20, 8)"
+---
+ q quit             
+ f fetch now        
+ ? close help

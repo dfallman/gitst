@@ -106,16 +106,19 @@ pub fn classify_fetch_stderr(stderr: &str) -> FetchError {
         "terminal prompts disabled",
         "Host key verification failed",
     ];
+    // Checked before OFFLINE: curl reports a timeout as
+    // "Failed to connect … Operation timed out".
+    const TIMEOUT: &[&str] = &["Connection timed out", "Operation timed out"];
     const OFFLINE: &[&str] = &[
         "Could not resolve host",
         "Network is unreachable",
         "Connection refused",
-        "Connection timed out",
-        "Operation timed out",
         "Failed to connect",
     ];
     if AUTH.iter().any(|p| stderr.contains(p)) {
         FetchError::Auth
+    } else if TIMEOUT.iter().any(|p| stderr.contains(p)) {
+        FetchError::Timeout
     } else if OFFLINE.iter().any(|p| stderr.contains(p)) {
         FetchError::Offline
     } else {
@@ -175,6 +178,24 @@ mod tests {
         assert_eq!(
             classify_fetch_stderr(
                 "fatal: unable to access 'https://x/': Could not resolve host: x\n"
+            ),
+            FetchError::Offline
+        );
+        assert_eq!(
+            classify_fetch_stderr(
+                "ssh: connect to host example.com port 22: Connection timed out\nfatal: Could not read from remote repository.\n"
+            ),
+            FetchError::Timeout
+        );
+        assert_eq!(
+            classify_fetch_stderr(
+                "fatal: unable to access 'https://x/': Failed to connect to x port 443 after 75003 ms: Operation timed out\n"
+            ),
+            FetchError::Timeout
+        );
+        assert_eq!(
+            classify_fetch_stderr(
+                "fatal: unable to access 'https://x/': Failed to connect to x port 443 after 3 ms: Couldn't connect to server\n"
             ),
             FetchError::Offline
         );

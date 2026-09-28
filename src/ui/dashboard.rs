@@ -14,7 +14,7 @@ use super::theme::Theme;
 use super::{line_lr, now_secs, spans_width, truncate_spans};
 use crate::activity::{ActivityKind, merged};
 use crate::app::{Action, App, NavItem, ScrollTarget, Target};
-use crate::model::{Change, Commit, Snapshot};
+use crate::model::{Change, Commit, Counts, Snapshot};
 
 /// Most activity rows kept in the section.
 const ACTIVITY_ROWS: usize = 100;
@@ -324,13 +324,13 @@ fn status_spans(c: &Change, theme: &Theme) -> Vec<Span<'static>> {
     ]
 }
 
-pub(crate) fn stats_spans(
-    added: Option<u32>,
-    removed: Option<u32>,
-    theme: &Theme,
-) -> Vec<Span<'static>> {
-    match (added, removed) {
-        (Some(a), Some(r)) => {
+/// `+a −r`, `bin`, or nothing when the lines were not counted.
+pub(crate) fn stats_spans(counts: Counts, theme: &Theme) -> Vec<Span<'static>> {
+    match counts {
+        Counts::Lines {
+            added: a,
+            removed: r,
+        } => {
             let mut v = Vec::new();
             if a > 0 {
                 v.push(Span::styled(format!("+{a}"), Style::new().fg(theme.add)));
@@ -343,13 +343,15 @@ pub(crate) fn stats_spans(
             }
             v
         }
-        _ => vec![Span::styled("bin", theme.dim)],
+        Counts::Binary => vec![Span::styled("bin", theme.dim)],
+        Counts::Unknown => Vec::new(),
     }
 }
 
 /// Up to five cells, more for bigger changes, split green/red by ratio.
-pub(crate) fn meter(added: Option<u32>, removed: Option<u32>, theme: &Theme) -> Vec<Span<'static>> {
-    let (a, r) = (added.unwrap_or(0) as f64, removed.unwrap_or(0) as f64);
+pub(crate) fn meter(counts: Counts, theme: &Theme) -> Vec<Span<'static>> {
+    let (a, r) = counts.known().unwrap_or((0, 0));
+    let (a, r) = (a as f64, r as f64);
     let total = a + r;
     let cells = if total == 0.0 {
         0
@@ -370,13 +372,15 @@ pub(crate) fn meter(added: Option<u32>, removed: Option<u32>, theme: &Theme) -> 
 
 fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> Section {
     let id = SectionId::Changes;
-    let (total_a, total_r) = snap.changes.iter().fold((0u32, 0u32), |(a, r), c| {
-        (a + c.added.unwrap_or(0), r + c.removed.unwrap_or(0))
-    });
-    let summary = if d.stats && !snap.changes.is_empty() {
-        stats_spans(Some(total_a), Some(total_r), theme)
-    } else {
-        Vec::new()
+    // Totals cover the changes whose lines were counted, if any were.
+    let total = snap
+        .changes
+        .iter()
+        .filter_map(|c| c.counts.known())
+        .reduce(|(a, r), (b, s)| (a.saturating_add(b), r.saturating_add(s)));
+    let summary = match total {
+        Some((a, r)) if d.stats => stats_spans(Counts::lines(a, r), theme),
+        _ => Vec::new(),
     };
     let count = Some(snap.changes.len() + snap.changes_omitted).filter(|n| *n > 0);
     if snap.changes.is_empty() {
@@ -392,7 +396,7 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
     let stats_w = if d.stats {
         snap.changes
             .iter()
-            .map(|c| spans_width(&stats_spans(c.added, c.removed, theme)))
+            .map(|c| spans_width(&stats_spans(c.counts, theme)))
             .max()
             .unwrap_or(0)
     } else {
@@ -408,11 +412,11 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
             left.push(Span::raw(" "));
             let mut right = Vec::new();
             if d.stats {
-                let stats = stats_spans(c.added, c.removed, theme);
+                let stats = stats_spans(c.counts, theme);
                 right.push(Span::raw(" ".repeat(stats_w - spans_width(&stats))));
                 right.extend(stats);
                 right.push(Span::raw(" "));
-                right.extend(meter(c.added, c.removed, theme));
+                right.extend(meter(c.counts, theme));
             }
             let pulse = match app.pulses.get(&c.path).map(|t| now.duration_since(*t)) {
                 Some(age) if age < ttl / 2 => Span::styled(
@@ -658,7 +662,7 @@ mod tests {
     fn meter_scales_and_splits() {
         let t = Theme::ansi();
         let cells = |a, r| {
-            meter(Some(a), Some(r), &t)
+            meter(Counts::lines(a, r), &t)
                 .iter()
                 .map(|s| s.content.chars().filter(|c| *c == '■').count())
                 .sum::<usize>()
@@ -666,6 +670,6 @@ mod tests {
         assert_eq!(cells(0, 0), 0);
         assert_eq!(cells(1, 0), 1);
         assert_eq!(cells(42, 7), 5);
-        assert_eq!(spans_width(&meter(Some(3), Some(1), &t)), METER_CELLS);
+        assert_eq!(spans_width(&meter(Counts::lines(3, 1), &t)), METER_CELLS);
     }
 }

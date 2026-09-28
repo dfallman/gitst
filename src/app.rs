@@ -368,7 +368,12 @@ impl App {
         }
         if self.help {
             self.help = false;
-            return Vec::new();
+            // The help box lists `q` as quit, so it quits from there too.
+            return if k.code == KeyCode::Char('q') {
+                vec![Cmd::Quit]
+            } else {
+                Vec::new()
+            };
         }
         match k.code {
             KeyCode::Char('q') => return vec![Cmd::Quit],
@@ -444,7 +449,9 @@ impl App {
                 }
                 None => {}
             },
-            KeyCode::Esc => self.selected = None,
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                self.selected = None
+            }
             _ => {}
         }
         Vec::new()
@@ -491,8 +498,16 @@ impl App {
                 view.selected = None;
                 view.scroll = view.scroll.saturating_sub(page);
             }
-            KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => view.scroll = usize::MAX / 2,
+            // A selected row would pull the view back to it on the next
+            // draw, so jumping drops the selection, as paging does.
+            KeyCode::Char('g') | KeyCode::Home => {
+                view.selected = None;
+                view.scroll = 0;
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                view.selected = None;
+                view.scroll = usize::MAX / 2;
+            }
             KeyCode::Char('w') => return self.perform(Action::ToggleWrap),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 let target = view
@@ -790,6 +805,32 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_back_keys_clear_selection() {
+        let mut a = app();
+        a.nav = vec![NavItem {
+            section: SectionId::Changes,
+            row: None,
+        }];
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('h'),
+            KeyCode::Left,
+            KeyCode::Backspace,
+        ] {
+            a.selected = Some(a.nav[0]);
+            a.handle(key(code));
+            assert_eq!(a.selected, None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn q_quits_while_help_is_open() {
+        let mut a = app();
+        a.handle(ch('?'));
+        assert!(matches!(a.handle(ch('q'))[..], [Cmd::Quit]));
+    }
+
+    #[test]
     fn help_toggles_and_any_key_closes() {
         let mut a = app();
         a.handle(ch('?'));
@@ -851,8 +892,7 @@ mod tests {
                 orig_path: None,
                 x: ' ',
                 y: 'M',
-                added: Some(*n),
-                removed: Some(0),
+                counts: crate::model::Counts::lines(*n, 0),
             })
             .collect();
         let event = ActivityEvent {

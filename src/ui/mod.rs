@@ -41,6 +41,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     };
     if density.tiny {
         draw_tiny(f, area, &snap, theme);
+        if app.help {
+            detail::draw_short_help(f, theme, area);
+        }
         return;
     }
 

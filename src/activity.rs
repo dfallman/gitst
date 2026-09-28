@@ -107,10 +107,11 @@ pub fn describe_files(paths: &[String], snap: &Snapshot) -> String {
     };
     let mut text = path.clone();
     if let Some(c) = snap.changes.iter().find(|c| &c.path == path) {
-        if let Some(a) = c.added.filter(|a| *a > 0) {
+        let (a, r) = c.counts.known().unwrap_or((0, 0));
+        if a > 0 {
             text.push_str(&format!(" +{a}"));
         }
-        if let Some(r) = c.removed.filter(|r| *r > 0) {
+        if r > 0 {
             text.push_str(&format!(" −{r}"));
         }
     }
@@ -144,10 +145,7 @@ pub fn diff_snapshots(
         let moved_to_index = |to_index: bool| {
             changed.iter().all(|(c, old)| {
                 old.is_some_and(|o| {
-                    o.added == c.added
-                        && o.removed == c.removed
-                        && (o.x == ' ') == to_index
-                        && (c.x == ' ') != to_index
+                    o.counts == c.counts && (o.x == ' ') == to_index && (c.x == ' ') != to_index
                 })
             })
         };
@@ -195,6 +193,7 @@ pub fn merged(reflog: &[ReflogEntry], live: &[ActivityEvent], limit: usize) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Counts;
 
     fn e(r: &str, m: &str) -> ReflogEntry {
         ReflogEntry {
@@ -211,8 +210,7 @@ mod tests {
             orig_path: None,
             x,
             y,
-            added: Some(a),
-            removed: Some(r),
+            counts: Counts::lines(a, r),
         }
     }
 

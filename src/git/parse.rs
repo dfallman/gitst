@@ -1,6 +1,8 @@
 //! Pure parsers for git's machine-readable output.
 
-use crate::model::{Branch, Change, Commit, DiffKind, DiffLine, ReflogEntry, Stash, TagInfo};
+use crate::model::{
+    Branch, Change, Commit, Counts, DiffKind, DiffLine, ReflogEntry, Stash, TagInfo,
+};
 
 pub const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%at%x1f%an%x1f%D%x1f%s%x1e";
 pub const BRANCH_FORMAT: &str = "%(refname:short)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(committerdate:unix)%1f%(HEAD)%1e";
@@ -48,8 +50,7 @@ pub fn parse_status(raw: &[u8]) -> (StatusHeader, Vec<Change>) {
                 orig_path: None,
                 x: '?',
                 y: '?',
-                added: None,
-                removed: None,
+                counts: Counts::Unknown,
             });
         }
     }
@@ -88,12 +89,11 @@ fn ordinary_entry(rest: &str, skip: usize, orig_path: Option<String>) -> Option<
         orig_path,
         x: norm(*xy.first()?),
         y: norm(*xy.get(1)?),
-        added: None,
-        removed: None,
+        counts: Counts::Unknown,
     })
 }
 
-pub type NumstatEntry = (String, Option<u32>, Option<u32>);
+pub type NumstatEntry = (String, Counts);
 
 /// Splits `\x1e`-terminated records into `\x1f`-separated fields.
 fn records(raw: &[u8]) -> impl Iterator<Item = Vec<String>> + '_ {
@@ -113,10 +113,6 @@ fn braced_number(s: &str) -> Option<i64> {
     let open = s.find('{')?;
     let close = s[open..].find('}')? + open;
     s[open + 1..close].parse().ok()
-}
-
-fn count(s: &str) -> Option<u32> {
-    s.parse().ok()
 }
 
 /// Parses `git diff --numstat -z`. Renames report the new path.
@@ -139,7 +135,11 @@ pub fn parse_numstat(raw: &[u8]) -> Vec<NumstatEntry> {
         } else {
             path.to_string()
         };
-        out.push((path, count(a), count(r)));
+        let counts = match (a.parse(), r.parse()) {
+            (Ok(a), Ok(r)) => Counts::lines(a, r),
+            _ => Counts::Binary,
+        };
+        out.push((path, counts));
     }
     out
 }
@@ -317,10 +317,10 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
     #[test]
     fn numstat_plain_binary_rename() {
         let v = parse_numstat(b"5\t0\tb.txt\0-\t-\timg.png\0");
-        assert_eq!(v[0], ("b.txt".into(), Some(5), Some(0)));
-        assert_eq!(v[1], ("img.png".into(), None, None));
+        assert_eq!(v[0], ("b.txt".into(), Counts::lines(5, 0)));
+        assert_eq!(v[1], ("img.png".into(), Counts::Binary));
         let r = parse_numstat(b"1\t2\t\0a.txt\0r.txt\0");
-        assert_eq!(r, vec![("r.txt".into(), Some(1), Some(2))]);
+        assert_eq!(r, vec![("r.txt".into(), Counts::lines(1, 2))]);
     }
 
     #[test]

@@ -1,0 +1,26 @@
+---
+source: tests/render.rs
+expression: out
+---
+ ‹ back  a                             ↻ 2m 
+── Staged ──────────────────────────────────
+@@ -1 +1 @@ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+-us╭ gitst ─────────────────────────────╮   
++us│ click       open · button          │   
+   │ wheel       scroll                 │   
+── │ right-click back                   │───
+@@ │                                    │╌╌╌
+   │ j k ↑ ↓     move · scroll          │   
+-  │ enter l     open                   │   
++  │ esc h       back                   │   
+\ N│ space pgdn  page down              │   
+   │ pgup        page up                │   
+   │ g G         top / bottom           │   
+   │ w           wrap long lines        │   
+   │ f           fetch now              │   
+   │ ?           close help             │   
+   │ q           quit                   │   
+   ╰────────────────────────────────────╯   
+                                            
+                                            
+ esc back  w wrap  q quit

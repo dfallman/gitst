@@ -39,7 +39,7 @@ fn unborn_repo() {
         s.head
     );
     assert_eq!(s.changes.len(), 1);
-    assert_eq!(s.changes[0].added, Some(1));
+    assert_eq!(s.changes[0].counts, Counts::lines(1, 0));
     assert!(s.commits.is_empty());
 }
 
@@ -52,7 +52,7 @@ fn changes_numstat_and_commits() {
     r.git(&["add", "b.txt"]);
     let s = snap(&r);
     let a = s.changes.iter().find(|c| c.path == "a.txt").unwrap();
-    assert_eq!((a.added, a.removed), (Some(2), Some(1)));
+    assert_eq!(a.counts, Counts::lines(2, 1));
     assert!(
         s.changes
             .iter()
@@ -63,6 +63,48 @@ fn changes_numstat_and_commits() {
     assert_eq!(s.commits[0].subject, "first");
     assert!(matches!(s.head, Head::Branch(ref b) if b == "main"));
     assert!(s.oid.is_some());
+}
+
+fn counts(s: &Snapshot) -> Vec<(&str, Counts)> {
+    s.changes
+        .iter()
+        .map(|c| (c.path.as_str(), c.counts))
+        .collect()
+}
+
+#[test]
+fn binary_and_uncounted_changes_differ() {
+    let r = TestRepo::new();
+    r.commit_file("img.bin", "a\0b", "one");
+    r.write("img.bin", "a\0c");
+    r.write("blob.dat", "\0\0");
+    r.write("text.txt", "x\ny");
+    let s = snap(&r);
+    assert_eq!(
+        counts(&s),
+        vec![
+            ("blob.dat", Counts::Binary),
+            ("img.bin", Counts::Binary),
+            ("text.txt", Counts::lines(2, 0)),
+        ]
+    );
+    // Over the numstat limit nothing is counted, which is not binary.
+    let s = backend(&r)
+        .snapshot(&SnapshotOpts {
+            numstat_max_files: 0,
+            ..opts()
+        })
+        .unwrap();
+    assert!(
+        s.changes.iter().all(|c| c.counts == Counts::Unknown),
+        "{s:?}"
+    );
+    // An untracked directory is not counted either.
+    r.git(&["config", "status.showUntrackedFiles", "normal"]);
+    r.write("sub/x.txt", "1\n");
+    let s = snap(&r);
+    let sub = s.changes.iter().find(|c| c.path == "sub/").unwrap();
+    assert_eq!(sub.counts, Counts::Unknown);
 }
 
 #[test]
@@ -289,6 +331,22 @@ fn fetch_updates_behind() {
     let s = snap(&r);
     assert_eq!(s.upstream.unwrap().behind, 1);
     assert!(s.last_fetch.is_some());
+}
+
+#[test]
+fn linked_worktree_reads_its_own_fetch_head() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.with_bare_remote();
+    let wt = r.dir.path().join("wt");
+    r.git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let linked = CliBackend::new(Repo::discover(&wt).ok().unwrap());
+    linked
+        .fetch(false, Duration::from_secs(30), &AtomicBool::new(false))
+        .unwrap();
+    assert!(linked.snapshot(&opts()).unwrap().last_fetch.is_some());
+    // The main worktree has never fetched.
+    assert_eq!(snap(&r).last_fetch, None);
 }
 
 #[test]

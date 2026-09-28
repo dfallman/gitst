@@ -211,12 +211,12 @@ fn commit_lines(
     out.push(plain(Line::default()));
     out.push((rule(&format!("{} files", c.files.len()), w, theme), None));
     let row_w = w.saturating_sub(2);
-    for (path, a, r) in &c.files {
+    for (path, counts) in &c.files {
         let mut right = Vec::new();
         if d.stats {
-            right.extend(stats_spans(*a, *r, theme));
+            right.extend(stats_spans(*counts, theme));
             right.push(Span::raw(" "));
-            right.extend(meter(*a, *r, theme));
+            right.extend(meter(*counts, theme));
         }
         let path_w = row_w.saturating_sub(spans_width(&right) + 1);
         let line = row(
@@ -275,28 +275,82 @@ fn branch_lines(
     out
 }
 
-const HELP: &[(&str, &str)] = &[
+const DASHBOARD_HELP: &[(&str, &str)] = &[
     ("click", "open · fold · button"),
     ("wheel", "scroll"),
-    ("right-click", "back"),
     ("", ""),
     ("j k ↑ ↓", "move"),
-    ("enter l", "open"),
-    ("esc h", "back"),
+    ("enter l", "open · fold"),
+    ("esc h", "clear selection"),
     ("tab", "next section"),
     ("space", "fold section"),
     ("g G", "top / bottom"),
     ("f", "fetch now"),
-    ("w", "wrap long lines"),
     ("?", "close help"),
     ("q", "quit"),
 ];
 
-/// Centered help box; any key or click closes it.
-pub fn draw_help(f: &mut Frame, _app: &mut App, theme: &Theme, area: Rect) {
+const DETAIL_HELP: &[(&str, &str)] = &[
+    ("click", "open · button"),
+    ("wheel", "scroll"),
+    ("right-click", "back"),
+    ("", ""),
+    ("j k ↑ ↓", "move · scroll"),
+    ("enter l", "open"),
+    ("esc h", "back"),
+    ("space pgdn", "page down"),
+    ("pgup", "page up"),
+    ("g G", "top / bottom"),
+    ("w", "wrap long lines"),
+    ("f", "fetch now"),
+    ("?", "close help"),
+    ("q", "quit"),
+];
+
+/// The keys that do something in every layout.
+const SHORT_HELP: &[(&str, &str)] = &[("q", "quit"), ("f", "fetch now"), ("?", "close help")];
+
+/// Help for the one-line layout, and wherever the full box does not fit:
+/// one key per row, or all on one line.
+pub fn draw_short_help(f: &mut Frame, theme: &Theme, area: Rect) {
+    let key_style = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let entry = |(k, v): &(&str, &str)| {
+        [
+            Span::styled(format!(" {k} "), key_style),
+            Span::styled(v.to_string(), theme.dim),
+        ]
+    };
+    let lines: Vec<Line> = if area.height as usize >= SHORT_HELP.len() {
+        SHORT_HELP
+            .iter()
+            .map(|e| Line::from_iter(entry(e)))
+            .collect()
+    } else {
+        let mut spans = Vec::new();
+        for (i, e) in SHORT_HELP.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" ·", theme.dim));
+            }
+            spans.extend(entry(e));
+        }
+        vec![Line::from(spans)]
+    };
+    let r = Rect::new(area.x, area.y, area.width, lines.len() as u16);
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(lines), r);
+}
+
+/// Centered help box for the current view; any key or click closes it.
+pub fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let help = if app.stack.is_empty() {
+        DASHBOARD_HELP
+    } else {
+        DETAIL_HELP
+    };
     let w = area.width.min(38);
-    let h = area.height.min(HELP.len() as u16 + 2);
+    let h = area.height.min(help.len() as u16 + 2);
     if w < 10 || h < 3 {
+        draw_short_help(f, theme, area);
         return;
     }
     let r = Rect::new(
@@ -316,7 +370,7 @@ pub fn draw_help(f: &mut Frame, _app: &mut App, theme: &Theme, area: Rect) {
     f.render_widget(Clear, r);
     f.render_widget(block, r);
     let key_style = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
-    let lines: Vec<Line> = HELP
+    let lines: Vec<Line> = help
         .iter()
         .map(|(k, v)| {
             Line::from(vec![

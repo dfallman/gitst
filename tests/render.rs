@@ -32,8 +32,7 @@ fn ch(path: &str, x: char, y: char, a: u32, r: u32) -> Change {
         orig_path: None,
         x,
         y,
-        added: Some(a),
-        removed: Some(r),
+        counts: Counts::lines(a, r),
     }
 }
 
@@ -456,8 +455,8 @@ fn commit_view_and_file_click() {
         time: at(120),
         message: "icons: jug on cream\n\nAll ten sizes, soft shadow.".into(),
         files: vec![
-            ("Assets/icon.png".into(), None, None),
-            ("project.yml".into(), Some(4), Some(1)),
+            ("Assets/icon.png".into(), Counts::Binary),
+            ("project.yml".into(), Counts::lines(4, 1)),
         ],
     };
     app.handle(UiMsg::Detail(
@@ -602,4 +601,95 @@ fn wheel_still_scrolls_after_keyboard_selection() {
     app.handle(wheel_down(5, 5));
     draw(&mut app, 44, 16);
     assert!(app.stack[0].scroll > 0);
+}
+
+fn many_files_commit(app: &mut App) {
+    let oid = "4de1e3c0000000000000000000000000000000000".to_string();
+    open(app, Target::Commit(oid.clone()));
+    let detail = CommitDetail {
+        oid: oid.clone(),
+        author: "Dan".into(),
+        time: at(120),
+        message: "many files".into(),
+        files: (0..30)
+            .map(|i| (format!("file{i:02}.rs"), Counts::lines(1, 0)))
+            .collect(),
+    };
+    app.handle(UiMsg::Detail(
+        DetailReq::Commit { rev: oid },
+        Ok(DetailData::Commit(detail)),
+    ));
+}
+
+fn special(code: KeyCode) -> UiMsg {
+    UiMsg::Input(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+}
+
+#[test]
+fn home_and_end_win_over_a_selected_row() {
+    for (bottom, top) in [('G', 'g'), ('\0', '\0')] {
+        let (to_bottom, to_top) = if bottom == '\0' {
+            (special(KeyCode::End), special(KeyCode::Home))
+        } else {
+            (key(bottom), key(top))
+        };
+        let mut app = new_app(fixture());
+        many_files_commit(&mut app);
+        draw(&mut app, 44, 12);
+        app.handle(key('j'));
+        draw(&mut app, 44, 12);
+        app.handle(to_bottom);
+        let out = draw(&mut app, 44, 12);
+        assert!(out.contains("file29.rs"), "{out}");
+        app.handle(to_top);
+        let out = draw(&mut app, 44, 12);
+        assert!(out.contains("many files"), "{out}");
+        assert_eq!(app.stack[0].scroll, 0);
+    }
+}
+
+#[test]
+fn help_shows_in_the_one_line_layout() {
+    let mut app = new_app(fixture());
+    app.handle(key('?'));
+    insta::assert_snapshot!(draw(&mut app, 20, 8));
+    let out = draw(&mut app, 20, 1);
+    assert!(out.contains("quit"), "{out}");
+}
+
+#[test]
+fn help_describes_the_detail_view() {
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("a".into()));
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Ok(file_data()),
+    ));
+    app.handle(key('?'));
+    let out = draw(&mut app, 44, 22);
+    insta::assert_snapshot!(out);
+    assert!(out.contains("page down"), "{out}");
+    assert!(!out.contains("fold section"), "{out}");
+    assert!(!out.contains("next section"), "{out}");
+}
+
+#[test]
+fn uncounted_changes_are_blank_not_binary() {
+    let mut s = fixture();
+    s.changes[2].counts = Counts::Unknown;
+    s.changes[3].counts = Counts::Binary;
+    let out = render(44, 20, s.clone());
+    let line = |p: &str| out.lines().find(|l| l.contains(p)).unwrap().to_string();
+    assert!(!line("src/app.rs").contains("bin"), "{out}");
+    assert!(line("src/git.rs").contains("bin"), "{out}");
+    // Totals cover what was counted: 3 + 10 added, 2 removed.
+    assert!(line("Changes").contains("+13 −2"), "{out}");
+
+    for c in &mut s.changes {
+        c.counts = Counts::Unknown;
+    }
+    let out = render(44, 20, s);
+    assert!(!out.contains("bin"), "{out}");
+    let title = out.lines().find(|l| l.contains("Changes")).unwrap();
+    assert!(!title.contains('+'), "{out}");
 }

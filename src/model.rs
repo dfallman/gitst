@@ -38,8 +38,55 @@ pub struct Change {
     pub orig_path: Option<String>,
     pub x: char,
     pub y: char,
-    pub added: Option<u32>,
-    pub removed: Option<u32>,
+    pub counts: Counts,
+}
+
+/// Lines added and removed by a change, as far as they are known.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Counts {
+    Lines {
+        added: u32,
+        removed: u32,
+    },
+    /// Numstat's `-`, or an untracked file with NUL bytes.
+    Binary,
+    /// Not counted: more changes than `numstat_max_files`, an untracked
+    /// directory or large file, or git failed.
+    #[default]
+    Unknown,
+}
+
+impl Counts {
+    pub fn lines(added: u32, removed: u32) -> Counts {
+        Counts::Lines { added, removed }
+    }
+
+    /// `(added, removed)` when the lines were counted.
+    pub fn known(self) -> Option<(u32, u32)> {
+        match self {
+            Counts::Lines { added, removed } => Some((added, removed)),
+            _ => None,
+        }
+    }
+
+    /// Counts for one path from two diffs (staged and unstaged). Unknown
+    /// wins over binary, and binary over lines.
+    pub fn plus(self, other: Counts) -> Counts {
+        match (self, other) {
+            (Counts::Unknown, _) | (_, Counts::Unknown) => Counts::Unknown,
+            (Counts::Binary, _) | (_, Counts::Binary) => Counts::Binary,
+            (
+                Counts::Lines {
+                    added: a,
+                    removed: r,
+                },
+                Counts::Lines {
+                    added: b,
+                    removed: s,
+                },
+            ) => Counts::lines(a.saturating_add(b), r.saturating_add(s)),
+        }
+    }
 }
 
 impl Change {
@@ -204,7 +251,7 @@ pub struct CommitDetail {
     pub author: String,
     pub time: i64,
     pub message: String,
-    pub files: Vec<(String, Option<u32>, Option<u32>)>,
+    pub files: Vec<(String, Counts)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
