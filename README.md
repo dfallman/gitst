@@ -92,8 +92,10 @@ gitst --version
 
 ## Config
 
-Optional, at `~/.config/gitst/config.toml`. All keys are optional; these are the
-defaults:
+Optional. gitst reads the first of these that exists:
+`$XDG_CONFIG_HOME/gitst/config.toml` (when that is set),
+`%APPDATA%\gitst\config.toml` (Windows) and `~/.config/gitst/config.toml`.
+All keys are optional; these are the defaults:
 
 ```toml
 fetch_interval = "5m"               # "0" turns the timer off; ↻ and f still work
@@ -106,7 +108,8 @@ numstat_max_files = 500             # skip +/− counts above this many changes
 ```
 
 Section names for `collapsed` are `changes`, `activity`, `commits`, `branches`
-and `stashes`. An invalid file is reported in the UI and the defaults are used.
+and `stashes`. Unknown keys and invalid values are named in the UI and keep their
+defaults; the rest of the file still applies.
 
 ## Notes
 

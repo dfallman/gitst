@@ -159,6 +159,9 @@ pub struct App {
     pub folded: HashSet<SectionId>,
     pub scroll: HashMap<SectionId, usize>,
     pub selected: Option<NavItem>,
+    /// What the selected row opens, so the selection can follow that row
+    /// when rows above it come or go.
+    pub selected_target: Option<Target>,
     pub hover: Option<(u16, u16)>,
     pub stack: Vec<DetailView>,
     pub help: bool,
@@ -178,6 +181,8 @@ pub struct App {
     pub detail_targets: Vec<Option<Target>>,
     /// Filled by draw: rows of the section or detail body, for paging.
     pub page: usize,
+    /// Whether something on screen may have changed since the last draw.
+    pub redraw: bool,
 }
 
 impl App {
@@ -197,6 +202,7 @@ impl App {
             folded,
             scroll: HashMap::new(),
             selected: None,
+            selected_target: None,
             hover: None,
             stack: Vec::new(),
             help: false,
@@ -209,10 +215,43 @@ impl App {
             row_targets: HashMap::new(),
             detail_targets: Vec::new(),
             page: 10,
+            redraw: true,
         }
     }
 
+    /// Whether to draw, clearing the request.
+    pub fn take_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.redraw)
+    }
+
+    /// Selects a dashboard item, remembering what a row opens.
+    fn select(&mut self, item: Option<NavItem>) {
+        self.selected_target = item
+            .and_then(|n| Some((n.section, n.row?)))
+            .and_then(|key| self.row_targets.get(&key).cloned());
+        self.selected = item;
+    }
+
+    /// The clickable area under the mouse pointer.
+    pub(crate) fn hovered(&self) -> Option<Rect> {
+        let (x, y) = self.hover?;
+        self.hits
+            .clicks
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| r.contains(Position::new(x, y)))
+    }
+
     pub fn handle(&mut self, msg: UiMsg) -> Vec<Cmd> {
+        // A pointer move redraws only when it changes what is highlighted.
+        let moved = matches!(
+            &msg,
+            UiMsg::Input(Event::Mouse(m))
+                if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_))
+        );
+        if !moved {
+            self.redraw = true;
+        }
         match msg {
             UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => self.key(k),
             UiMsg::Input(Event::Mouse(m)) => self.mouse(m),
@@ -405,7 +444,7 @@ impl App {
             .selected
             .and_then(|s| self.nav.iter().position(|n| *n == s));
         let last = self.nav.len().saturating_sub(1);
-        let select = |app: &mut App, i: usize| app.selected = app.nav.get(i).copied();
+        let select = |app: &mut App, i: usize| app.select(app.nav.get(i).copied());
         match code {
             KeyCode::Char('j') | KeyCode::Down => {
                 select(self, pos.map_or(0, |p| (p + 1).min(last)))
@@ -440,10 +479,10 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 if let Some(s) = self.selected {
-                    self.selected = Some(NavItem {
+                    self.select(Some(NavItem {
                         section: s.section,
                         row: None,
-                    });
+                    }));
                     return self.perform(Action::Toggle(s.section));
                 }
             }
@@ -462,7 +501,7 @@ impl App {
                 None => {}
             },
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
-                self.selected = None
+                self.select(None)
             }
             _ => {}
         }
@@ -563,10 +602,10 @@ impl App {
                     // instead of pulling the view back on the next draw.
                     Some(ScrollTarget::Section(id)) => {
                         if self.selected.is_some_and(|s| s.section == id) {
-                            self.selected = Some(NavItem {
+                            self.select(Some(NavItem {
                                 section: id,
                                 row: None,
-                            });
+                            }));
                         }
                         apply(self.scroll.entry(id).or_insert(0));
                     }
@@ -581,7 +620,9 @@ impl App {
                 Vec::new()
             }
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                let before = self.hovered();
                 self.hover = Some((x, y));
+                self.redraw |= self.hovered() != before;
                 Vec::new()
             }
             _ => Vec::new(),
@@ -847,6 +888,31 @@ mod tests {
         let mut a = app();
         a.handle(ch('?'));
         assert!(matches!(a.handle(ch('q'))[..], [Cmd::Quit]));
+    }
+
+    #[test]
+    fn hover_redraws_only_when_its_target_changes() {
+        let mut a = app();
+        a.hits
+            .clicks
+            .push((Rect::new(0, 2, 10, 1), Action::Toggle(SectionId::Changes)));
+        a.hits
+            .clicks
+            .push((Rect::new(0, 3, 10, 1), Action::Toggle(SectionId::Commits)));
+        let moved = |x, y| mouse(MouseEventKind::Moved, x, y);
+        a.take_redraw();
+        a.handle(moved(1, 2));
+        assert!(a.take_redraw(), "onto a target");
+        a.handle(moved(5, 2));
+        assert!(!a.take_redraw(), "within the same target");
+        a.handle(moved(5, 3));
+        assert!(a.take_redraw(), "onto another target");
+        a.handle(moved(5, 9));
+        assert!(a.take_redraw(), "off every target");
+        a.handle(moved(6, 9));
+        assert!(!a.take_redraw(), "still off every target");
+        a.handle(ch('j'));
+        assert!(a.take_redraw(), "any other input");
     }
 
     #[test]

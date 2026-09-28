@@ -55,8 +55,8 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build (release)
-        # --locked works because the post-commit hook keeps Cargo.lock's
-        # gitst version in step with Cargo.toml.
+        # --locked works because the pre-commit hook (.githooks) keeps
+        # Cargo.lock's gitst version in step with Cargo.toml.
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package

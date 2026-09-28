@@ -35,14 +35,23 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density)
             diff_lines(blocks, theme, w, app.wrap)
         }
         Some(Ok(DetailData::Commit(c))) => commit_lines(c, app, theme, w, d),
-        Some(Ok(DetailData::Branch { ahead, behind })) => {
+        Some(Ok(DetailData::Branch {
+            ahead,
+            behind,
+            ahead_total,
+            behind_total,
+        })) => {
             let upstream = match &view.target {
                 Target::Branch {
                     upstream: Some(u), ..
                 } => u.clone(),
                 _ => "upstream".into(),
             };
-            branch_lines(ahead, behind, &upstream, app, theme, w, d)
+            let sides = [
+                ("ahead of", &ahead[..], *ahead_total),
+                ("behind", &behind[..], *behind_total),
+            ];
+            branch_lines(sides, &upstream, app, theme, w, d)
         }
     };
 
@@ -236,16 +245,17 @@ fn commit_lines(
     out
 }
 
+/// Commits ahead of and behind the upstream: `(label, listed, total)` per
+/// side, where only the newest are listed.
 fn branch_lines(
-    ahead: &[Commit],
-    behind: &[Commit],
+    sides: [(&str, &[Commit], usize); 2],
     upstream: &str,
     app: &App,
     theme: &Theme,
     w: usize,
     d: Density,
 ) -> Vec<DetailLine> {
-    if ahead.is_empty() && behind.is_empty() {
+    if sides.iter().all(|(_, commits, _)| commits.is_empty()) {
         let text = format!(" ✓ in sync with {upstream}");
         return vec![(
             Line::from(Span::styled(text, Style::new().fg(theme.add))),
@@ -254,15 +264,16 @@ fn branch_lines(
     }
     let row_w = w.saturating_sub(2);
     let mut out = Vec::new();
-    for (label, commits) in [("ahead of", ahead), ("behind", behind)] {
+    for (label, commits, total) in sides {
         if commits.is_empty() {
             continue;
         }
         if !out.is_empty() {
             out.push((Line::default(), None));
         }
+        let total = total.max(commits.len());
         out.push((
-            rule(&format!("{label} {upstream} ({})", commits.len()), w, theme),
+            rule(&format!("{label} {upstream} ({total})"), w, theme),
             None,
         ));
         for c in commits {
@@ -270,6 +281,10 @@ fn branch_lines(
                 commit_row(c, app, theme, row_w, d),
                 Some(Target::Commit(c.oid.clone())),
             ));
+        }
+        if total > commits.len() {
+            let more = format!(" … {} more", total - commits.len());
+            out.push((Line::from(Span::styled(more, theme.dim)), None));
         }
     }
     out

@@ -1,0 +1,93 @@
+#!/bin/sh
+#
+# pre-commit hook: bumps the version in Cargo.toml as part of every commit.
+# The bump is staged before git writes the commit, so nothing is amended
+# afterwards: the hash git prints is final and a signed commit is signed once.
+#
+# Versions are X.Y.Z. Each commit bumps Z.
+#
+#   GITST_BUMP=minor git commit ...   bumps Y and resets Z.
+#   GITST_BUMP=major git commit ...   bumps X and resets Y and Z.
+#   GITST_BUMP=none git commit ...    keeps the version.
+#
+# Left alone: amends (they keep the version of the commit they replace), a
+# commit whose staged Cargo.toml already changes the version (set by hand),
+# `git commit <paths>`, and commits made by merge, rebase, cherry-pick and
+# revert. `--no-verify` skips this hook, and with it the bump.
+#
+# Only the staged Cargo.toml and Cargo.lock are bumped, plus the same line in
+# the working tree, so unstaged edits to those files stay out of the commit.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+[ "$GITST_BUMP" = none ] && exit 0
+
+GIT_DIR="$(git rev-parse --git-dir)"
+
+if [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ] \
+	|| [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] || [ -f "$GIT_DIR/REVERT_HEAD" ] \
+	|| [ -f "$GIT_DIR/MERGE_HEAD" ]; then
+	exit 0
+fi
+# `git commit <paths>` commits from a temporary index, and a bump staged
+# there would be missing from the real one afterwards.
+case "$GIT_INDEX_FILE" in
+*next-index*) exit 0 ;;
+esac
+# A root commit keeps the version it was made with.
+git rev-parse -q --verify HEAD >/dev/null || exit 0
+
+# An amend shows on git's command line (aliases are expanded by then).
+# Without ps, fall back on the author date git passes to hooks, which an
+# amend keeps from HEAD.
+ARGS="$(ps -o args= -p "$PPID" 2>/dev/null)"
+if [ -n "$ARGS" ]; then
+	case " $ARGS " in
+	*" --amend "*) exit 0 ;;
+	esac
+elif [ "$GIT_AUTHOR_DATE" = "@$(git log -1 --format=%ad --date=raw)" ]; then
+	exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+version_of() {
+	sed -n 's/^version = "\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' | head -n 1
+}
+
+HEAD_VERSION="$(git show HEAD:Cargo.toml 2>/dev/null | version_of)"
+STAGED="$(git show :Cargo.toml 2>/dev/null | version_of)"
+[ -n "$HEAD_VERSION" ] && [ -n "$STAGED" ] || exit 0
+
+NEW="$STAGED"
+if [ "$STAGED" = "$HEAD_VERSION" ]; then
+	MAJOR="$(echo "$STAGED" | cut -d. -f1)"
+	MINOR="$(echo "$STAGED" | cut -d. -f2)"
+	PATCH="$(echo "$STAGED" | cut -d. -f3)"
+	case "$GITST_BUMP" in
+	major) MAJOR=$((MAJOR + 1)) MINOR=0 PATCH=0 ;;
+	minor) MINOR=$((MINOR + 1)) PATCH=0 ;;
+	*) PATCH=$((PATCH + 1)) ;;
+	esac
+	NEW="$MAJOR.$MINOR.$PATCH"
+fi
+
+# Only the first `version =` line: the [package] one.
+bump_toml() { perl -pe "\$d ||= s/^version = \"[0-9.]+\"/version = \"$NEW\"/"; }
+# Cargo.lock too, also after a hand edit, so release builds can use --locked.
+bump_lock() { perl -0pe "s/(\[\[package\]\]\nname = \"gitst\"\nversion = \")[0-9.]+/\${1}$NEW/"; }
+
+# Rewrites the staged copy of $1 through $2, and the working copy the same way.
+bump() {
+	git ls-files --error-unmatch -- "$1" >/dev/null 2>&1 || return 0
+	mode="$(git ls-files -s -- "$1" | cut -d' ' -f1)"
+	blob="$(git show ":$1" | $2 | git hash-object -w --stdin)" || return 0
+	git update-index --cacheinfo "$mode,$blob,$1" || return 0
+	$2 <"$1" >"$1.bump" && cat "$1.bump" >"$1"
+	rm -f "$1.bump"
+}
+bump Cargo.toml bump_toml
+bump Cargo.lock bump_lock
+
+[ "$NEW" = "$HEAD_VERSION" ] || echo "gitst $HEAD_VERSION -> $NEW"
+exit 0

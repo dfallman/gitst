@@ -259,8 +259,12 @@ pub enum DetailData {
     File(Vec<DiffBlock>),
     Commit(CommitDetail),
     CommitFile(Vec<DiffBlock>),
+    /// The newest commits on each side (at most 50), and how many there
+    /// are in all.
     Branch {
         ahead: Vec<Commit>,
         behind: Vec<Commit>,
+        ahead_total: usize,
+        behind_total: usize,
     },
 }

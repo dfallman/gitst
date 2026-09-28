@@ -42,7 +42,7 @@ impl Tui {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                &raw mut size,
             )
         };
         assert_eq!(made, 0, "openpty");
@@ -188,3 +188,29 @@ fn ctrl_z_hands_back_the_terminal_and_resumes() {
     assert!(tui.exits_within(Duration::from_secs(5)));
     assert!(tui.left_normal_screen());
 }
+
+#[test]
+fn the_spinner_keeps_turning_while_the_mouse_moves() {
+    let r = repo();
+    // A background fetch that never finishes keeps the spinner up.
+    let pid_file = hanging_remote(&r);
+    let mut tui = Tui::start(&r.path());
+    wait_for_pid(&pid_file);
+    std::thread::sleep(Duration::from_millis(300));
+    let before = tui.output().len();
+    let start = Instant::now();
+    let mut x = 10;
+    while start.elapsed() < Duration::from_millis(1500) {
+        // Pointer moves (SGR mouse reports) faster than the spinner turns.
+        x = if x == 10 { 11 } else { 10 };
+        tui.type_bytes(format!("\x1b[<35;{x};20M").as_bytes());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let frames = tui.output()[before..]
+        .chars()
+        .filter(|c| SPINNER.contains(*c))
+        .count();
+    assert!(frames >= 5, "the spinner turned {frames} times in 1.5 s");
+}
+
+const SPINNER: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";

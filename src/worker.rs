@@ -124,6 +124,12 @@ impl Drop for WorkerHandle {
     }
 }
 
+/// When a timer of `delay` goes off, or `None` if that is beyond what an
+/// `Instant` can hold (an interval of centuries means never).
+fn due_in(delay: Duration) -> Option<Instant> {
+    Instant::now().checked_add(delay)
+}
+
 /// Starts the worker thread.
 pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>) -> WorkerHandle {
     let (tx, rx) = mpsc::channel();
@@ -219,7 +225,11 @@ impl Worker {
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs() as i64);
                 let (events, changed) = match &self.prev {
-                    Some(prev) => diff_snapshots(prev, &snap, now),
+                    Some(prev) => {
+                        let root = &self.backend.repo().root;
+                        let gone = |p: &str| std::fs::symlink_metadata(root.join(p)).is_err();
+                        diff_snapshots(prev, &snap, now, &gone)
+                    }
                     None => (Vec::new(), Vec::new()),
                 };
                 if std::mem::take(&mut self.manual_pending)
@@ -265,7 +275,7 @@ impl Worker {
             .last_fetch
             .and_then(|t| t.elapsed().ok())
             .unwrap_or(Duration::MAX);
-        self.next_fetch = Some(Instant::now() + self.cfg.interval.saturating_sub(since));
+        self.next_fetch = due_in(self.cfg.interval.saturating_sub(since));
     }
 
     fn start_fetch(&mut self, manual: bool) {
@@ -313,8 +323,7 @@ impl Worker {
             }
         }
         if !self.cfg.interval.is_zero() {
-            self.next_fetch =
-                Some(Instant::now() + backoff(self.cfg.interval, self.fetch.failures));
+            self.next_fetch = due_in(backoff(self.cfg.interval, self.fetch.failures));
         }
         let _ = self.ui.send(UiMsg::Fetch(self.fetch.clone()));
     }
@@ -419,6 +428,14 @@ mod tests {
         fn fetch_starts(&self, within: Duration) -> bool {
             self.started.recv_timeout(within).is_ok()
         }
+    }
+
+    #[test]
+    fn huge_interval_does_not_overflow_the_timer() {
+        let h = harness(Duration::from_secs(u64::MAX), Some(SystemTime::now()));
+        h.worker.send(WorkerMsg::Refresh).unwrap();
+        h.next_snapshot();
+        assert!(!h.fetch_starts(Duration::from_millis(200)));
     }
 
     #[test]

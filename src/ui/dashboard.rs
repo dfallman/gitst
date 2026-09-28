@@ -151,6 +151,16 @@ pub fn draw(
                 app.row_targets.insert((id, i), t.clone());
             }
         }
+        if let Some(NavItem {
+            section: s,
+            row: Some(r),
+        }) = app.selected
+            && s == id
+        {
+            let row = follow_selection(&section.rows, r, app.selected_target.as_ref());
+            app.selected = Some(NavItem { section: id, row });
+            app.selected_target = row.and_then(|i| section.rows[i].target.clone());
+        }
         let selected_row = match app.selected {
             Some(NavItem {
                 section,
@@ -180,6 +190,21 @@ pub fn draw(
         }
     }
     selected_rect
+}
+
+/// Where a selected row is after the rows changed: the row that opens the
+/// same thing; else, once that is gone, the row now in its place (or the
+/// nearest selectable one above it); else the section title (`None`).
+fn follow_selection(rows: &[Row], old: usize, target: Option<&Target>) -> Option<usize> {
+    if let Some(t) = target
+        && let Some(i) = rows.iter().position(|r| r.target.as_ref() == Some(t))
+    {
+        return Some(i);
+    }
+    let last = rows.len().checked_sub(1)?;
+    (0..=old.min(last))
+        .rev()
+        .find(|i| rows[*i].target.is_some())
 }
 
 /// Which rows of a section show: `(first, count, hidden_below)`. When rows

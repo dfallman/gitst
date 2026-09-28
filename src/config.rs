@@ -1,11 +1,12 @@
-//! Optional `~/.config/gitst/config.toml`.
+//! Optional `config.toml`, in `$XDG_CONFIG_HOME/gitst/`, `%APPDATA%\gitst\`
+//! on Windows, or `~/.config/gitst/`.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub fetch_interval: String,
     pub fetch_prune: bool,
@@ -31,27 +32,63 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Reads the config file. A missing file gives the defaults; an invalid
-    /// one gives the defaults plus a warning to show in the UI.
+    /// Reads the first config file that exists. A missing file gives the
+    /// defaults; unknown keys and bad values keep their defaults and are
+    /// named in a warning to show in the UI.
     pub fn load() -> (Config, Option<String>) {
-        let Some(path) = dirs::home_dir().map(|h| h.join(".config/gitst/config.toml")) else {
-            return (Config::default(), None);
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+        let platform = if cfg!(windows) {
+            dirs::config_dir()
+        } else {
+            None
         };
-        match std::fs::read_to_string(&path) {
-            Err(_) => (Config::default(), None),
-            Ok(text) => match Config::from_toml(&text) {
-                Ok(c) => (c, None),
-                Err(e) => (Config::default(), Some(format!("config.toml: {e}"))),
-            },
+        let home = dirs::home_dir();
+        for path in config_paths(xdg.as_deref(), home.as_deref(), platform.as_deref()) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                return Config::from_toml(&text);
+            }
         }
+        (Config::default(), None)
     }
 
-    pub fn from_toml(s: &str) -> Result<Config, String> {
-        let c: Config = toml::from_str(s).map_err(|e| e.message().to_string())?;
-        if parse_duration(&c.fetch_interval).is_none() {
-            return Err(format!("invalid fetch_interval \"{}\"", c.fetch_interval));
+    /// Parses a config file key by key, so that one typo does not cost the
+    /// rest of the file.
+    pub fn from_toml(s: &str) -> (Config, Option<String>) {
+        let table: toml::Table = match toml::from_str(s) {
+            Ok(t) => t,
+            Err(e) => {
+                let warning = format!("config.toml: {}", e.message().trim_end());
+                return (Config::default(), Some(warning));
+            }
+        };
+        let mut c = Config::default();
+        let mut bad = Vec::new();
+        for (key, value) in table {
+            let ok = match key.as_str() {
+                "fetch_interval" => match value.try_into::<String>() {
+                    Ok(v) if parse_duration(&v).is_some() => {
+                        c.fetch_interval = v;
+                        true
+                    }
+                    _ => false,
+                },
+                "fetch_prune" => set(&mut c.fetch_prune, value),
+                "collapsed" => set(&mut c.collapsed, value),
+                "icons" => set(&mut c.icons, value),
+                "pulse_seconds" => set(&mut c.pulse_seconds, value),
+                "max_changes" => set(&mut c.max_changes, value),
+                "numstat_max_files" => set(&mut c.numstat_max_files, value),
+                _ => {
+                    bad.push(format!("{key} (unknown)"));
+                    continue;
+                }
+            };
+            if !ok {
+                bad.push(format!("{key} (invalid)"));
+            }
         }
-        Ok(c)
+        let warning = (!bad.is_empty()).then(|| format!("config.toml: ignored {}", bad.join(", ")));
+        (c, warning)
     }
 
     pub fn fetch_interval(&self) -> Duration {
@@ -59,7 +96,34 @@ impl Config {
     }
 }
 
-/// Parses `"0"`, `"90"` (seconds), `"30s"`, `"5m"` or `"1h"`.
+/// Stores `value` in `slot` if it has the right type.
+fn set<T: DeserializeOwned>(slot: &mut T, value: toml::Value) -> bool {
+    match value.try_into() {
+        Ok(v) => {
+            *slot = v;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Where a config file may be, in order: under `XDG_CONFIG_HOME` when set
+/// (and absolute, as the spec requires), the platform's config directory,
+/// then `~/.config`, which is the documented place and stays valid.
+fn config_paths(xdg: Option<&Path>, home: Option<&Path>, platform: Option<&Path>) -> Vec<PathBuf> {
+    let xdg = xdg.filter(|p| p.is_absolute());
+    let mut paths: Vec<PathBuf> = [xdg, platform]
+        .into_iter()
+        .flatten()
+        .chain(home.map(|h| h.join(".config")).as_deref())
+        .map(|dir| dir.join("gitst").join("config.toml"))
+        .collect();
+    paths.dedup();
+    paths
+}
+
+/// Parses `"0"`, `"90"` (seconds), `"30s"`, `"5m"` or `"1h"`. A value too
+/// large to count in seconds is rejected.
 pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     let (num, unit) = match s.char_indices().last()? {
@@ -69,8 +133,8 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     let n: u64 = num.parse().ok()?;
     let secs = match unit {
         's' => n,
-        'm' => n * 60,
-        'h' => n * 3600,
+        'm' => n.checked_mul(60)?,
+        'h' => n.checked_mul(3600)?,
         _ => return None,
     };
     Some(Duration::from_secs(secs))
@@ -89,11 +153,35 @@ mod tests {
         assert_eq!(parse_duration(" 90 "), Some(Duration::from_secs(90)));
         assert_eq!(parse_duration("x"), None);
         assert_eq!(parse_duration("5d"), None);
+        // Too large to count in seconds.
+        assert_eq!(parse_duration(&format!("{}h", u64::MAX / 1000)), None);
+    }
+
+    #[test]
+    fn config_paths_prefer_xdg_then_platform_then_home() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            config_paths(Some(&p("/x")), Some(&p("/h")), None),
+            vec![p("/x/gitst/config.toml"), p("/h/.config/gitst/config.toml")]
+        );
+        // A relative XDG_CONFIG_HOME is invalid and ignored.
+        assert_eq!(
+            config_paths(Some(&p("rel")), Some(&p("/h")), None),
+            vec![p("/h/.config/gitst/config.toml")]
+        );
+        assert_eq!(
+            config_paths(None, Some(&p("/h")), Some(&p("/h/AppData"))),
+            vec![
+                p("/h/AppData/gitst/config.toml"),
+                p("/h/.config/gitst/config.toml")
+            ]
+        );
     }
 
     #[test]
     fn partial_toml_keeps_defaults() {
-        let c = Config::from_toml("fetch_prune = true").unwrap();
+        let (c, warning) = Config::from_toml("fetch_prune = true");
+        assert_eq!(warning, None);
         assert!(c.fetch_prune);
         assert_eq!(c.fetch_interval, "5m");
         assert_eq!(c.collapsed, vec!["branches", "stashes"]);
@@ -101,8 +189,26 @@ mod tests {
     }
 
     #[test]
-    fn bad_toml_errors() {
-        assert!(Config::from_toml("fetch_prune = 3").is_err());
-        assert!(Config::from_toml("fetch_interval = \"soon\"").is_err());
+    fn bad_keys_are_dropped_one_by_one() {
+        let (c, warning) =
+            Config::from_toml("fetch_prune = true\ncolour = 1\nfetch_interval = \"soon\"\n");
+        assert!(c.fetch_prune, "good keys still apply");
+        assert_eq!(c.fetch_interval, "5m");
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("colour") && warning.contains("fetch_interval"),
+            "{warning}"
+        );
+        let (c, warning) = Config::from_toml("fetch_prune = 3\npulse_seconds = 4");
+        assert_eq!((c.fetch_prune, c.pulse_seconds), (false, 4));
+        assert!(warning.unwrap().contains("fetch_prune"));
+        assert_eq!(Config::from_toml("pulse_seconds = 4").1, None);
+    }
+
+    #[test]
+    fn broken_toml_gives_defaults_and_a_warning() {
+        let (c, warning) = Config::from_toml("fetch_prune = ");
+        assert_eq!(c, Config::default());
+        assert!(warning.is_some());
     }
 }

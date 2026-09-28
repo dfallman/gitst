@@ -2,7 +2,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -130,20 +130,28 @@ fn run(
         }
     };
 
+    // Ages, the spinner and pulses change with time alone, so a redraw is
+    // due by this time even if every message until then is one that does
+    // not redraw, such as a pointer move.
+    let mut due = Instant::now();
     loop {
-        app.now = SystemTime::now();
-        terminal.draw(|f| ui::draw(f, &mut app, theme))?;
-        let wait = poll.map_or(app.next_wakeup(), |p| p.min(app.next_wakeup()));
-        let first = match ui_rx.recv_timeout(wait) {
+        if app.take_redraw() {
+            app.now = SystemTime::now();
+            terminal.draw(|f| ui::draw(f, &mut app, theme))?;
+            let wait = poll.map_or(app.next_wakeup(), |p| p.min(app.next_wakeup()));
+            due = Instant::now() + wait;
+        }
+        let first = match ui_rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
             Ok(m) => Some(m),
-            Err(RecvTimeoutError::Timeout) => {
-                if poll.is_some() {
-                    let _ = worker.send(WorkerMsg::Refresh);
-                }
-                None
-            }
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        if Instant::now() >= due {
+            app.redraw = true;
+            if poll.is_some() {
+                let _ = worker.send(WorkerMsg::Refresh);
+            }
+        }
         let mut quit = false;
         app.now = SystemTime::now();
         for msg in first

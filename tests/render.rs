@@ -490,6 +490,8 @@ fn branch_view() {
     let data = DetailData::Branch {
         ahead: snap.commits[..2].to_vec(),
         behind: vec![],
+        ahead_total: 2,
+        behind_total: 0,
     };
     app.handle(UiMsg::Detail(
         DetailReq::Branch {
@@ -714,4 +716,74 @@ fn single_file_activity_row_opens_the_file() {
         app.stack.last().map(|v| v.target.clone()),
         Some(Target::File("src/app.rs".into()))
     );
+}
+
+#[test]
+fn branch_view_titles_use_the_full_counts() {
+    let mut app = new_app(fixture());
+    let target = Target::Branch {
+        name: "main".into(),
+        upstream: Some("origin/main".into()),
+    };
+    open(&mut app, target);
+    app.handle(UiMsg::Detail(
+        DetailReq::Branch {
+            name: "main".into(),
+            upstream: "origin/main".into(),
+        },
+        Ok(DetailData::Branch {
+            ahead: fixture().commits[..2].to_vec(),
+            behind: vec![],
+            ahead_total: 80,
+            behind_total: 0,
+        }),
+    ));
+    let out = draw(&mut app, 44, 12);
+    assert!(out.contains("ahead of origin/main (80)"), "{out}");
+    assert!(out.contains("78 more"), "{out}");
+}
+
+fn enter() -> UiMsg {
+    UiMsg::Input(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+}
+
+fn opened(app: &mut App) -> Option<Target> {
+    app.handle(enter());
+    app.stack.pop().map(|v| v.target)
+}
+
+#[test]
+fn selection_stays_on_its_row_when_rows_move() {
+    let mut app = new_app(fixture());
+    draw(&mut app, 44, 28);
+    // Changes title, notes.md, old.rs, src/app.rs, src/git.rs.
+    for _ in 0..5 {
+        app.handle(key('j'));
+    }
+    draw(&mut app, 44, 28);
+    assert_eq!(opened(&mut app), Some(Target::File("src/git.rs".into())));
+
+    // A new path sorts above the selected one.
+    let mut s = fixture();
+    s.changes.insert(0, ch("a_first.rs", '?', '?', 1, 0));
+    app.handle(UiMsg::Snapshot {
+        snap: Arc::new(s.clone()),
+        events: vec![],
+        changed: vec![],
+    });
+    draw(&mut app, 44, 28);
+    assert_eq!(opened(&mut app), Some(Target::File("src/git.rs".into())));
+
+    // Once the selected path is gone, the row that took its place is.
+    s.changes.retain(|c| c.path != "src/git.rs");
+    app.handle(UiMsg::Snapshot {
+        snap: Arc::new(s),
+        events: vec![],
+        changed: vec![],
+    });
+    draw(&mut app, 44, 28);
+    assert_eq!(opened(&mut app), Some(Target::File("src/watch.rs".into())));
 }

@@ -313,12 +313,37 @@ fn staged_and_unstaged_blocks() {
 }
 
 #[test]
+fn branch_detail_counts_past_the_listed_commits() {
+    let r = TestRepo::new();
+    r.commit_file("a", "0", "zero");
+    r.with_bare_remote();
+    for i in 0..55 {
+        r.git(&["commit", "-q", "--allow-empty", "-m", &format!("c{i}")]);
+    }
+    let DetailData::Branch {
+        ahead,
+        ahead_total,
+        behind_total,
+        ..
+    } = backend(&r)
+        .detail(&DetailReq::Branch {
+            name: "main".into(),
+            upstream: "origin/main".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!((ahead.len(), ahead_total, behind_total), (50, 55, 0));
+}
+
+#[test]
 fn branch_detail() {
     let r = TestRepo::new();
     r.commit_file("a", "1", "one");
     r.with_bare_remote();
     r.commit_file("a", "2", "two");
-    let DetailData::Branch { ahead, behind } = backend(&r)
+    let DetailData::Branch { ahead, behind, .. } = backend(&r)
         .detail(&DetailReq::Branch {
             name: "main".into(),
             upstream: "origin/main".into(),
@@ -475,6 +500,53 @@ fn watcher_signals_refresh() {
     let _h = watch::spawn(&Repo::discover(&r.path()).ok().unwrap(), tx).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     r.write("a", "2");
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Ok(WorkerMsg::Refresh)
+    ));
+}
+
+#[test]
+fn relevance_follows_info_exclude_edits_and_nested_repos() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let root = r.path().canonicalize().unwrap();
+    let mut rel = Relevance::new(&Repo::discover(&root).ok().unwrap());
+    assert!(rel.is_relevant(&root.join("scratch/x.tmp")));
+    let exclude = root.join(".git/info/exclude");
+    std::fs::write(&exclude, "*.tmp\n").unwrap();
+    assert!(rel.is_relevant(&exclude));
+    assert!(!rel.is_relevant(&root.join("scratch/x.tmp")));
+    // A repository nested in the work tree has its own git directory.
+    assert!(rel.is_relevant(&root.join("vendor/x/.git/HEAD")));
+    assert!(!rel.is_relevant(&root.join("vendor/x/.git/objects/ab/cd")));
+    // Unless the nested repository sits in an ignored directory.
+    r.write(".gitignore", ".venv/\n");
+    assert!(rel.is_relevant(&root.join(".gitignore")));
+    assert!(!rel.is_relevant(&root.join(".venv/src/pkg/.git/HEAD")));
+}
+
+#[test]
+fn submodule_commit_signals_refresh() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let lib = TestRepo::new();
+    lib.commit_file("l", "1", "lib");
+    let lib_path = lib.path();
+    r.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        lib_path.to_str().unwrap(),
+        "sub",
+    ]);
+    r.git(&["commit", "-qm", "add sub"]);
+    let (tx, rx) = channel();
+    let _h = watch::spawn(&Repo::discover(&r.path()).ok().unwrap(), tx).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    r.git(&["-C", "sub", "commit", "-q", "--allow-empty", "-m", "inside"]);
     assert!(matches!(
         rx.recv_timeout(Duration::from_secs(5)),
         Ok(WorkerMsg::Refresh)

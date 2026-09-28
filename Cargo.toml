@@ -1,6 +1,6 @@
 [package]
 name = "gitst"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Live, glanceable git status TUI for small terminal panes"
 license = "MIT"
@@ -15,7 +15,7 @@ dirs = "6"
 ignore = "0.4"
 notify = "8"
 ratatui = "0.30"
-serde = { version = "1", features = ["derive"] }
+serde = "1"
 terminal-colorsaurus = "1.0"
 toml = "1"
 unicode-segmentation = "1"
@@ -31,6 +31,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

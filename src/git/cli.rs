@@ -26,6 +26,8 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Longest any git command other than fetch may run. Generous, since a cold
 /// `git status` in a very large repository can take many seconds.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Commits listed on each side of a branch detail.
+const BRANCH_LOG: usize = 50;
 /// Upper bound on remote-tracking reflogs read per refresh.
 const MAX_REMOTE_REFLOGS: usize = 10;
 
@@ -540,13 +542,30 @@ impl GitBackend for CliBackend {
             }
             DetailReq::Branch { name, upstream } => {
                 let fmt = format!("--format={LOG_FORMAT}");
-                let ahead =
-                    self.git(&["log", "-n50", &fmt, &format!("{upstream}..{name}"), "--"])?;
-                let behind =
-                    self.git(&["log", "-n50", &fmt, &format!("{name}..{upstream}"), "--"])?;
+                let n = format!("-n{BRANCH_LOG}");
+                let ahead = self.git(&["log", &n, &fmt, &format!("{upstream}..{name}"), "--"])?;
+                let behind = self.git(&["log", &n, &fmt, &format!("{name}..{upstream}"), "--"])?;
+                let (ahead, behind) = (parse::parse_log(&ahead), parse::parse_log(&behind));
+                // Only a list that hit the limit needs counting.
+                let (mut ahead_total, mut behind_total) = (ahead.len(), behind.len());
+                if ahead_total >= BRANCH_LOG || behind_total >= BRANCH_LOG {
+                    let counts = self.git(&[
+                        "rev-list",
+                        "--left-right",
+                        "--count",
+                        &format!("{name}...{upstream}"),
+                        "--",
+                    ])?;
+                    let counts = String::from_utf8_lossy(&counts);
+                    let mut n = counts.split_whitespace().map(|n| n.parse().ok());
+                    ahead_total = n.next().flatten().unwrap_or(ahead_total);
+                    behind_total = n.next().flatten().unwrap_or(behind_total);
+                }
                 Ok(DetailData::Branch {
-                    ahead: parse::parse_log(&ahead),
-                    behind: parse::parse_log(&behind),
+                    ahead,
+                    behind,
+                    ahead_total,
+                    behind_total,
                 })
             }
         }
@@ -712,8 +731,9 @@ impl ProcessTree {
     fn adopt(child: &Child) -> Self {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
-        // Git has only just started, so it has not yet started anything that
-        // would be left outside the job.
+        // Anything the child starts before this is outside the job. That
+        // window is short (git has barely begun loading), but not closed:
+        // std cannot start a process suspended or already in a job.
         let job = unsafe {
             let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if h.is_null() {
@@ -732,46 +752,114 @@ impl ProcessTree {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         // Git removes its ref lock files in atexit handlers, which
         // TerminateProcess skips, and a leftover lock would break the user's
-        // own next fetch. Ask git to exit from inside first.
-        if exit_from_inside(child) {
-            wait_grace(child);
-        }
-        match &self.job {
-            Some(job) => unsafe {
-                TerminateJobObject(job.as_raw_handle(), STOPPED_EXIT_CODE);
-            },
-            None => {
-                let _ = child.kill();
+        // own next fetch. So every process is first asked to exit from
+        // inside: on a default install the `git.exe` on PATH is a launcher,
+        // and the git doing the work is its child.
+        let Some(job) = &self.job else {
+            if exit_from_inside(child.as_raw_handle()) {
+                wait_grace(child);
             }
+            let _ = child.kill();
+            return;
+        };
+        let job = job.as_raw_handle();
+        let mut asked = false;
+        for pid in job_processes(job) {
+            asked |= exit_pid_from_inside(pid);
+        }
+        if asked {
+            let grace = Instant::now();
+            while grace.elapsed() < KILL_GRACE && !job_processes(job).is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        unsafe {
+            TerminateJobObject(job, STOPPED_EXIT_CODE);
         }
     }
 }
 
-/// Exit status for a stopped fetch on Windows, as if by SIGTERM.
+/// Exit status for a stopped command on Windows, as if by SIGTERM.
 #[cfg(windows)]
 const STOPPED_EXIT_CODE: u32 = 128 + 15;
 
-/// Runs `ExitProcess` on a new thread inside `child`, the way Git for
-/// Windows emulates `kill -TERM`, so that git's atexit handlers run.
+/// Ids of the processes still running in `job` (the first 64).
+#[cfg(windows)]
+fn job_processes(job: std::os::windows::io::RawHandle) -> Vec<u32> {
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectBasicProcessIdList, QueryInformationJobObject,
+    };
+    #[repr(C)]
+    struct IdList {
+        assigned: u32,
+        listed: u32,
+        ids: [usize; 64],
+    }
+    let mut list = IdList {
+        assigned: 0,
+        listed: 0,
+        ids: [0; 64],
+    };
+    // With more than 64 processes the call fails, but still fills the list.
+    unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectBasicProcessIdList,
+            (&raw mut list).cast(),
+            std::mem::size_of::<IdList>() as u32,
+            std::ptr::null_mut(),
+        );
+    }
+    let listed = (list.listed as usize).min(list.ids.len());
+    list.ids[..listed].iter().map(|id| *id as u32).collect()
+}
+
+/// `exit_from_inside` for a process known by its id.
+#[cfg(windows)]
+fn exit_pid_from_inside(pid: u32) -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+        PROCESS_VM_READ, PROCESS_VM_WRITE,
+    };
+    let access = PROCESS_CREATE_THREAD
+        | PROCESS_QUERY_INFORMATION
+        | PROCESS_VM_OPERATION
+        | PROCESS_VM_READ
+        | PROCESS_VM_WRITE;
+    let h = unsafe { OpenProcess(access, 0, pid) };
+    if h.is_null() {
+        return false;
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(h) };
+    exit_from_inside(process.as_raw_handle())
+}
+
+/// Runs `ExitProcess` on a new thread inside `process`, the way Git for
+/// Windows emulates `kill -TERM`, so that its atexit handlers run.
 /// Returns whether the thread was started.
 #[cfg(windows)]
-fn exit_from_inside(child: &Child) -> bool {
+fn exit_from_inside(process: std::os::windows::io::RawHandle) -> bool {
     use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::SystemInformation::{
+        IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
+    };
     use windows_sys::Win32::System::Threading::{
-        CreateRemoteThread, GetCurrentProcess, IsWow64Process, LPTHREAD_START_ROUTINE,
+        CreateRemoteThread, GetCurrentProcess, IsWow64Process2, LPTHREAD_START_ROUTINE,
     };
     use windows_sys::core::{s, w};
-    let process = child.as_raw_handle();
     unsafe {
         // kernel32 sits at the same address in every process of one
-        // architecture, so our `ExitProcess` is git's, but only if git is
-        // built for the same one.
-        let (mut ours, mut theirs) = (0, 0);
-        if IsWow64Process(GetCurrentProcess(), &mut ours) == 0
-            || IsWow64Process(process, &mut theirs) == 0
+        // architecture, so our `ExitProcess` is valid in the target only if
+        // it is built for ours. IsWow64Process2 tells 32-bit x86 processes
+        // from native ones, but on an ARM64 machine it cannot tell emulated
+        // x64 from native ARM64, so there the stop is left to the kill.
+        let (mut ours, mut native, mut theirs, mut unused) = (0, 0, 0, 0);
+        if IsWow64Process2(GetCurrentProcess(), &mut ours, &mut native) == 0
+            || !matches!(native, IMAGE_FILE_MACHINE_AMD64 | IMAGE_FILE_MACHINE_I386)
+            || IsWow64Process2(process, &mut theirs, &mut unused) == 0
             || ours != theirs
         {
             return false;
@@ -806,7 +894,7 @@ fn exit_from_inside(child: &Child) -> bool {
     }
 }
 
-/// Gives a stopped fetch `KILL_GRACE` to exit on its own.
+/// Gives a stopped command `KILL_GRACE` to exit on its own.
 fn wait_grace(child: &mut Child) {
     let grace = Instant::now();
     while grace.elapsed() < KILL_GRACE && matches!(child.try_wait(), Ok(None)) {

@@ -149,11 +149,14 @@ fn newest_head(snap: &Snapshot) -> Option<&ReflogEntry> {
 }
 
 /// Events describing what changed between two snapshots, plus the paths
-/// whose status or line counts changed (for the change pulse).
+/// whose status or line counts changed (for the change pulse). `gone` says
+/// whether a path no longer exists on disk: an untracked path that leaves
+/// the list but still exists was ignored, not discarded.
 pub fn diff_snapshots(
     prev: &Snapshot,
     next: &Snapshot,
     now: i64,
+    gone: &dyn Fn(&str) -> bool,
 ) -> (Vec<ActivityEvent>, Vec<String>) {
     let before: HashMap<&str, &Change> =
         prev.changes.iter().map(|c| (c.path.as_str(), c)).collect();
@@ -178,6 +181,7 @@ pub fn diff_snapshots(
         prev.changes
             .iter()
             .filter(|c| !now_paths.contains(c.path.as_str()))
+            .filter(|c| !c.untracked() || gone(&c.path))
             .collect()
     };
 
@@ -263,6 +267,11 @@ pub fn merged(reflog: &[ReflogEntry], live: &[ActivityEvent], limit: usize) -> V
 mod tests {
     use super::*;
     use crate::model::Counts;
+
+    /// Treats every path that left the list as gone from disk.
+    fn diff(a: &Snapshot, b: &Snapshot, now: i64) -> (Vec<ActivityEvent>, Vec<String>) {
+        diff_snapshots(a, b, now, &|_| true)
+    }
 
     fn e(r: &str, m: &str) -> ReflogEntry {
         ReflogEntry {
@@ -385,7 +394,7 @@ mod tests {
     fn diff_reports_changed_files() {
         let a = snap_with(vec![ch("a", ' ', 'M', 1, 0)]);
         let b = snap_with(vec![ch("a", ' ', 'M', 3, 0), ch("b", '?', '?', 1, 0)]);
-        let (ev, paths) = diff_snapshots(&a, &b, 5);
+        let (ev, paths) = diff(&a, &b, 5);
         assert_eq!(
             ev,
             vec![ActivityEvent {
@@ -398,28 +407,28 @@ mod tests {
         );
         assert_eq!(paths, vec!["a", "b"]);
         let c = snap_with(vec![ch("a", ' ', 'M', 4, 1), ch("b", '?', '?', 1, 0)]);
-        assert_eq!(diff_snapshots(&b, &c, 6).0[0].text, "a +4 −1");
+        assert_eq!(diff(&b, &c, 6).0[0].text, "a +4 −1");
     }
 
     #[test]
     fn single_file_event_omits_zero_counts() {
         let a = snap_with(vec![]);
         let b = snap_with(vec![ch("new.md", '?', '?', 1, 0)]);
-        assert_eq!(diff_snapshots(&a, &b, 5).0[0].text, "new.md +1");
+        assert_eq!(diff(&a, &b, 5).0[0].text, "new.md +1");
         let c = snap_with(vec![ch("gone.rs", ' ', 'D', 0, 7)]);
-        assert_eq!(diff_snapshots(&a, &c, 5).0[0].text, "gone.rs −7");
+        assert_eq!(diff(&a, &c, 5).0[0].text, "gone.rs −7");
     }
 
     #[test]
     fn diff_reports_staging() {
         let s1 = snap_with(vec![ch("a", ' ', 'M', 3, 0), ch("b", ' ', 'M', 1, 0)]);
         let s2 = snap_with(vec![ch("a", 'M', ' ', 3, 0), ch("b", 'M', ' ', 1, 0)]);
-        let (ev, _) = diff_snapshots(&s1, &s2, 5);
+        let (ev, _) = diff(&s1, &s2, 5);
         assert_eq!(
             (ev[0].kind, ev[0].text.as_str()),
             (ActivityKind::Stage, "staged 2 files")
         );
-        let (ev, _) = diff_snapshots(&s2, &s1, 5);
+        let (ev, _) = diff(&s2, &s1, 5);
         assert_eq!(ev[0].text, "unstaged 2 files");
     }
 
@@ -430,8 +439,8 @@ mod tests {
             oid: Some("o2".into()),
             ..Snapshot::default()
         };
-        assert!(diff_snapshots(&a, &b, 5).0.is_empty());
-        assert!(diff_snapshots(&a, &a, 5).0.is_empty());
+        assert!(diff(&a, &b, 5).0.is_empty());
+        assert!(diff(&a, &a, 5).0.is_empty());
     }
 
     #[test]
@@ -441,11 +450,8 @@ mod tests {
             stash_count: 1,
             ..Snapshot::default()
         };
-        assert_eq!(diff_snapshots(&a, &b, 5).0[0].text, "stash saved");
-        assert_eq!(
-            diff_snapshots(&b, &a, 5).0[0].text,
-            "stash applied or dropped"
-        );
+        assert_eq!(diff(&a, &b, 5).0[0].text, "stash saved");
+        assert_eq!(diff(&b, &a, 5).0[0].text, "stash applied or dropped");
     }
 
     fn at(time: i64, m: &str) -> ReflogEntry {
@@ -463,7 +469,7 @@ mod tests {
             reflog: vec![at(9, "reset: moving to HEAD")],
             ..Snapshot::default()
         };
-        let (events, _) = diff_snapshots(&prev, &next, 12);
+        let (events, _) = diff(&prev, &next, 12);
         let texts: Vec<_> = merged(&next.reflog, &events, 10)
             .into_iter()
             .map(|e| (e.time, e.text))
@@ -490,26 +496,32 @@ mod tests {
     fn files_leaving_the_list_are_reported() {
         let a = snap_with(vec![ch("a", ' ', 'M', 1, 0), ch("b", '?', '?', 2, 0)]);
         let b = snap_with(vec![ch("b", '?', '?', 2, 0)]);
-        let (ev, paths) = diff_snapshots(&a, &b, 5);
+        let (ev, paths) = diff(&a, &b, 5);
         assert_eq!(ev[0].text, "a discarded");
         assert_eq!(paths, vec!["a"]);
-        let (ev, _) = diff_snapshots(&a, &snap_with(vec![]), 5);
+        let (ev, _) = diff(&a, &snap_with(vec![]), 5);
         assert_eq!(ev[0].text, "2 files discarded");
+        // An untracked file still on disk was ignored, not discarded.
+        let only_a = snap_with(vec![ch("a", ' ', 'M', 1, 0)]);
+        let (ev, paths) = diff_snapshots(&a, &only_a, 5, &|_| false);
+        assert_eq!((ev, paths), (vec![], Vec::<String>::new()));
+        let (ev, _) = diff_snapshots(&a, &snap_with(vec![]), 5, &|p| p != "b");
+        assert_eq!(ev[0].text, "a discarded");
         // A new HEAD reflog entry (commit, reset, checkout) explains it.
         let reset = Snapshot {
             reflog: vec![at(4, "reset: moving to HEAD")],
             ..snap_with(vec![])
         };
-        assert!(diff_snapshots(&a, &reset, 5).0.is_empty());
+        assert!(diff(&a, &reset, 5).0.is_empty());
     }
 
     #[test]
     fn single_path_events_carry_the_path() {
         let a = snap_with(vec![]);
         let b = snap_with(vec![ch("a", ' ', 'M', 1, 0)]);
-        assert_eq!(diff_snapshots(&a, &b, 5).0[0].path.as_deref(), Some("a"));
+        assert_eq!(diff(&a, &b, 5).0[0].path.as_deref(), Some("a"));
         let c = snap_with(vec![ch("a", ' ', 'M', 1, 0), ch("b", ' ', 'M', 1, 0)]);
-        assert_eq!(diff_snapshots(&a, &c, 5).0[0].path, None);
+        assert_eq!(diff(&a, &c, 5).0[0].path, None);
     }
 
     #[test]

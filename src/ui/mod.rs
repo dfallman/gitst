@@ -98,16 +98,8 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
             Rect::new(area.x, body.y + body.height, area.width, 1),
         );
     }
-    if let Some((hx, hy)) = app.hover {
-        let hovered = app
-            .hits
-            .clicks
-            .iter()
-            .map(|(r, _)| *r)
-            .find(|r| r.contains((hx, hy).into()));
-        if let Some(r) = hovered.filter(|r| Some(*r) != selected) {
-            f.buffer_mut().set_style(r, theme.hover);
-        }
+    if let Some(r) = app.hovered().filter(|r| Some(*r) != selected) {
+        f.buffer_mut().set_style(r, theme.hover);
     }
     if app.help {
         detail::draw_help(f, app, theme, area);
