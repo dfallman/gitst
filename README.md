@@ -12,7 +12,7 @@ Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, h
   <img width="600" alt="gitst" src="https://github.com/user-attachments/assets/6a59ecbd-b764-437c-99c5-8123279c66fc" />
 </p>
 
-Note that by design, gitst *monitors* git, it doesn't *manipulate* it. This is by design and comes with a few benefits, especially for use in conjunction with coding agents where you might either want the coding agent to control git or, like me, you want to control git manually. Apart from `git fetch`, gitst never changes your git repository, and it never takes over git's `index.lock`, so it cannot get in the way or obstruct git commands run elsewhere.
+Note that by design, gitst *monitors* git, it doesn't *manipulate* it. This comes with a few benefits, especially for use in conjunction with team work and coding agents where you might want the coding agent to control git, there's lots of team activity on the repo, or, like me, you just want to control git manually. Because it is a git monitor, apart from `git fetch`, gitst never changes your git repository, and it never takes over git's `index.lock`, so it cannot get in the way or obstruct git commands run elsewhere.
 
 ## Install
 
