@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 /// A throwaway repository driven by the real git CLI, isolated from the
 /// user's global and system config.
@@ -104,5 +106,54 @@ impl TestRepo {
         self.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
         self.git(&["push", "-q", "-u", "origin", "main"]);
         remote
+    }
+}
+
+/// Points `origin` at an ssh transport that writes its pid to the returned
+/// file and then hangs.
+#[cfg(unix)]
+pub fn hanging_remote(r: &TestRepo) -> PathBuf {
+    let pid_file = r.dir.path().join("ssh.pid");
+    r.git(&["remote", "add", "origin", "ssh://example.invalid/x.git"]);
+    let ssh = format!("sh -c 'echo $$ > {}; exec sleep 30' --", pid_file.display());
+    r.git(&["config", "core.sshCommand", &ssh]);
+    pid_file
+}
+
+#[cfg(unix)]
+pub fn wait_for_pid(file: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(file)
+            && s.ends_with('\n')
+        {
+            return s.trim().to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no pid written to {}",
+            file.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+pub fn exits_within(pid: &str, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -492,7 +492,11 @@ fn activity(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> 
             ];
             Row {
                 line: row(left, middle, age_span(e.time, app, theme, d), w),
-                target: e.rev.map(Target::Commit),
+                target: e.rev.map(Target::Commit).or_else(|| {
+                    e.path
+                        .filter(|p| snap.changes.iter().any(|c| &c.path == p))
+                        .map(Target::File)
+                }),
             }
         })
         .collect()

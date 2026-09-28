@@ -43,6 +43,11 @@ pub enum UiMsg {
     Fetch(FetchStatus),
     Detail(DetailReq, Result<DetailData, String>),
     Live(ActivityEvent),
+    /// SIGTSTP from outside.
+    Suspend,
+    /// SIGHUP, SIGTERM or SIGINT: the terminal is gone or gitst was asked
+    /// to stop.
+    Quit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -226,6 +231,7 @@ impl Worker {
                         kind: ActivityKind::Fetch,
                         text,
                         rev: None,
+                        path: None,
                     }));
                 }
                 self.arm_fetch_timer(&snap);

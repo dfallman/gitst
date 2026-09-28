@@ -1,6 +1,6 @@
 [package]
 name = "gitst"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Live, glanceable git status TUI for small terminal panes"
 license = "MIT"
@@ -23,6 +23,7 @@ unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -55,7 +55,10 @@ fn main() -> Result<()> {
     let theme = Theme::detect(cfg.icons == "nerd");
 
     let mut terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture)?;
+    if let Err(e) = execute!(stdout(), EnableMouseCapture) {
+        ratatui::restore();
+        return Err(e).context("enable mouse capture");
+    }
     let restore = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(stdout(), DisableMouseCapture);
@@ -78,6 +81,7 @@ fn run(
     theme: &Theme,
 ) -> Result<()> {
     let (ui_tx, ui_rx) = mpsc::channel();
+    forward_signals(ui_tx.clone())?;
     let input_tx = ui_tx.clone();
     std::thread::Builder::new()
         .name("gitst-input".into())
@@ -149,6 +153,7 @@ fn run(
             for cmd in app.handle(msg) {
                 match cmd {
                     Cmd::Quit => quit = true,
+                    Cmd::Suspend => suspend(terminal)?,
                     Cmd::Worker(m) => {
                         let _ = worker.send(m);
                     }
@@ -177,6 +182,7 @@ fn wait_for_repo(
         let message = match Repo::discover(path) {
             Ok(repo) => return Ok(Some(repo)),
             Err(DiscoverError::NotARepo) => "not a git repository",
+            Err(DiscoverError::NoWorkTree) => "no work tree (bare repository?)",
             Err(DiscoverError::GitMissing) => "git not found on PATH",
             Err(DiscoverError::Other(_)) => "cannot read repository",
         };
@@ -208,9 +214,68 @@ fn wait_for_repo(
             {
                 return Ok(None);
             }
-            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+            Ok(UiMsg::Input(Event::Key(k)))
+                if k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                suspend(terminal)?;
+            }
+            Ok(UiMsg::Suspend) => suspend(terminal)?,
+            Ok(UiMsg::Quit) | Err(RecvTimeoutError::Disconnected) => return Ok(None),
             _ => {}
         }
         while dir_rx.try_recv().is_ok() {}
     }
+}
+
+/// Turns signals into UI messages, so that a closed terminal or a `kill`
+/// quits through the same path as `q`: the fetch is stopped and the
+/// terminal restored.
+#[cfg(unix)]
+fn forward_signals(ui: mpsc::Sender<UiMsg>) -> Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGTSTP};
+    let mut signals = signal_hook::iterator::Signals::new([SIGHUP, SIGINT, SIGTERM, SIGTSTP])
+        .context("install signal handlers")?;
+    std::thread::Builder::new()
+        .name("gitst-signals".into())
+        .spawn(move || {
+            for sig in signals.forever() {
+                let msg = if sig == SIGTSTP {
+                    UiMsg::Suspend
+                } else {
+                    UiMsg::Quit
+                };
+                if ui.send(msg).is_err() {
+                    break;
+                }
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn forward_signals(_ui: mpsc::Sender<UiMsg>) -> Result<()> {
+    Ok(())
+}
+
+/// Hands the terminal back to the shell and stops, as Ctrl-Z does outside
+/// raw mode, then takes the terminal again when continued.
+#[cfg(unix)]
+fn suspend(terminal: &mut DefaultTerminal) -> Result<()> {
+    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = terminal.show_cursor();
+    ratatui::restore();
+    // Stops here until `fg`. A process group without a job-control shell
+    // ignores the stop, and this returns at once.
+    signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTSTP)?;
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // The screen was the shell's meanwhile, so the next draw repaints all.
+    terminal.clear()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn suspend(_terminal: &mut DefaultTerminal) -> Result<()> {
+    Ok(())
 }

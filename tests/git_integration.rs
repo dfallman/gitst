@@ -7,6 +7,8 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use common::TestRepo;
+#[cfg(unix)]
+use common::{exits_within, hanging_remote, wait_for_pid};
 use gitst::git::{CliBackend, DiscoverError, FetchError, GitBackend, Repo, SnapshotOpts};
 use gitst::model::*;
 use gitst::watch::{self, Relevance};
@@ -205,6 +207,17 @@ fn discover_errors() {
     assert!(matches!(
         Repo::discover(d.path()),
         Err(DiscoverError::NotARepo)
+    ));
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let bare = r.with_bare_remote();
+    assert!(matches!(
+        Repo::discover(&bare),
+        Err(DiscoverError::NoWorkTree)
+    ));
+    assert!(matches!(
+        Repo::discover(&r.path().join(".git")),
+        Err(DiscoverError::NoWorkTree)
     ));
 }
 
@@ -493,51 +506,6 @@ fn fetch_times_out_and_returns() {
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
 }
 
-/// Points `origin` at an ssh transport that writes its pid to the returned
-/// file and then hangs.
-#[cfg(unix)]
-fn hanging_remote(r: &TestRepo) -> std::path::PathBuf {
-    let pid_file = r.dir.path().join("ssh.pid");
-    r.git(&["remote", "add", "origin", "ssh://example.invalid/x.git"]);
-    let ssh = format!("sh -c 'echo $$ > {}; exec sleep 30' --", pid_file.display());
-    r.git(&["config", "core.sshCommand", &ssh]);
-    pid_file
-}
-
-#[cfg(unix)]
-fn wait_for_pid(file: &Path) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(s) = std::fs::read_to_string(file)
-            && s.ends_with('\n')
-        {
-            return s.trim().to_string();
-        }
-        assert!(Instant::now() < deadline, "fetch transport never started");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-#[cfg(unix)]
-fn exits_within(pid: &str, limit: Duration) -> bool {
-    let deadline = Instant::now() + limit;
-    loop {
-        let alive = std::process::Command::new("kill")
-            .args(["-0", pid])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        if !alive {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn fetch_stops_when_cancelled() {
@@ -660,4 +628,72 @@ fn untracked_fifo_and_symlink_do_not_hang_detail() {
         let _ = tx.send(b.snapshot(&opts()).is_ok());
     });
     assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(true));
+}
+
+#[cfg(unix)]
+#[test]
+fn hung_git_command_times_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let pid_file = r.dir.path().join("hook.pid");
+    let hook = r.dir.path().join("hook.sh");
+    let script = format!(
+        "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+        pid_file.display()
+    );
+    std::fs::write(&hook, script).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // `git status` waits for the fsmonitor hook.
+    r.git(&["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    let b = backend(&r).with_timeout(Duration::from_millis(500));
+    let t = Instant::now();
+    let err = b.snapshot(&opts()).unwrap_err();
+    assert!(err.0.contains("timed out"), "{err}");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    let pid = wait_for_pid(&pid_file);
+    assert!(
+        exits_within(&pid, Duration::from_secs(2)),
+        "hook {pid} outlived the timeout"
+    );
+}
+
+#[test]
+fn has_remote_follows_config() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    assert!(!snap(&r).has_remote);
+    r.with_bare_remote();
+    assert!(snap(&r).has_remote);
+    r.git(&["remote", "remove", "origin"]);
+    assert!(!snap(&r).has_remote);
+}
+
+#[test]
+fn stash_shows_once_in_activity() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.write("a", "2");
+    let (tx, rx) = channel();
+    let cfg = WorkerConfig {
+        opts: opts(),
+        interval: Duration::ZERO,
+        prune: false,
+    };
+    let w = worker::spawn(Arc::new(backend(&r)), cfg, tx);
+    recv_until(&rx, |m| matches!(m, UiMsg::Snapshot { .. }).then_some(()));
+    r.git(&["stash", "-q"]);
+    w.send(WorkerMsg::Refresh).unwrap();
+    let (snap, events) = recv_until(&rx, |m| match m {
+        UiMsg::Snapshot { snap, events, .. } => Some((snap, events)),
+        _ => None,
+    });
+    let texts: Vec<String> = gitst::activity::merged(&snap.reflog, &events, 10)
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    let stashes = texts.iter().filter(|t| *t == "stash saved").count();
+    assert_eq!(stashes, 1, "{texts:?}");
+    assert!(!texts.iter().any(|t| t.starts_with("reset")), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("discarded")), "{texts:?}");
 }

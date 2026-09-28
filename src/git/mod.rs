@@ -19,6 +19,8 @@ pub struct Repo {
 #[derive(Debug)]
 pub enum DiscoverError {
     NotARepo,
+    /// A bare repository, or inside a `.git` directory.
+    NoWorkTree,
     GitMissing,
     Other(String),
 }
@@ -41,8 +43,11 @@ impl Repo {
             })?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            if err.contains("not a git repository") || err.contains("must be run in a work tree") {
+            if err.contains("not a git repository") {
                 return Err(DiscoverError::NotARepo);
+            }
+            if err.contains("must be run in a work tree") {
+                return Err(DiscoverError::NoWorkTree);
             }
             return Err(DiscoverError::Other(
                 err.lines().next().unwrap_or("").to_string(),

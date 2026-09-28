@@ -77,6 +77,7 @@ than 10 seconds, failed fetches and config errors.
 | `f` | fetch now | fetch now |
 | `?` | help | help |
 | `q` / `Ctrl-C` | quit | quit |
+| `Ctrl-Z` | suspend (`fg` resumes; not on Windows) | suspend |
 
 ### Options
 

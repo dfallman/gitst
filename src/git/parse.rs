@@ -95,6 +95,44 @@ fn ordinary_entry(rest: &str, skip: usize, orig_path: Option<String>) -> Option<
 
 pub type NumstatEntry = (String, Counts);
 
+/// Config keys a snapshot reads, for `git config -z --get-regexp`. Git
+/// matches them lowercased (apart from the remote's name).
+pub const REPO_CONFIG_KEYS: &str = r"^(remote\..+\.url|status\.showuntrackedfiles)$";
+
+/// What a snapshot needs from the config, read in one `git config` call.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RepoConfig {
+    /// `--untracked-files=…` for `git status`.
+    pub untracked_mode: &'static str,
+    pub has_remote: bool,
+}
+
+/// Parses `git config -z --get-regexp REPO_CONFIG_KEYS`. Untracked files
+/// follow `status.showUntrackedFiles`, but are listed one by one (`all`)
+/// when it is not set.
+pub fn parse_repo_config(raw: &[u8]) -> RepoConfig {
+    let mut mode = "--untracked-files=all";
+    let mut has_remote = false;
+    for entry in raw.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let entry = String::from_utf8_lossy(entry);
+        // A key without a value is boolean true.
+        let (key, value) = entry.split_once('\n').unwrap_or((&entry, "true"));
+        if key == "status.showuntrackedfiles" {
+            mode = match value.trim().to_ascii_lowercase().as_str() {
+                "no" | "false" | "off" | "0" => "--untracked-files=no",
+                "normal" | "true" | "on" | "1" => "--untracked-files=normal",
+                _ => "--untracked-files=all",
+            };
+        } else if key.starts_with("remote.") {
+            has_remote = true;
+        }
+    }
+    RepoConfig {
+        untracked_mode: mode,
+        has_remote,
+    }
+}
+
 /// Splits `\x1e`-terminated records into `\x1f`-separated fields.
 fn records(raw: &[u8]) -> impl Iterator<Item = Vec<String>> + '_ {
     raw.split(|b| *b == 0x1e).filter_map(|rec| {
@@ -312,6 +350,28 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         let (h, _) = parse_status(b"# branch.oid (initial)\0# branch.head (detached)\0");
         assert_eq!(h.oid, None);
         assert_eq!(h.head, None);
+    }
+
+    #[test]
+    fn repo_config_untracked_mode_and_remotes() {
+        let c = parse_repo_config(b"");
+        assert_eq!(
+            (c.untracked_mode, c.has_remote),
+            ("--untracked-files=all", false)
+        );
+        // The last value wins.
+        let c = parse_repo_config(
+            b"remote.origin.url\n/x.git\0status.showuntrackedfiles\nno\0status.showuntrackedfiles\nnormal\0",
+        );
+        assert_eq!(
+            (c.untracked_mode, c.has_remote),
+            ("--untracked-files=normal", true)
+        );
+        // A key without a value is boolean true.
+        let c = parse_repo_config(b"status.showuntrackedfiles\0");
+        assert_eq!(c.untracked_mode, "--untracked-files=normal");
+        let c = parse_repo_config(b"status.showuntrackedfiles\nOff\0");
+        assert_eq!(c.untracked_mode, "--untracked-files=no");
     }
 
     #[test]

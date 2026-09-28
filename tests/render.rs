@@ -693,3 +693,25 @@ fn uncounted_changes_are_blank_not_binary() {
     let title = out.lines().find(|l| l.contains("Changes")).unwrap();
     assert!(!title.contains('+'), "{out}");
 }
+
+#[test]
+fn single_file_activity_row_opens_the_file() {
+    let mut app = new_app(fixture());
+    app.handle(UiMsg::Live(gitst::activity::ActivityEvent {
+        time: at(30),
+        kind: gitst::activity::ActivityKind::Files,
+        text: "src/app.rs +42 −7".into(),
+        rev: None,
+        path: Some("src/app.rs".into()),
+    }));
+    let out = draw(&mut app, 44, 28);
+    let y = out
+        .lines()
+        .position(|l| l.contains("src/app.rs +42"))
+        .unwrap_or_else(|| panic!("{out}")) as u16;
+    app.handle(click(10, y));
+    assert_eq!(
+        app.stack.last().map(|v| v.target.clone()),
+        Some(Target::File("src/app.rs".into()))
+    );
+}

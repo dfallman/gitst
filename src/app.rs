@@ -10,7 +10,7 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use crate::activity::{ActivityEvent, ActivityKind, describe_files};
+use crate::activity::{ActivityEvent, ActivityKind, files_event};
 use crate::config::Config;
 use crate::model::{DetailData, DetailReq, Snapshot};
 use crate::ui::layout::SectionId;
@@ -142,6 +142,8 @@ pub struct DetailView {
 
 pub enum Cmd {
     Quit,
+    /// Hand the terminal back to the shell and stop until `fg`.
+    Suspend,
     Worker(WorkerMsg),
 }
 
@@ -261,6 +263,8 @@ impl App {
                 }
                 Vec::new()
             }
+            UiMsg::Suspend => vec![Cmd::Suspend],
+            UiMsg::Quit => vec![Cmd::Quit],
         }
     }
 
@@ -290,17 +294,20 @@ impl App {
             self.burst.clear();
         }
         self.burst.extend(changed.iter().cloned());
+        // Paths that are no longer changed drop out, so undoing most of a
+        // burst leaves the row describing what remains.
+        if let Some(snap) = &self.snap {
+            self.burst
+                .retain(|p| snap.changes.iter().any(|c| &c.path == p));
+        }
         let paths: Vec<String> = self.burst.iter().cloned().collect();
-        let text = match &self.snap {
-            Some(snap) if !paths.is_empty() => describe_files(&paths, snap),
-            _ => e.text.clone(),
+        let e = match &self.snap {
+            Some(snap) if !paths.is_empty() => files_event(&paths, snap, e.time),
+            _ => e,
         };
         match self.live.last_mut() {
-            Some(last) if joins => {
-                last.time = e.time;
-                last.text = text;
-            }
-            _ => self.live.push(ActivityEvent { text, ..e }),
+            Some(last) if joins => *last = e,
+            _ => self.live.push(e),
         }
     }
 
@@ -363,8 +370,13 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) -> Vec<Cmd> {
-        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-            return vec![Cmd::Quit];
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            // Raw mode turns these keys into input instead of signals.
+            match k.code {
+                KeyCode::Char('c') => return vec![Cmd::Quit],
+                KeyCode::Char('z') => return vec![Cmd::Suspend],
+                _ => {}
+            }
         }
         if self.help {
             self.help = false;
@@ -626,6 +638,13 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(matches!(a.handle(ctrl_c)[..], [Cmd::Quit]));
+        let ctrl_z = UiMsg::Input(Event::Key(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(a.handle(ctrl_z)[..], [Cmd::Suspend]));
+        assert!(matches!(a.handle(UiMsg::Quit)[..], [Cmd::Quit]));
+        assert!(matches!(a.handle(UiMsg::Suspend)[..], [Cmd::Suspend]));
     }
 
     #[test]
@@ -866,6 +885,7 @@ mod tests {
             kind: ActivityKind::Fetch,
             text: "x".into(),
             rev: None,
+            path: None,
         }));
         assert_eq!(a.live.len(), 1);
         a.handle(UiMsg::Fetch(FetchStatus {
@@ -900,6 +920,7 @@ mod tests {
             kind: ActivityKind::Files,
             text: text.into(),
             rev: None,
+            path: None,
         };
         a.handle(UiMsg::Snapshot {
             snap: Arc::new(Snapshot {
@@ -932,5 +953,32 @@ mod tests {
         );
         files_snapshot(&mut a, &[("c.rs", 1)], 400, "c.rs +1", &["c.rs"]);
         assert_eq!(a.live.len(), 2);
+    }
+
+    #[test]
+    fn a_burst_forgets_reverted_paths() {
+        let mut a = app();
+        let all = [("a.rs", 1), ("b.rs", 1), ("c.rs", 1)];
+        files_snapshot(
+            &mut a,
+            &all,
+            100,
+            "3 files changed",
+            &["a.rs", "b.rs", "c.rs"],
+        );
+        assert_eq!(a.live[0].text, "3 files changed");
+        files_snapshot(
+            &mut a,
+            &all[..1],
+            110,
+            "2 files discarded",
+            &["b.rs", "c.rs"],
+        );
+        assert_eq!(a.live.len(), 1);
+        assert_eq!(a.live[0].text, "a.rs +1");
+        assert_eq!(a.live[0].path.as_deref(), Some("a.rs"));
+        files_snapshot(&mut a, &[], 120, "a.rs discarded", &["a.rs"]);
+        assert_eq!(a.live[0].text, "a.rs discarded");
+        assert_eq!(a.live[0].path, None);
     }
 }

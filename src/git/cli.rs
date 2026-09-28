@@ -3,11 +3,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::parse::{self, BRANCH_FORMAT, LOG_FORMAT, REFLOG_FORMAT, STASH_FORMAT};
+use super::parse::{
+    self, BRANCH_FORMAT, LOG_FORMAT, REFLOG_FORMAT, REPO_CONFIG_KEYS, STASH_FORMAT,
+};
 use super::{FetchError, GitBackend, GitError, Repo, SnapshotOpts, classify_fetch_stderr};
 use crate::model::{
     CommitDetail, Counts, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, RepoOp,
@@ -16,8 +20,12 @@ use crate::model::{
 
 /// Largest untracked file whose lines are counted for the `+N` column.
 const MAX_COUNTED_FILE: u64 = 1 << 20;
-/// How long a stopped fetch gets to clean up and exit before it is killed.
+/// How long a stopped git command gets to clean up and exit before it is
+/// killed.
 const KILL_GRACE: Duration = Duration::from_secs(2);
+/// Longest any git command other than fetch may run. Generous, since a cold
+/// `git status` in a very large repository can take many seconds.
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on remote-tracking reflogs read per refresh.
 const MAX_REMOTE_REFLOGS: usize = 10;
 
@@ -50,28 +58,54 @@ pub(crate) fn base_command(cwd: &Path) -> Command {
 
 pub struct CliBackend {
     repo: Repo,
+    timeout: Duration,
 }
 
 impl CliBackend {
     pub fn new(repo: Repo) -> Self {
-        CliBackend { repo }
+        CliBackend {
+            repo,
+            timeout: GIT_TIMEOUT,
+        }
+    }
+
+    /// Sets how long git commands other than fetch may run.
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        CliBackend { timeout, ..self }
     }
 
     pub(crate) fn command(&self) -> Command {
         base_command(&self.repo.root)
     }
 
-    /// Runs git and returns stdout; a non-zero exit becomes the first stderr line.
+    /// Runs git and returns stdout; a non-zero exit becomes the first stderr
+    /// line. A command still running after the timeout is stopped, so one
+    /// wedged call cannot hold up every later snapshot and detail.
     pub(crate) fn git(&self, args: &[&str]) -> Result<Vec<u8>, GitError> {
-        let out = self
-            .command()
-            .args(args)
-            .output()
-            .map_err(|e| GitError(format!("git: {e}")))?;
-        if out.status.success() {
-            Ok(out.stdout)
+        let mut cmd = self.command();
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Its own group, so a stop reaches hooks and helpers too.
+            cmd.process_group(0);
+        }
+        let (status, stdout, stderr) = match run_bounded(&mut cmd, self.timeout, None) {
+            Ok(Run::Exited {
+                status,
+                stdout,
+                stderr,
+            }) => (status, stdout, stderr),
+            Ok(_) => {
+                let name = args.first().copied().unwrap_or_default();
+                return Err(GitError(format!("git {name} timed out")));
+            }
+            Err(e) => return Err(GitError(format!("git: {e}"))),
+        };
+        if status.success() {
+            Ok(stdout)
         } else {
-            let err = String::from_utf8_lossy(&out.stderr);
+            let err = String::from_utf8_lossy(&stderr);
             let line = err
                 .lines()
                 .find(|l| !l.trim().is_empty())
@@ -185,19 +219,6 @@ impl CliBackend {
                 })
                 .collect(),
             _ => meta_line(format!("binary · {}", human_size(size))),
-        }
-    }
-
-    /// Untracked-file listing that follows `status.showUntrackedFiles`, but
-    /// lists individual files (`all`) when it is not set.
-    fn untracked_mode(&self) -> &'static str {
-        let value = self
-            .git(&["config", "--get", "status.showUntrackedFiles"])
-            .unwrap_or_default();
-        match String::from_utf8_lossy(&value).trim() {
-            "no" | "false" | "off" | "0" => "--untracked-files=no",
-            "normal" | "true" | "on" | "1" => "--untracked-files=normal",
-            _ => "--untracked-files=all",
         }
     }
 
@@ -319,13 +340,19 @@ impl GitBackend for CliBackend {
     }
 
     fn snapshot(&self, opts: &SnapshotOpts) -> Result<Snapshot, GitError> {
+        // Exits 1 when no key is set.
+        let config = parse::parse_repo_config(
+            &self
+                .git(&["config", "-z", "--get-regexp", REPO_CONFIG_KEYS])
+                .unwrap_or_default(),
+        );
         let raw = self.git(&[
             "status",
             "--porcelain=v2",
             "-z",
             "--branch",
             "--show-stash",
-            self.untracked_mode(),
+            config.untracked_mode,
         ])?;
         let (header, mut changes) = parse::parse_status(&raw);
 
@@ -445,10 +472,6 @@ impl GitBackend for CliBackend {
                 .and_then(|o| parse::parse_describe(&String::from_utf8_lossy(&o)))
         };
 
-        let has_remote = self
-            .git(&["remote"])
-            .map(|o| !o.trim_ascii().is_empty())
-            .unwrap_or(false);
         let index_lock_age =
             mtime(&self.repo.git_dir.join("index.lock")).map(|t| t.elapsed().unwrap_or_default());
 
@@ -468,7 +491,7 @@ impl GitBackend for CliBackend {
             index_lock_age,
             // FETCH_HEAD is per worktree, like HEAD.
             last_fetch: mtime(&self.repo.git_dir.join("FETCH_HEAD")),
-            has_remote,
+            has_remote: config.has_remote,
         })
     }
 
@@ -535,40 +558,97 @@ impl GitBackend for CliBackend {
         }
         let mut cmd = self.fetch_command(prune);
         detach(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| FetchError::Other(e.to_string()))?;
-        let tree = ProcessTree::adopt(&child);
-        let mut stderr = child.stderr.take().expect("stderr is piped");
-        let reader = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = stderr.read_to_string(&mut s);
-            s
-        });
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let err = reader.join().unwrap_or_default();
-                    return if status.success() {
-                        Ok(())
-                    } else {
-                        Err(classify_fetch_stderr(&err))
-                    };
-                }
-                Ok(None) if cancel.load(Ordering::SeqCst) => {
-                    tree.terminate(&mut child);
-                    let _ = child.wait();
-                    return Err(FetchError::Cancelled);
-                }
-                Ok(None) if start.elapsed() >= timeout => {
-                    tree.terminate(&mut child);
-                    let _ = child.wait();
-                    return Err(FetchError::Timeout);
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(e) => return Err(FetchError::Other(e.to_string())),
+        match run_bounded(&mut cmd, timeout, Some(cancel)) {
+            Ok(Run::Exited { status, .. }) if status.success() => Ok(()),
+            Ok(Run::Exited { stderr, .. }) => {
+                Err(classify_fetch_stderr(&String::from_utf8_lossy(&stderr)))
             }
+            Ok(Run::TimedOut) => Err(FetchError::Timeout),
+            Ok(Run::Cancelled) => Err(FetchError::Cancelled),
+            Err(e) => Err(FetchError::Other(e.to_string())),
         }
     }
+}
+
+/// How a command run by `run_bounded` ended.
+enum Run {
+    Exited {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    TimedOut,
+    Cancelled,
+}
+
+/// Runs `cmd`, collecting whichever of stdout and stderr are piped, and
+/// stops it and everything it started after `timeout` or once `cancel` is
+/// set. On Unix `cmd` must start a process group (see `ProcessTree`).
+fn run_bounded(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<Run> {
+    /// How often a cancel is noticed while the command runs.
+    const TICK: Duration = Duration::from_millis(50);
+    let mut child = cmd.spawn()?;
+    let tree = ProcessTree::adopt(&child);
+    let (closed_tx, closed) = mpsc::channel();
+    let stdout = child.stdout.take().map(|p| drain(p, closed_tx.clone()));
+    let stderr = child.stderr.take().map(|p| drain(p, closed_tx.clone()));
+    drop(closed_tx);
+    let mut open = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
+    let deadline = Instant::now() + timeout;
+    let mut nap = Duration::from_millis(1);
+    loop {
+        // Pipes close when the command exits, so waiting on them wakes at
+        // once; polling for the exit only starts after that.
+        if open == 0
+            && let Some(status) = child.try_wait()?
+        {
+            let join =
+                |h: Option<JoinHandle<Vec<u8>>>| h.and_then(|h| h.join().ok()).unwrap_or_default();
+            return Ok(Run::Exited {
+                status,
+                stdout: join(stdout),
+                stderr: join(stderr),
+            });
+        }
+        let stop = if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            Some(Run::Cancelled)
+        } else if Instant::now() >= deadline {
+            Some(Run::TimedOut)
+        } else {
+            None
+        };
+        if let Some(run) = stop {
+            tree.terminate(&mut child);
+            let _ = child.wait();
+            return Ok(run);
+        }
+        if open > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match closed.recv_timeout(left.min(TICK)) {
+                Ok(()) => open -= 1,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => open = 0,
+            }
+        } else {
+            std::thread::sleep(nap);
+            nap = (nap * 2).min(TICK);
+        }
+    }
+}
+
+/// Reads a pipe to its end on its own thread, so neither pipe can fill up
+/// and stall the child, then reports the pipe closed.
+fn drain(mut pipe: impl Read + Send + 'static, closed: Sender<()>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = closed.send(());
+        buf
+    })
 }
 
 /// Cuts a fetch off from the terminal so neither git nor ssh can ever prompt
@@ -594,7 +674,8 @@ fn detach(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
-/// A fetch and every process it starts.
+/// A git command and every process it starts: its process group, which
+/// the command must lead.
 #[cfg(unix)]
 struct ProcessTree;
 
@@ -604,7 +685,7 @@ impl ProcessTree {
         ProcessTree
     }
 
-    /// Stops a timed-out or cancelled fetch and everything it started.
+    /// Stops a timed-out or cancelled command and everything it started.
     fn terminate(&self, child: &mut Child) {
         // SIGTERM first: git removes its ref lock files on SIGTERM but not on
         // SIGKILL, and a leftover lock would break the user's own next fetch.
@@ -619,8 +700,8 @@ impl ProcessTree {
     }
 }
 
-/// A fetch and every process it starts, held in a job object so that a stop
-/// reaches ssh and the remote helpers as well as git.
+/// A git command and every process it starts, held in a job object so that
+/// a stop reaches ssh, hooks and helpers as well as git.
 #[cfg(windows)]
 struct ProcessTree {
     job: Option<std::os::windows::io::OwnedHandle>,
@@ -645,7 +726,7 @@ impl ProcessTree {
         ProcessTree { job }
     }
 
-    /// Stops a timed-out or cancelled fetch and everything it started.
+    /// Stops a timed-out or cancelled command and everything it started.
     fn terminate(&self, child: &mut Child) {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;

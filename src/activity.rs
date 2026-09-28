@@ -31,7 +31,13 @@ pub struct ActivityEvent {
     pub text: String,
     /// Commit the event refers to, when clicking it can open one.
     pub rev: Option<String>,
+    /// The one changed file the event is about, which clicking can open.
+    pub path: Option<String>,
 }
+
+/// What `git stash` writes to HEAD's reflog, as a user's `git reset --hard
+/// HEAD` also does.
+const STASH_RESET: &str = "reset: moving to HEAD";
 
 /// Turns a reflog entry into a timeline event, or `None` for noise such as
 /// individual rebase picks.
@@ -42,6 +48,7 @@ pub fn classify(e: &ReflogEntry) -> Option<ActivityEvent> {
             kind,
             text,
             rev: Some(e.short.clone()),
+            path: None,
         })
     };
     if let Some(remote) = e.refname.strip_prefix("refs/remotes/") {
@@ -64,6 +71,8 @@ pub fn classify(e: &ReflogEntry) -> Option<ActivityEvent> {
             event(ActivityKind::Rebase, "rebase started".into())
         } else if action.contains("(finish)") {
             event(ActivityKind::Rebase, "rebase finished".into())
+        } else if action.contains("(abort)") {
+            event(ActivityKind::Rebase, "rebase aborted".into())
         } else {
             None
         };
@@ -100,22 +109,43 @@ fn plural(n: usize, word: &str) -> String {
     }
 }
 
-/// `path +a −r` for one changed path (counts from `snap`), or `N files changed`.
-pub fn describe_files(paths: &[String], snap: &Snapshot) -> String {
-    let [path] = paths else {
-        return format!("{} changed", plural(paths.len(), "file"));
+/// A file event for `paths` as they stand in `snap`: `path +a −r` for one
+/// changed path, `path discarded` for one no longer changed, or
+/// `N files changed` / `N files discarded`.
+pub fn files_event(paths: &[String], snap: &Snapshot, time: i64) -> ActivityEvent {
+    let find = |p: &String| snap.changes.iter().find(|c| &c.path == p);
+    let (text, path) = match paths {
+        [p] => match find(p) {
+            Some(c) => {
+                let mut text = p.clone();
+                let (a, r) = c.counts.known().unwrap_or((0, 0));
+                if a > 0 {
+                    text.push_str(&format!(" +{a}"));
+                }
+                if r > 0 {
+                    text.push_str(&format!(" −{r}"));
+                }
+                (text, Some(p.clone()))
+            }
+            None => (format!("{p} discarded"), None),
+        },
+        _ if paths.iter().all(|p| find(p).is_none()) => {
+            (format!("{} discarded", plural(paths.len(), "file")), None)
+        }
+        _ => (format!("{} changed", plural(paths.len(), "file")), None),
     };
-    let mut text = path.clone();
-    if let Some(c) = snap.changes.iter().find(|c| &c.path == path) {
-        let (a, r) = c.counts.known().unwrap_or((0, 0));
-        if a > 0 {
-            text.push_str(&format!(" +{a}"));
-        }
-        if r > 0 {
-            text.push_str(&format!(" −{r}"));
-        }
+    ActivityEvent {
+        time,
+        kind: ActivityKind::Files,
+        text,
+        rev: None,
+        path,
     }
-    text
+}
+
+/// HEAD's newest reflog entry.
+fn newest_head(snap: &Snapshot) -> Option<&ReflogEntry> {
+    snap.reflog.iter().find(|r| r.refname == "HEAD")
 }
 
 /// Events describing what changed between two snapshots, plus the paths
@@ -134,14 +164,39 @@ pub fn diff_snapshots(
         .filter(|(c, old)| old.is_none_or(|o| o != c))
         .collect();
 
+    // Paths that left the list, unless a commit, reset, checkout or stash
+    // explains it, or the list is capped and a path may only have moved
+    // past the cap.
+    let explained = newest_head(prev) != newest_head(next)
+        || prev.oid != next.oid
+        || prev.stash_count != next.stash_count;
+    let capped = prev.changes_omitted > 0 || next.changes_omitted > 0;
+    let left: Vec<&Change> = if explained || capped {
+        Vec::new()
+    } else {
+        let now_paths: HashSet<&str> = next.changes.iter().map(|c| c.path.as_str()).collect();
+        prev.changes
+            .iter()
+            .filter(|c| !now_paths.contains(c.path.as_str()))
+            .collect()
+    };
+
     let mut events = Vec::new();
     let event = |kind, text: String| ActivityEvent {
         time: now,
         kind,
         text,
         rev: None,
+        path: None,
     };
-    if !changed.is_empty() {
+    let paths: Vec<String> = changed
+        .iter()
+        .map(|(c, _)| c.path.clone())
+        .chain(left.iter().map(|c| c.path.clone()))
+        .collect();
+    if !left.is_empty() {
+        events.push(files_event(&paths, next, now));
+    } else if !changed.is_empty() {
         let moved_to_index = |to_index: bool| {
             changed.iter().all(|(c, old)| {
                 old.is_some_and(|o| {
@@ -160,26 +215,40 @@ pub fn diff_snapshots(
                 format!("unstaged {}", plural(changed.len(), "file")),
             ));
         } else {
-            let paths: Vec<String> = changed.iter().map(|(c, _)| c.path.clone()).collect();
-            events.push(event(ActivityKind::Files, describe_files(&paths, next)));
+            events.push(files_event(&paths, next, now));
         }
     }
     if next.stash_count > prev.stash_count {
-        events.push(event(ActivityKind::Stash, "stash saved".into()));
+        // The stash takes the time of the reset `git stash` wrote, which
+        // `merged` then leaves out.
+        let reset = next
+            .reflog
+            .iter()
+            .filter(|r| r.refname == "HEAD" && !prev.reflog.contains(r))
+            .find(|r| r.message == STASH_RESET);
+        events.push(ActivityEvent {
+            time: reset.map_or(now, |r| r.time),
+            ..event(ActivityKind::Stash, "stash saved".into())
+        });
     } else if next.stash_count < prev.stash_count {
         events.push(event(
             ActivityKind::Stash,
             "stash applied or dropped".into(),
         ));
     }
-    let paths = changed.into_iter().map(|(c, _)| c.path.clone()).collect();
     (events, paths)
 }
 
 /// The timeline shown in the Activity section, newest first.
 pub fn merged(reflog: &[ReflogEntry], live: &[ActivityEvent], limit: usize) -> Vec<ActivityEvent> {
+    let stashes: HashSet<i64> = live
+        .iter()
+        .filter(|e| e.kind == ActivityKind::Stash)
+        .map(|e| e.time)
+        .collect();
     let mut all: Vec<ActivityEvent> = reflog
         .iter()
+        .filter(|r| !(r.message == STASH_RESET && stashes.contains(&r.time)))
         .filter_map(classify)
         .chain(live.iter().cloned())
         .collect();
@@ -323,7 +392,8 @@ mod tests {
                 time: 5,
                 kind: ActivityKind::Files,
                 text: "2 files changed".into(),
-                rev: None
+                rev: None,
+                path: None,
             }]
         );
         assert_eq!(paths, vec!["a", "b"]);
@@ -378,6 +448,70 @@ mod tests {
         );
     }
 
+    fn at(time: i64, m: &str) -> ReflogEntry {
+        ReflogEntry {
+            time,
+            ..e("HEAD", m)
+        }
+    }
+
+    #[test]
+    fn stash_is_not_also_shown_as_a_reset() {
+        let prev = Snapshot::default();
+        let next = Snapshot {
+            stash_count: 1,
+            reflog: vec![at(9, "reset: moving to HEAD")],
+            ..Snapshot::default()
+        };
+        let (events, _) = diff_snapshots(&prev, &next, 12);
+        let texts: Vec<_> = merged(&next.reflog, &events, 10)
+            .into_iter()
+            .map(|e| (e.time, e.text))
+            .collect();
+        assert_eq!(texts, vec![(9, "stash saved".to_string())]);
+        // A reset to HEAD of its own still shows.
+        let texts: Vec<_> = merged(&next.reflog, &[], 10)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(texts, vec!["reset to HEAD"]);
+    }
+
+    #[test]
+    fn aborted_rebase_is_shown() {
+        let ev = classify(&e("HEAD", "rebase (abort): returning to refs/heads/side")).unwrap();
+        assert_eq!(
+            (ev.kind, ev.text.as_str()),
+            (ActivityKind::Rebase, "rebase aborted")
+        );
+    }
+
+    #[test]
+    fn files_leaving_the_list_are_reported() {
+        let a = snap_with(vec![ch("a", ' ', 'M', 1, 0), ch("b", '?', '?', 2, 0)]);
+        let b = snap_with(vec![ch("b", '?', '?', 2, 0)]);
+        let (ev, paths) = diff_snapshots(&a, &b, 5);
+        assert_eq!(ev[0].text, "a discarded");
+        assert_eq!(paths, vec!["a"]);
+        let (ev, _) = diff_snapshots(&a, &snap_with(vec![]), 5);
+        assert_eq!(ev[0].text, "2 files discarded");
+        // A new HEAD reflog entry (commit, reset, checkout) explains it.
+        let reset = Snapshot {
+            reflog: vec![at(4, "reset: moving to HEAD")],
+            ..snap_with(vec![])
+        };
+        assert!(diff_snapshots(&a, &reset, 5).0.is_empty());
+    }
+
+    #[test]
+    fn single_path_events_carry_the_path() {
+        let a = snap_with(vec![]);
+        let b = snap_with(vec![ch("a", ' ', 'M', 1, 0)]);
+        assert_eq!(diff_snapshots(&a, &b, 5).0[0].path.as_deref(), Some("a"));
+        let c = snap_with(vec![ch("a", ' ', 'M', 1, 0), ch("b", ' ', 'M', 1, 0)]);
+        assert_eq!(diff_snapshots(&a, &c, 5).0[0].path, None);
+    }
+
     #[test]
     fn merged_sorted_deduped_limited() {
         let live = vec![
@@ -386,12 +520,14 @@ mod tests {
                 kind: ActivityKind::Files,
                 text: "x".into(),
                 rev: None,
+                path: None,
             },
             ActivityEvent {
                 time: 20,
                 kind: ActivityKind::Files,
                 text: "x".into(),
                 rev: None,
+                path: None,
             },
         ];
         let m = merged(
