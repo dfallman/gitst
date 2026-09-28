@@ -2,6 +2,7 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -282,7 +283,9 @@ fn fetch_updates_behind() {
     let other = TestRepo::clone_from(&remote);
     other.commit_file("a", "2", "two");
     other.git(&["push", "-q"]);
-    backend(&r).fetch(false, Duration::from_secs(30)).unwrap();
+    backend(&r)
+        .fetch(false, Duration::from_secs(30), &AtomicBool::new(false))
+        .unwrap();
     let s = snap(&r);
     assert_eq!(s.upstream.unwrap().behind, 1);
     assert!(s.last_fetch.is_some());
@@ -295,7 +298,7 @@ fn fetch_unreachable_remote_fails_cleanly() {
     r.git(&["remote", "add", "origin", "/nonexistent/remote.git"]);
     let t = Instant::now();
     let err = backend(&r)
-        .fetch(false, Duration::from_secs(30))
+        .fetch(false, Duration::from_secs(30), &AtomicBool::new(false))
         .unwrap_err();
     assert!(
         matches!(err, FetchError::Other(ref m) if m.contains("does not appear")),
@@ -426,10 +429,98 @@ fn fetch_times_out_and_returns() {
     r.git(&["config", "core.sshCommand", "sh -c 'sleep 30' --"]);
     let t = Instant::now();
     let err = backend(&r)
-        .fetch(false, Duration::from_millis(500))
+        .fetch(false, Duration::from_millis(500), &AtomicBool::new(false))
         .unwrap_err();
     assert_eq!(err, FetchError::Timeout);
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+/// Points `origin` at an ssh transport that writes its pid to the returned
+/// file and then hangs.
+#[cfg(unix)]
+fn hanging_remote(r: &TestRepo) -> std::path::PathBuf {
+    let pid_file = r.dir.path().join("ssh.pid");
+    r.git(&["remote", "add", "origin", "ssh://example.invalid/x.git"]);
+    let ssh = format!("sh -c 'echo $$ > {}; exec sleep 30' --", pid_file.display());
+    r.git(&["config", "core.sshCommand", &ssh]);
+    pid_file
+}
+
+#[cfg(unix)]
+fn wait_for_pid(file: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(file)
+            && s.ends_with('\n')
+        {
+            return s.trim().to_string();
+        }
+        assert!(Instant::now() < deadline, "fetch transport never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn exits_within(pid: &str, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fetch_stops_when_cancelled() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let pid_file = hanging_remote(&r);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let b = backend(&r);
+    let flag = cancel.clone();
+    let fetch = std::thread::spawn(move || b.fetch(false, Duration::from_secs(30), &flag));
+    let pid = wait_for_pid(&pid_file);
+    let t = Instant::now();
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(fetch.join().unwrap(), Err(FetchError::Cancelled));
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(exits_within(&pid, Duration::from_secs(2)));
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_shutdown_stops_running_fetch() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let pid_file = hanging_remote(&r);
+    let (tx, rx) = channel();
+    let cfg = WorkerConfig {
+        opts: opts(),
+        interval: Duration::ZERO,
+        prune: false,
+    };
+    let w = worker::spawn(Arc::new(backend(&r)), cfg, tx);
+    recv_until(&rx, |m| matches!(m, UiMsg::Snapshot { .. }).then_some(()));
+    w.send(WorkerMsg::Fetch { manual: true }).unwrap();
+    let pid = wait_for_pid(&pid_file);
+    let t = Instant::now();
+    w.shutdown();
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(
+        exits_within(&pid, Duration::from_secs(2)),
+        "fetch transport {pid} outlived shutdown"
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "gitst"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Live, glanceable git status TUI for small terminal panes"
 license = "MIT"
@@ -23,6 +23,15 @@ unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 insta = "1"

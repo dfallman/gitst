@@ -2,6 +2,7 @@ pub mod cli;
 pub mod parse;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::model::{DetailData, DetailReq, Snapshot};
@@ -77,6 +78,8 @@ pub enum FetchError {
     Auth,
     Offline,
     Timeout,
+    /// Stopped because gitst is quitting.
+    Cancelled,
     Other(String),
 }
 
@@ -87,6 +90,7 @@ impl FetchError {
             FetchError::Auth => "auth".into(),
             FetchError::Offline => "offline".into(),
             FetchError::Timeout => "timeout".into(),
+            FetchError::Cancelled => "cancelled".into(),
             FetchError::Other(m) => m.clone(),
         }
     }
@@ -140,8 +144,8 @@ pub trait GitBackend: Send + Sync {
     fn repo(&self) -> &Repo;
     fn snapshot(&self, opts: &SnapshotOpts) -> Result<Snapshot, GitError>;
     fn detail(&self, req: &DetailReq) -> Result<DetailData, GitError>;
-    /// Runs `git fetch`, killing it after `timeout`.
-    fn fetch(&self, prune: bool, timeout: Duration) -> Result<(), FetchError>;
+    /// Runs `git fetch`, stopping it after `timeout` or once `cancel` is set.
+    fn fetch(&self, prune: bool, timeout: Duration, cancel: &AtomicBool) -> Result<(), FetchError>;
 }
 
 #[cfg(test)]

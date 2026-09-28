@@ -3,7 +3,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::parse::{self, BRANCH_FORMAT, LOG_FORMAT, REFLOG_FORMAT, STASH_FORMAT};
@@ -15,8 +16,7 @@ use crate::model::{
 
 /// Largest untracked file whose lines are counted for the `+N` column.
 const MAX_COUNTED_FILE: u64 = 1 << 20;
-/// How long a timed-out fetch gets to exit after SIGTERM.
-#[cfg(unix)]
+/// How long a stopped fetch gets to clean up and exit before it is killed.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Upper bound on remote-tracking reflogs read per refresh.
 const MAX_REMOTE_REFLOGS: usize = 10;
@@ -468,10 +468,14 @@ impl GitBackend for CliBackend {
         }
     }
 
-    fn fetch(&self, prune: bool, timeout: Duration) -> Result<(), FetchError> {
+    fn fetch(&self, prune: bool, timeout: Duration, cancel: &AtomicBool) -> Result<(), FetchError> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(FetchError::Cancelled);
+        }
         let mut cmd = self.fetch_command(prune);
         detach(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| FetchError::Other(e.to_string()))?;
+        let tree = ProcessTree::adopt(&child);
         let mut stderr = child.stderr.take().expect("stderr is piped");
         let reader = std::thread::spawn(move || {
             let mut s = String::new();
@@ -489,8 +493,13 @@ impl GitBackend for CliBackend {
                         Err(classify_fetch_stderr(&err))
                     };
                 }
+                Ok(None) if cancel.load(Ordering::SeqCst) => {
+                    tree.terminate(&mut child);
+                    let _ = child.wait();
+                    return Err(FetchError::Cancelled);
+                }
                 Ok(None) if start.elapsed() >= timeout => {
-                    terminate(&mut child);
+                    tree.terminate(&mut child);
                     let _ = child.wait();
                     return Err(FetchError::Timeout);
                 }
@@ -506,8 +515,8 @@ impl GitBackend for CliBackend {
 #[cfg(unix)]
 fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // A new session has no controlling terminal; it also lets `terminate`
-    // kill the whole group.
+    // A new session has no controlling terminal; it also makes git a group
+    // leader, so `ProcessTree::terminate` can signal everything it starts.
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -524,28 +533,143 @@ fn detach(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
-/// Stops a timed-out fetch and everything it started.
+/// A fetch and every process it starts.
 #[cfg(unix)]
-fn terminate(child: &mut std::process::Child) {
-    // SIGTERM first: git removes its ref lock files on SIGTERM but not on
-    // SIGKILL, and a leftover lock would break the user's own next fetch.
-    let group = -(child.id() as i32);
-    unsafe {
-        libc::kill(group, libc::SIGTERM);
+struct ProcessTree;
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn adopt(_child: &Child) -> Self {
+        ProcessTree
     }
+
+    /// Stops a timed-out or cancelled fetch and everything it started.
+    fn terminate(&self, child: &mut Child) {
+        // SIGTERM first: git removes its ref lock files on SIGTERM but not on
+        // SIGKILL, and a leftover lock would break the user's own next fetch.
+        let group = -(child.id() as i32);
+        unsafe {
+            libc::kill(group, libc::SIGTERM);
+        }
+        wait_grace(child);
+        unsafe {
+            libc::kill(group, libc::SIGKILL);
+        }
+    }
+}
+
+/// A fetch and every process it starts, held in a job object so that a stop
+/// reaches ssh and the remote helpers as well as git.
+#[cfg(windows)]
+struct ProcessTree {
+    job: Option<std::os::windows::io::OwnedHandle>,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn adopt(child: &Child) -> Self {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // Git has only just started, so it has not yet started anything that
+        // would be left outside the job.
+        let job = unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return ProcessTree { job: None };
+            }
+            let job = OwnedHandle::from_raw_handle(h);
+            (AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) != 0)
+                .then_some(job)
+        };
+        ProcessTree { job }
+    }
+
+    /// Stops a timed-out or cancelled fetch and everything it started.
+    fn terminate(&self, child: &mut Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // Git removes its ref lock files in atexit handlers, which
+        // TerminateProcess skips, and a leftover lock would break the user's
+        // own next fetch. Ask git to exit from inside first.
+        if exit_from_inside(child) {
+            wait_grace(child);
+        }
+        match &self.job {
+            Some(job) => unsafe {
+                TerminateJobObject(job.as_raw_handle(), STOPPED_EXIT_CODE);
+            },
+            None => {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+/// Exit status for a stopped fetch on Windows, as if by SIGTERM.
+#[cfg(windows)]
+const STOPPED_EXIT_CODE: u32 = 128 + 15;
+
+/// Runs `ExitProcess` on a new thread inside `child`, the way Git for
+/// Windows emulates `kill -TERM`, so that git's atexit handlers run.
+/// Returns whether the thread was started.
+#[cfg(windows)]
+fn exit_from_inside(child: &Child) -> bool {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::Threading::{
+        CreateRemoteThread, GetCurrentProcess, IsWow64Process, LPTHREAD_START_ROUTINE,
+    };
+    use windows_sys::core::{s, w};
+    let process = child.as_raw_handle();
+    unsafe {
+        // kernel32 sits at the same address in every process of one
+        // architecture, so our `ExitProcess` is git's, but only if git is
+        // built for the same one.
+        let (mut ours, mut theirs) = (0, 0);
+        if IsWow64Process(GetCurrentProcess(), &mut ours) == 0
+            || IsWow64Process(process, &mut theirs) == 0
+            || ours != theirs
+        {
+            return false;
+        }
+        let kernel32 = GetModuleHandleW(w!("kernel32.dll"));
+        if kernel32.is_null() {
+            return false;
+        }
+        let Some(exit) = GetProcAddress(kernel32, s!("ExitProcess")) else {
+            return false;
+        };
+        // `ExitProcess(u32)` takes its one argument where a thread routine
+        // takes its parameter.
+        let start: LPTHREAD_START_ROUTINE = Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            unsafe extern "system" fn(*mut c_void) -> u32,
+        >(exit));
+        let thread = CreateRemoteThread(
+            process,
+            std::ptr::null(),
+            0,
+            start,
+            STOPPED_EXIT_CODE as usize as *const c_void,
+            0,
+            std::ptr::null_mut(),
+        );
+        if thread.is_null() {
+            return false;
+        }
+        CloseHandle(thread);
+        true
+    }
+}
+
+/// Gives a stopped fetch `KILL_GRACE` to exit on its own.
+fn wait_grace(child: &mut Child) {
     let grace = Instant::now();
     while grace.elapsed() < KILL_GRACE && matches!(child.try_wait(), Ok(None)) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    unsafe {
-        libc::kill(group, libc::SIGKILL);
-    }
-}
-
-#[cfg(windows)]
-fn terminate(child: &mut std::process::Child) {
-    // Windows has no gentle stop for a console process without a console.
-    let _ = child.kill();
 }
 
 #[cfg(test)]

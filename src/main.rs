@@ -118,7 +118,7 @@ fn run(
     );
     app.config_warning = warning;
     // Without a watcher, fall back to refreshing every few seconds.
-    let (_watch, poll) = match watch::spawn(&repo, worker.clone()) {
+    let (_watch, poll) = match watch::spawn(&repo, worker.sender()) {
         Ok(h) => (Some(h), None),
         Err(e) => {
             app.config_warning = Some(format!("file watching failed ({e}); polling"));
@@ -156,7 +156,7 @@ fn run(
             }
         }
         if quit {
-            let _ = worker.send(WorkerMsg::Shutdown);
+            worker.shutdown();
             break;
         }
     }
