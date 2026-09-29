@@ -131,3 +131,6 @@ defaults; the rest of the file still applies.
 - Changes are picked up by watching the working tree and `.git`, skipping
   ignored paths. If the watcher cannot start, gitst polls every 3 seconds.
 
+## Note on AI use
+I've been writing code for over 30 years, and lately LLM agent-assisted coding has rekindled my sense of awe at what code can do. This project was built in Rust using a range of tools, including Anthropic's Claude Code. For me, these tools are simply means to move faster, explore more ideas, and test those ideas and implementations more rigorously than I could (or would ever do) on my own.
+
