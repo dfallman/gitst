@@ -2,7 +2,7 @@
 **Gitst is a real-time interactive git monitor**.
 
 <p align="center">
-  <img width="800" alt="gits front" src="https://github.com/user-attachments/assets/8d13e857-f218-461f-a580-9b5fda27cd58" />
+  <img width="700" alt="gitst-transp" src="https://github.com/user-attachments/assets/2f10ea77-fda8-411d-a552-e221e575ff0c" />
 </p>
 
 Gitst is intended to sit in one pane of a multi-pane terminal setup (using tools like Dantty, tmux, screen, herdr, WezTerm, iTerm2, etc.) next to for instance an editor, a coding agent, and a shell. Gitst shows in real-time what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges, and rebases.
