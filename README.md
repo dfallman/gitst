@@ -1,5 +1,5 @@
 # gitst
-**Gitst is a real-time interactive git monitor**.
+**A real-time, glanceable git status monitor for the terminal**
 
 <p align="center">
   <img width="700" alt="gitst-transp" src="https://github.com/user-attachments/assets/582d783f-7925-439a-835d-0cf7bbc7ea0e" />
