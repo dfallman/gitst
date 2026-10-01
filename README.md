@@ -1,18 +1,13 @@
 # gitst
-
-A real-time, glanceable interactive **git status monitor** typically used in a small terminal pane alongside for instance your coding editor/IDE, a coding agent, and other terminal panes.
-
-<p align="center">
-  <img width="496" alt="gitst-front" src="https://github.com/user-attachments/assets/3a474e6b-669e-4591-80eb-9f74018e6213" />
-</p>
-
-Gitst is meant to sit in one pane of a multi-pane setup (Dantty, tmux, screen, herdr, WezTerm etc.) next to for instance a coding agent and a shell, and show what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges and rebases.
+**Gitst is a real-time interactive git monitor**.
 
 <p align="center">
   <img width="800" alt="gits front" src="https://github.com/user-attachments/assets/8d13e857-f218-461f-a580-9b5fda27cd58" />
 </p>
 
-Note that by design, gitst *monitors* git, it doesn't *manipulate* it. This comes with a few benefits, especially for use in conjunction with team work and coding agents where you might want the coding agent to control git, there's lots of team activity on the repo, or, like me, you just want to control git manually. Because it is a git monitor, apart from `git fetch`, gitst never changes your git repository, and it never takes over git's `index.lock`, so it cannot get in the way or obstruct git commands run elsewhere.
+Gitst is intended to sit in one pane of a multi-pane terminal setup (using tools like Dantty, tmux, screen, herdr, WezTerm, iTerm2, etc.) next to for instance an editor, a coding agent, and a shell. Gitst shows in real-time what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges, and rebases.
+
+By design, gitst *monitors* git, it doesn't *manipulate* it. This is by design and comes with a few benefits, especially for team work scenarios when there's lots of team activity on the repo, and also for personal use in conjunction with coding agents. Being a git monitor, gitst never changes your git repository (apart from `git fetch`), and it never takes over git's `index.lock`, so it cannot (by design) get in the way or obstruct git commands run elsewhere. This is useful for at least two scenarios: 1) when you might want the coding agent to control git but still see what's going on, or 2), like me, you just want to control git manually.
 
 ## Install
 
