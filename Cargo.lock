@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "gitst"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -673,6 +673,7 @@ dependencies = [
  "libc",
  "notify",
  "ratatui",
+ "regex",
  "serde",
  "signal-hook",
  "tempfile",

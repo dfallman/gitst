@@ -308,6 +308,93 @@ pub fn parse_diff(raw: &[u8]) -> Vec<DiffLine> {
     out
 }
 
+/// A file in a `-U0` patch: the lines it adds, with their new line numbers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddedFile {
+    pub path: String,
+    /// Created by the patch.
+    pub new_file: bool,
+    pub lines: Vec<(u32, String)>,
+}
+
+/// Parses `git diff` or `git log -p` output made with `-U0 --no-renames
+/// --src-prefix=a/ --dst-prefix=b/`. Deleted files are left out.
+pub fn parse_added_lines(raw: &[u8]) -> Vec<AddedFile> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = Vec::new();
+    let mut cur: Option<AddedFile> = None;
+    let mut in_header = false;
+    let mut next = 0u32;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with("diff --git ") {
+            out.extend(cur.take().filter(|f| !f.path.is_empty()));
+            cur = Some(AddedFile::default());
+            in_header = true;
+            continue;
+        }
+        let Some(file) = cur.as_mut() else {
+            continue;
+        };
+        if line.starts_with("@@") {
+            in_header = false;
+            next = hunk_new_start(line);
+        } else if in_header {
+            if line.starts_with("new file mode") {
+                file.new_file = true;
+            } else if let Some(p) = line.strip_prefix("+++ ") {
+                file.path = new_side_path(p).unwrap_or_default();
+            } else if let Some((_, p)) = line
+                .strip_prefix("Binary files ")
+                .and_then(|r| r.strip_suffix(" differ"))
+                .and_then(|r| r.rsplit_once(" and "))
+            {
+                file.path = new_side_path(p).unwrap_or_default();
+            }
+        } else if let Some(added) = line.strip_prefix('+') {
+            file.lines.push((next, added.to_string()));
+            next += 1;
+        }
+    }
+    out.extend(cur.filter(|f| !f.path.is_empty()));
+    out
+}
+
+/// The path in `b/<path>`; `None` for `/dev/null`. Git ends a path that
+/// contains a space with a tab, and quotes one with special characters.
+fn new_side_path(p: &str) -> Option<String> {
+    let p = p.strip_suffix('\t').unwrap_or(p);
+    let p = p
+        .strip_prefix('"')
+        .and_then(|q| q.strip_suffix('"'))
+        .unwrap_or(p);
+    p.strip_prefix("b/").map(str::to_string)
+}
+
+/// `c` in `@@ -a,b +c,d @@`.
+fn hunk_new_start(line: &str) -> u32 {
+    line.split(' ')
+        .find_map(|part| part.strip_prefix('+'))
+        .and_then(|n| n.split(',').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Splits `git log --format=%x00%H -p` output into `(oid, patch)` pairs.
+pub fn split_commit_patches(raw: &[u8]) -> Vec<(String, &[u8])> {
+    raw.split(|b| *b == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .filter_map(|chunk| {
+            let end = chunk
+                .iter()
+                .position(|b| *b == b'\n')
+                .unwrap_or(chunk.len());
+            let oid = String::from_utf8_lossy(&chunk[..end]).trim().to_string();
+            (!oid.is_empty()).then(|| (oid, &chunk[end..]))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +543,42 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
             parse_diff(b"diff --git a/i b/i\nBinary files a/i and b/i differ\n@@ -1 +1 @@\n+\tx\n");
         assert_eq!(d[0].kind, DiffKind::Meta);
         assert_eq!(d[2].text, "    x");
+    }
+
+    /// Real `git diff -U0` output: a new file with a space in its name
+    /// (git ends that `+++` line with a tab), a new binary file, an edit
+    /// whose added line starts with `++`, and a deleted file.
+    const ADDED: &str = "diff --git a/a b.txt b/a b.txt\nnew file mode 100644\nindex 0000000..587be6b\n--- /dev/null\n+++ b/a b.txt\t\n@@ -0,0 +1 @@\n+x\ndiff --git a/k s.p12 b/k s.p12\nnew file mode 100644\nindex 0000000..bdc955b\nBinary files /dev/null and b/k s.p12 differ\ndiff --git a/plus.txt b/plus.txt\nindex 1111111..2222222 100644\n--- a/plus.txt\n+++ b/plus.txt\n@@ -3,0 +4,2 @@\n+++x\n+foo\n@@ -9 +11 @@ fn x() {\n-old\n+new\ndiff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\nindex 3333333..0000000\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+
+    #[test]
+    fn added_lines_with_numbers_paths_and_new_files() {
+        let files = parse_added_lines(ADDED.as_bytes());
+        let file = |path: &str, new_file, lines: &[(u32, &str)]| AddedFile {
+            path: path.into(),
+            new_file,
+            lines: lines.iter().map(|(n, t)| (*n, t.to_string())).collect(),
+        };
+        assert_eq!(
+            files,
+            vec![
+                file("a b.txt", true, &[(1, "x")]),
+                file("k s.p12", true, &[]),
+                file("plus.txt", false, &[(4, "++x"), (5, "foo"), (11, "new")]),
+            ]
+        );
+        assert!(parse_added_lines(b"").is_empty());
+    }
+
+    #[test]
+    fn commit_patches_split_on_nul() {
+        let raw = b"\0aaa111\n\ndiff --git a/x b/x\n+++ b/x\n@@ -0,0 +1 @@\n+k\n\0bbb222\n";
+        let parts = split_commit_patches(raw);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].0, "aaa111");
+        assert_eq!(
+            parse_added_lines(parts[0].1)[0].lines,
+            vec![(1, "k".to_string())]
+        );
+        assert_eq!(parts[1], ("bbb222".to_string(), &b"\n"[..]));
     }
 }

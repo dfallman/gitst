@@ -15,6 +15,9 @@ pub struct Config {
     pub pulse_seconds: u64,
     pub max_changes: usize,
     pub numstat_max_files: usize,
+    pub leak_scan: bool,
+    /// Paths never warned about, in gitignore syntax.
+    pub leak_allow: Vec<String>,
 }
 
 impl Default for Config {
@@ -27,6 +30,8 @@ impl Default for Config {
             pulse_seconds: 10,
             max_changes: 1000,
             numstat_max_files: 500,
+            leak_scan: true,
+            leak_allow: Vec::new(),
         }
     }
 }
@@ -78,6 +83,20 @@ impl Config {
                 "pulse_seconds" => set(&mut c.pulse_seconds, value),
                 "max_changes" => set(&mut c.max_changes, value),
                 "numstat_max_files" => set(&mut c.numstat_max_files, value),
+                "leak_scan" => set(&mut c.leak_scan, value),
+                "leak_allow" => match value.try_into::<Vec<String>>() {
+                    Ok(patterns) => {
+                        for p in patterns {
+                            if crate::leaks::valid_allow_pattern(&p) {
+                                c.leak_allow.push(p);
+                            } else {
+                                bad.push(format!("leak_allow {p:?} (invalid)"));
+                            }
+                        }
+                        true
+                    }
+                    Err(_) => false,
+                },
                 _ => {
                     bad.push(format!("{key} (unknown)"));
                     continue;
@@ -212,5 +231,27 @@ mod tests {
         let (c, warning) = Config::from_toml("fetch_prune = ");
         assert_eq!(c, Config::default());
         assert!(warning.is_some());
+    }
+
+    #[test]
+    fn leak_keys() {
+        let d = Config::default();
+        assert!(d.leak_scan && d.leak_allow.is_empty());
+        let (c, warning) =
+            Config::from_toml("leak_scan = false\nleak_allow = [\"tests/fixtures/\", \"a{b\"]");
+        assert!(!c.leak_scan);
+        assert_eq!(c.leak_allow, vec!["tests/fixtures/"]);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("leak_allow \"a{b\" (invalid)"),
+            "{warning}"
+        );
+        let (c, warning) = Config::from_toml("leak_scan = 1\nleak_allow = \"x\"");
+        assert!(c.leak_scan && c.leak_allow.is_empty());
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("leak_scan") && warning.contains("leak_allow"),
+            "{warning}"
+        );
     }
 }

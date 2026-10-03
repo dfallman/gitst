@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use common::TestRepo;
 #[cfg(unix)]
 use common::{exits_within, hanging_remote, wait_for_pid};
-use gitst::git::{CliBackend, DiscoverError, FetchError, GitBackend, Repo, SnapshotOpts};
+use gitst::git::{
+    CliBackend, DiscoverError, FetchError, GitBackend, LeakScanConfig, Repo, SnapshotOpts,
+};
 use gitst::model::*;
 use gitst::watch::{self, Relevance};
 use gitst::worker::{self, FetchStatus, UiMsg, WorkerConfig, WorkerMsg};
@@ -768,4 +770,232 @@ fn stash_shows_once_in_activity() {
     assert_eq!(stashes, 1, "{texts:?}");
     assert!(!texts.iter().any(|t| t.starts_with("reset")), "{texts:?}");
     assert!(!texts.iter().any(|t| t.contains("discarded")), "{texts:?}");
+}
+
+/// A fake AWS key, assembled so that this file holds none.
+fn aws_key() -> String {
+    format!("{}{}", "AK", "IAQ7LM2XRT5VBN8KWD")
+}
+
+fn leak_list(s: &Snapshot) -> Vec<(&str, &str, &LeakSource)> {
+    s.leaks
+        .iter()
+        .map(|l| (l.rule, l.path.as_str(), &l.source))
+        .collect()
+}
+
+#[test]
+fn leaks_in_untracked_and_staged_files() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.write(".env", "TOKEN=1\n");
+    r.write(".env.example", "TOKEN=\n");
+    r.write("my notes.txt", &format!("x\n{}\n", aws_key()));
+    r.write(
+        "src/my cfg.rs",
+        &format!("a\nb\nlet k = \"{}\";\n", aws_key()),
+    );
+    r.git(&["add", "src/my cfg.rs"]);
+    let s = snap(&r);
+    assert_eq!(s.leaks.len(), 3, "{:?}", s.leaks);
+    assert!(
+        s.leaks
+            .iter()
+            .any(|l| l.rule == "env-file" && l.path == ".env" && l.source == LeakSource::Untracked)
+    );
+    assert!(
+        s.leaks
+            .iter()
+            .any(|l| l.path == "my notes.txt" && l.line == Some(2))
+    );
+    let staged = s
+        .leaks
+        .iter()
+        .find(|l| l.source == LeakSource::Staged)
+        .unwrap();
+    assert_eq!(
+        (staged.path.as_str(), staged.line),
+        ("src/my cfg.rs", Some(3))
+    );
+    assert!(
+        !staged.snippet.as_deref().unwrap().contains("Q7LM2XRT"),
+        "masked"
+    );
+    assert_eq!(s.leak_scan_skipped, None);
+}
+
+#[test]
+fn an_edited_tracked_env_file_is_not_flagged_again() {
+    let r = TestRepo::new();
+    r.commit_file(".env", "A=1\n", "one");
+    r.write(".env", "A=2\n");
+    assert!(snap(&r).leaks.is_empty());
+}
+
+#[test]
+fn leak_scan_ignores_diff_prefix_config() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.git(&["config", "diff.noprefix", "true"]);
+    r.git(&["config", "diff.mnemonicPrefix", "true"]);
+    r.write("a.txt", &format!("1\n{}\n", aws_key()));
+    let s = snap(&r);
+    let got: Vec<(&str, Option<u32>, &LeakSource)> = s
+        .leaks
+        .iter()
+        .map(|l| (l.path.as_str(), l.line, &l.source))
+        .collect();
+    assert_eq!(got, vec![("a.txt", Some(2), &LeakSource::Unstaged)]);
+}
+
+#[test]
+fn leaks_in_unpushed_commits_then_pushed() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    r.commit_file("deploy.txt", &format!("{}\n", aws_key()), "add deploy key");
+    // One backend throughout: the pushed list lives in its cache.
+    let b = backend(&r);
+    let s = b.snapshot(&opts()).unwrap();
+    let oid = s.commits[0].oid.clone();
+    assert_eq!(
+        leak_list(&s),
+        vec![(
+            "aws-access-key",
+            "deploy.txt",
+            &LeakSource::Commit(oid.clone())
+        )]
+    );
+    r.git(&["push", "-q"]);
+    let s = b.snapshot(&opts()).unwrap();
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "deploy.txt", &LeakSource::Pushed(oid))]
+    );
+}
+
+#[test]
+fn a_leak_amended_away_is_dropped() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    r.write("b.txt", "2\n");
+    r.write(".env", "A=1\n");
+    r.git(&["add", "b.txt", ".env"]);
+    r.git(&["commit", "-q", "-m", "two"]);
+    let b = backend(&r);
+    let s = b.snapshot(&opts()).unwrap();
+    assert!(
+        matches!(
+            s.leaks[..],
+            [Leak {
+                rule: "env-file",
+                source: LeakSource::Commit(_),
+                ..
+            }]
+        ),
+        "{:?}",
+        s.leaks
+    );
+    r.git(&["rm", "-q", "--cached", ".env"]);
+    std::fs::remove_file(r.path().join(".env")).unwrap();
+    r.git(&["commit", "-q", "--amend", "--no-edit"]);
+    assert!(b.snapshot(&opts()).unwrap().leaks.is_empty());
+}
+
+#[test]
+fn leaks_on_a_branch_without_upstream_and_none_without_a_remote() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.git(&["checkout", "-q", "-b", "feat"]);
+    r.commit_file("k.txt", &format!("{}\n", aws_key()), "local key");
+    assert!(
+        snap(&r).leaks.is_empty(),
+        "no remote: commits are not scanned"
+    );
+    r.git(&["checkout", "-q", "main"]);
+    r.with_bare_remote();
+    r.git(&["checkout", "-q", "feat"]);
+    let s = snap(&r);
+    assert!(s.upstream.is_none());
+    assert_eq!(s.leaks.len(), 1, "{:?}", s.leaks);
+    assert!(matches!(s.leaks[0].source, LeakSource::Commit(_)));
+}
+
+#[test]
+fn leak_allow_and_markers_suppress() {
+    let r = TestRepo::new();
+    let repo = Repo::discover(&r.path()).ok().unwrap();
+    let allow = gitst::leaks::allow_matcher(&repo.root, &["fixtures/".to_string()]);
+    let b = CliBackend::new(repo).with_leak_scan(LeakScanConfig {
+        enabled: true,
+        allow,
+    });
+    r.write("fixtures/.env", "A=1\n");
+    r.write("fixtures/k.txt", &aws_key());
+    r.write("b.txt", &format!("{} # gitst:allow\n", aws_key()));
+    assert!(b.snapshot(&opts()).unwrap().leaks.is_empty());
+}
+
+#[test]
+fn too_many_changes_skip_the_content_scan() {
+    let r = TestRepo::new();
+    r.write(".env", "A=1\n");
+    r.write("k.txt", &aws_key());
+    r.write("z.txt", "z\n");
+    let opts = SnapshotOpts {
+        numstat_max_files: 2,
+        ..opts()
+    };
+    let s = backend(&r).snapshot(&opts).unwrap();
+    assert_eq!(s.leak_scan_skipped, Some(3));
+    assert_eq!(
+        leak_list(&s),
+        vec![("env-file", ".env", &LeakSource::Untracked)]
+    );
+}
+
+#[test]
+fn leak_scan_can_be_turned_off() {
+    let r = TestRepo::new();
+    r.write(".env", "A=1\n");
+    let b = backend(&r).with_leak_scan(LeakScanConfig {
+        enabled: false,
+        ..LeakScanConfig::default()
+    });
+    let opts = SnapshotOpts {
+        numstat_max_files: 0,
+        ..opts()
+    };
+    let s = b.snapshot(&opts).unwrap();
+    assert!(s.leaks.is_empty());
+    assert_eq!(s.leak_scan_skipped, None);
+}
+
+#[test]
+fn a_key_pushed_to_a_branch_other_than_the_upstream_counts_as_pushed() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    // Tracks origin/main, but is pushed to origin/feat.
+    r.git(&["checkout", "-q", "-b", "feat", "--track", "origin/main"]);
+    r.commit_file("deploy.txt", &format!("{}\n", aws_key()), "add deploy key");
+    let b = backend(&r);
+    let s = b.snapshot(&opts()).unwrap();
+    let oid = s.commits[0].oid.clone();
+    assert!(s.upstream.is_some());
+    assert_eq!(
+        leak_list(&s),
+        vec![(
+            "aws-access-key",
+            "deploy.txt",
+            &LeakSource::Commit(oid.clone())
+        )]
+    );
+    r.git(&["push", "-q", "origin", "feat"]);
+    let s = b.snapshot(&opts()).unwrap();
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "deploy.txt", &LeakSource::Pushed(oid))]
+    );
 }

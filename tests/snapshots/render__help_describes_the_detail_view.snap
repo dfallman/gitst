@@ -4,19 +4,19 @@ expression: out
 ---
  ‹ back  a                             ↻ 2m 
 ── Staged ──────────────────────────────────
-@@ -1 +1 @@ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
--us╭ gitst ─────────────────────────────╮   
-+us│ click       open · button          │   
-   │ wheel       scroll                 │   
-── │ right-click back                   │───
-@@ │                                    │╌╌╌
-   │ j k ↑ ↓     move · scroll          │   
--  │ enter l     open                   │   
-+  │ esc h       back                   │   
-\ N│ space pgdn  page down              │   
-   │ pgup        page up                │   
+@@ ╭ gitst ─────────────────────────────╮╌╌╌
+-us│ click       open · button          │   
++us│ wheel       scroll                 │   
+   │ right-click back                   │   
+── │                                    │───
+@@ │ j k ↑ ↓     move · scroll          │╌╌╌
+   │ enter l     open                   │   
+-  │ esc h       back                   │   
++  │ space pgdn  page down              │   
+\ N│ pgup        page up                │   
    │ g G         top / bottom           │   
    │ w           wrap long lines        │   
+   │ s           possible secrets       │   
    │ f           fetch now              │   
    │ ?           close help             │   
    │ q           quit                   │   

@@ -157,6 +157,40 @@ pub struct TagInfo {
     pub distance: u32,
 }
 
+/// Where a possible secret was found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeakSource {
+    Untracked,
+    Unstaged,
+    Staged,
+    /// An unpushed commit, by full oid.
+    Commit(String),
+    /// A commit seen flagged and then seen reaching a remote this session.
+    Pushed(String),
+}
+
+impl LeakSource {
+    /// The commit, for `Commit` and `Pushed`.
+    pub fn oid(&self) -> Option<&str> {
+        match self {
+            LeakSource::Commit(o) | LeakSource::Pushed(o) => Some(o),
+            _ => None,
+        }
+    }
+}
+
+/// A possible secret. `snippet` is masked before a `Leak` is made, so the
+/// raw value is never stored or drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Leak {
+    pub rule: &'static str,
+    pub label: &'static str,
+    pub path: String,
+    pub line: Option<u32>,
+    pub snippet: Option<String>,
+    pub source: LeakSource,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub head: Head,
@@ -174,6 +208,10 @@ pub struct Snapshot {
     pub index_lock_age: Option<Duration>,
     pub last_fetch: Option<SystemTime>,
     pub has_remote: bool,
+    /// Possible secrets in the working tree and unpushed commits.
+    pub leaks: Vec<Leak>,
+    /// The number of changes, when there were too many to scan contents.
+    pub leak_scan_skipped: Option<usize>,
 }
 
 impl Default for Snapshot {
@@ -194,6 +232,8 @@ impl Default for Snapshot {
             index_lock_age: None,
             last_fetch: None,
             has_remote: false,
+            leaks: Vec::new(),
+            leak_scan_skipped: None,
         }
     }
 }
@@ -222,6 +262,8 @@ pub enum DetailReq {
         name: String,
         upstream: String,
     },
+    /// Possible secrets: drawn from the snapshot, never sent to the worker.
+    Leaks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

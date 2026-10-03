@@ -5,17 +5,17 @@ expression: "draw(&mut app, 44, 22)"
  main ↑2 ↓0 ●                          ↻ 2m 
  origin/main · v0.1.9+4 · stash 1           
 ╭ ▾ Changes (5) ────────────────── +64 −12 ╮
-│ ?? notes.md                   +3 ■■      │
-│  ╭ gitst ─────────────────────────────╮  │
+│ ?╭ gitst ─────────────────────────────╮  │
 │  │ click       open · fold · button   │  │
 │  │ wheel       scroll                 │  │
-│ A│                                    │  │
-╰──│ j k ↑ ↓     move                   │──╯
-╭ ▾│ enter l     open · fold            │──╮
-│ 0│ esc h       clear selection        │m │
-│ 0│ tab         next section           │h │
+│  │                                    │  │
+│ A│ j k ↑ ↓     move                   │  │
+╰──│ enter l     open · fold            │──╯
+╭ ▾│ esc h       clear selection        │──╮
+│ 0│ tab         next section           │m │
 │ 0│ space       fold section           │h │
 │ 0│ g G         top / bottom           │h │
+│ 0│ s           possible secrets       │h │
 ╰──│ f           fetch now              │──╯
 ╭ ▾│ ?           close help             │2 ╮
 │ 4│ q           quit                   │m │

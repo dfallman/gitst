@@ -46,8 +46,23 @@ The dashboard has five sections:
 - **Commits**: recent history, with `↑` on commits not yet pushed.
 - **Branches** and **Stashes**: folded by default.
 
-Warnings appear under the header for conflicts, an `index.lock` held for more
-than 10 seconds, failed fetches and config errors.
+Warnings appear under the header for possible secrets, conflicts, an
+`index.lock` held for more than 10 seconds, failed fetches and config errors.
+
+### Secret warnings
+
+gitst looks for things that should not be pushed: `.env` files, SSH and other
+private keys, key stores, credentials files, Terraform state, and tokens with a
+recognisable prefix (AWS, GitHub, GitLab, Slack, Stripe, Google, Anthropic,
+OpenAI, npm and SendGrid). It checks untracked files, staged and unstaged
+changes, and commits that are not pushed yet, and shows what it finds in a red
+band under the header. Click the band, or press `s`, to list each finding with
+a masked snippet; a finding opens its diff.
+
+gitst only warns. It never blocks a commit or a push and never changes a file,
+and it checks everything offline. To silence a false alarm, add `gitst:allow`
+(or `gitleaks:allow`) to the line, or list paths in `leak_allow`. Above
+`numstat_max_files` changes, only file names are checked.
 
 ### Mouse
 
@@ -70,6 +85,7 @@ than 10 seconds, failed fetches and config errors.
 | `g` / `G` / `Home` / `End` | top / bottom | top / bottom |
 | `w` | | wrap long lines |
 | `f` | fetch now | fetch now |
+| `s` | possible secrets | possible secrets |
 | `?` | help | help |
 | `q` / `Ctrl-C` | quit | quit |
 | `Ctrl-Z` | suspend (`fg` resumes; not on Windows) | suspend |
@@ -100,6 +116,8 @@ icons = "none"                      # "nerd" for Nerd Font icons
 pulse_seconds = 10                  # how long a changed file stays marked
 max_changes = 1000                  # most changed files to list
 numstat_max_files = 500             # skip +/− counts above this many changes
+leak_scan = true                    # warn about possible secrets
+leak_allow = []                     # paths never warned about (.gitignore syntax)
 ```
 
 Section names for `collapsed` are `changes`, `activity`, `commits`, `branches`

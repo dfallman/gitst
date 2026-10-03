@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use super::leakscan::{LeakScanConfig, LeakScanner, MAX_SCANNED_COMMITS};
 use super::parse::{
     self, BRANCH_FORMAT, LOG_FORMAT, REFLOG_FORMAT, REPO_CONFIG_KEYS, STASH_FORMAT,
 };
@@ -61,6 +62,7 @@ pub(crate) fn base_command(cwd: &Path) -> Command {
 pub struct CliBackend {
     repo: Repo,
     timeout: Duration,
+    leaks: LeakScanner,
 }
 
 impl CliBackend {
@@ -68,12 +70,21 @@ impl CliBackend {
         CliBackend {
             repo,
             timeout: GIT_TIMEOUT,
+            leaks: LeakScanner::new(LeakScanConfig::default()),
         }
     }
 
     /// Sets how long git commands other than fetch may run.
     pub fn with_timeout(self, timeout: Duration) -> Self {
         CliBackend { timeout, ..self }
+    }
+
+    /// Sets whether and where to look for possible secrets.
+    pub fn with_leak_scan(self, cfg: LeakScanConfig) -> Self {
+        CliBackend {
+            leaks: LeakScanner::new(cfg),
+            ..self
+        }
     }
 
     pub(crate) fn command(&self) -> Command {
@@ -241,18 +252,21 @@ impl CliBackend {
         cmd
     }
 
-    /// Line count of a small text file, for untracked files' `+N`.
-    fn count_lines(&self, rel: &str) -> Counts {
+    /// An untracked file's `+N` count, and, with `text`, its contents for
+    /// the leak scan when it is small and not binary.
+    fn read_untracked(&self, rel: &str, text: bool) -> (Counts, Option<String>) {
         let FileRead::Contents(bytes) = read_regular(&self.repo.root.join(rel), MAX_COUNTED_FILE)
         else {
-            return Counts::Unknown;
+            return (Counts::Unknown, None);
         };
         if bytes.contains(&0) {
-            return Counts::Binary;
+            return (Counts::Binary, None);
         }
         let newlines = bytes.iter().filter(|b| **b == b'\n').count();
         let trailing = !bytes.is_empty() && !bytes.ends_with(b"\n");
-        Counts::lines((newlines + trailing as usize) as u32, 0)
+        let counts = Counts::lines((newlines + trailing as usize) as u32, 0);
+        let text = text.then(|| String::from_utf8_lossy(&bytes).into_owned());
+        (counts, text)
     }
 }
 
@@ -366,8 +380,12 @@ impl GitBackend for CliBackend {
         };
         let unborn = matches!(head, Head::Unborn(_));
 
+        let leak_on = self.leaks.enabled();
+        let git = |args: &[&str]| self.git(args);
+        let mut leaks = Vec::new();
         // Paths left out stay `Counts::Unknown`, which shows as blank.
-        if changes.len() <= opts.numstat_max_files {
+        let counted = changes.len() <= opts.numstat_max_files;
+        if counted {
             let unstaged = self.git(&["diff", "--no-ext-diff", "--numstat", "-z"]);
             let staged = self.git(&["diff", "--no-ext-diff", "--cached", "--numstat", "-z"]);
             // Half a count would be wrong, so both diffs or neither.
@@ -385,9 +403,18 @@ impl GitBackend for CliBackend {
                 if let Some(n) = counts.get(&c.path) {
                     c.counts = *n;
                 } else if c.untracked() {
-                    c.counts = self.count_lines(&c.path);
+                    let (n, text) = self.read_untracked(&c.path, leak_on);
+                    c.counts = n;
+                    if let Some(text) = text {
+                        leaks.extend(self.leaks.untracked_file(&c.path, &text));
+                    }
                 }
             }
+        }
+        // Past the numstat limit only file names are checked.
+        let leak_scan_skipped = (leak_on && !counted).then_some(changes.len());
+        if leak_on {
+            leaks.extend(self.leaks.worktree(&git, &changes, counted));
         }
 
         changes.sort_by(|a, b| {
@@ -405,6 +432,8 @@ impl GitBackend for CliBackend {
         });
 
         let mut commits = Vec::new();
+        // Commits on no remote, newest first; `None` if git could not say.
+        let mut unpushed: Option<Vec<String>> = Some(Vec::new());
         if !unborn {
             let n = format!("-n{}", opts.commits);
             let fmt = format!("--format={LOG_FORMAT}");
@@ -420,6 +449,28 @@ impl GitBackend for CliBackend {
                     c.unpushed = ahead.contains(&c.oid);
                 }
             }
+            // Not `@{upstream}..HEAD`: a commit pushed to another branch, or
+            // merged in from one, is already out, whatever the upstream says.
+            if leak_on && config.has_remote {
+                unpushed = self
+                    .git(&[
+                        "rev-list",
+                        &format!("-n{MAX_SCANNED_COMMITS}"),
+                        "HEAD",
+                        "--not",
+                        "--remotes",
+                    ])
+                    .ok()
+                    .map(|out| {
+                        String::from_utf8_lossy(&out)
+                            .lines()
+                            .map(str::to_string)
+                            .collect()
+                    });
+            }
+        }
+        if leak_on {
+            leaks.extend(self.leaks.commits(&git, unpushed.as_deref()));
         }
 
         let branches = self
@@ -494,6 +545,8 @@ impl GitBackend for CliBackend {
             // FETCH_HEAD is per worktree, like HEAD.
             last_fetch: mtime(&self.repo.git_dir.join("FETCH_HEAD")),
             has_remote: config.has_remote,
+            leaks,
+            leak_scan_skipped,
         })
     }
 
@@ -568,6 +621,7 @@ impl GitBackend for CliBackend {
                     behind_total,
                 })
             }
+            DetailReq::Leaks => Err(GitError("possible secrets come with the snapshot".into())),
         }
     }
 

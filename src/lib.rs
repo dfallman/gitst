@@ -2,6 +2,7 @@ pub mod activity;
 pub mod app;
 pub mod config;
 pub mod git;
+pub mod leaks;
 pub mod model;
 pub mod ui;
 pub mod watch;

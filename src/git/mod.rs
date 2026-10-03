@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod leakscan;
 pub mod parse;
 
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::time::Duration;
 use crate::model::{DetailData, DetailReq, Snapshot};
 
 pub use cli::CliBackend;
+pub use leakscan::LeakScanConfig;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Repo {

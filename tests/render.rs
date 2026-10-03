@@ -13,6 +13,7 @@ use gitst::ui::theme::Theme;
 use gitst::worker::{FetchStatus, UiMsg};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::style::Color;
 
 const NOW: i64 = 1_790_484_333;
 
@@ -149,7 +150,62 @@ fn fixture() -> Snapshot {
         index_lock_age: None,
         last_fetch: Some(UNIX_EPOCH + Duration::from_secs(at(120) as u64)),
         has_remote: true,
+        leaks: Vec::new(),
+        leak_scan_skipped: None,
     }
+}
+
+fn leak(
+    path: &str,
+    rule: &'static str,
+    label: &'static str,
+    line: Option<u32>,
+    snippet: Option<&str>,
+    source: LeakSource,
+) -> Leak {
+    Leak {
+        rule,
+        label,
+        path: path.into(),
+        line,
+        snippet: snippet.map(Into::into),
+        source,
+    }
+}
+
+/// The fixture with an untracked `.env`, a key in `src/app.rs` and a key
+/// file in the newest (unpushed) commit.
+fn leaky() -> Snapshot {
+    let mut s = fixture();
+    s.changes.insert(0, ch(".env", '?', '?', 2, 0));
+    let oid = s.commits[0].oid.clone();
+    s.leaks = vec![
+        leak(
+            ".env",
+            "env-file",
+            ".env file",
+            None,
+            None,
+            LeakSource::Untracked,
+        ),
+        leak(
+            "src/app.rs",
+            "aws-access-key",
+            "AWS access key",
+            Some(12),
+            Some("AKIA••••••••••••WXYZ"),
+            LeakSource::Unstaged,
+        ),
+        leak(
+            "deploy/id_rsa",
+            "ssh-private-key",
+            "SSH private key",
+            None,
+            None,
+            LeakSource::Commit(oid),
+        ),
+    ];
+    s
 }
 
 fn new_app(snap: Snapshot) -> App {
@@ -786,4 +842,125 @@ fn selection_stays_on_its_row_when_rows_move() {
     });
     draw(&mut app, 44, 28);
     assert_eq!(opened(&mut app), Some(Target::File("src/watch.rs".into())));
+}
+
+#[test]
+fn leaks_view_groups_and_opens_findings() {
+    let mut app = new_app(leaky());
+    app.handle(key('s'));
+    let wide = draw(&mut app, 80, 20);
+    assert!(
+        wide.contains("src/app.rs:12") && wide.contains("AKIA••••"),
+        "{wide}"
+    );
+    let out = draw(&mut app, 44, 20);
+    insta::assert_snapshot!(out);
+    assert!(
+        out.lines().next().unwrap().contains("3 possible secrets"),
+        "{out}"
+    );
+    assert!(out.contains("Not pushed yet"), "{out}");
+    let y = out
+        .lines()
+        .position(|l| l.contains("src/app.rs:12"))
+        .unwrap() as u16;
+    app.handle(click(5, y));
+    assert_eq!(
+        app.stack.last().unwrap().target,
+        Target::File("src/app.rs".into())
+    );
+}
+
+#[test]
+fn leaks_view_after_a_push_and_once_clean() {
+    let mut s = leaky();
+    let oid = s.commits[0].oid.clone();
+    s.leaks[2].source = LeakSource::Pushed(oid.clone());
+    let mut app = new_app(s);
+    app.handle(key('s'));
+    let out = draw(&mut app, 44, 20);
+    assert!(out.contains("rotate the key"), "{out}");
+    app.handle(UiMsg::Snapshot {
+        snap: Arc::new(fixture()),
+        events: vec![],
+        changed: vec![],
+    });
+    assert!(draw(&mut app, 44, 20).contains("no possible secrets"));
+    app.handle(UiMsg::Snapshot {
+        snap: Arc::new(leaky()),
+        events: vec![],
+        changed: vec![],
+    });
+    let out = draw(&mut app, 44, 20);
+    let y = out
+        .lines()
+        .position(|l| l.contains("deploy/id_rsa"))
+        .unwrap() as u16;
+    app.handle(click(5, y));
+    assert_eq!(
+        app.stack.last().unwrap().target,
+        Target::CommitFile {
+            rev: oid,
+            path: "deploy/id_rsa".into()
+        }
+    );
+}
+
+#[test]
+fn leak_band_and_row_markers() {
+    let out = render(44, 20, leaky());
+    insta::assert_snapshot!(out);
+    assert!(
+        out.lines()
+            .nth(2)
+            .unwrap()
+            .contains("⚠ 3 possible secrets · 1 in unpushed commit"),
+        "{out}"
+    );
+    let row = |needle: &str| {
+        out.lines()
+            .find(|l| l.contains(needle))
+            .unwrap()
+            .to_string()
+    };
+    assert!(row("?? .env").contains('⚠'), "{out}");
+    assert!(row("4de1e3c ↑ ⚠").contains("icons"), "{out}");
+    let mut app = new_app(leaky());
+    let mut t = Terminal::new(TestBackend::new(44, 20)).unwrap();
+    t.draw(|f| gitst::ui::draw(f, &mut app, &Theme::ansi()))
+        .unwrap();
+    let buf = t.backend().buffer();
+    assert_eq!(buf[(43, 2)].bg, Color::Red, "the band fills its row");
+    assert_eq!(buf[(1, 2)].fg, Color::White);
+}
+
+#[test]
+fn leak_warning_survives_small_panes() {
+    let narrow = render(24, 12, leaky());
+    assert!(narrow.contains("⚠ 3 secrets"), "{narrow}");
+    let tiny = render(20, 6, leaky());
+    assert!(tiny.lines().next().unwrap().contains('⚠'), "{tiny}");
+    let short = render(44, 4, leaky());
+    assert!(short.lines().next().unwrap().contains('⚠'), "{short}");
+}
+
+#[test]
+fn clicking_the_band_opens_the_leaks_view() {
+    let mut app = new_app(leaky());
+    draw(&mut app, 44, 20);
+    app.handle(click(5, 2));
+    assert_eq!(app.stack.last().unwrap().target, Target::Leaks);
+}
+
+#[test]
+fn skipped_scan_note_comes_last() {
+    let mut s = fixture();
+    s.index_lock_age = Some(Duration::from_secs(42));
+    s.leak_scan_skipped = Some(812);
+    let out = render(44, 20, s);
+    let at = |needle: &str| out.lines().position(|l| l.contains(needle)).unwrap();
+    assert!(
+        at("index.lock held") < at("⚠ secret scan skipped · 812 changes"),
+        "{out}"
+    );
 }

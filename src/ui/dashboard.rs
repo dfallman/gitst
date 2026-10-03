@@ -1,5 +1,6 @@
 //! The stacked, collapsible dashboard.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -11,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use super::fmt::{clock, rel_age, truncate_left};
 use super::layout::{Density, SectionId, SectionReq, Slot, allocate};
 use super::theme::Theme;
-use super::{line_lr, now_secs, spans_width, truncate_spans};
+use super::{leak_marker, line_lr, now_secs, spans_width, truncate_spans};
 use crate::activity::{ActivityKind, merged};
 use crate::app::{Action, App, NavItem, ScrollTarget, Target};
 use crate::model::{Change, Commit, Counts, Snapshot};
@@ -427,6 +428,12 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
     } else {
         0
     };
+    let flagged: HashSet<&str> = snap
+        .leaks
+        .iter()
+        .filter(|l| l.source.oid().is_none())
+        .map(|l| l.path.as_str())
+        .collect();
     let ttl = Duration::from_secs(app.pulse_secs);
     let now = Instant::now();
     let mut rows: Vec<Row> = snap
@@ -436,12 +443,18 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
             let mut left = status_spans(c, theme);
             left.push(Span::raw(" "));
             let mut right = Vec::new();
+            let flag = flagged.contains(c.path.as_str());
             if d.stats {
                 let stats = stats_spans(c.counts, theme);
                 right.push(Span::raw(" ".repeat(stats_w - spans_width(&stats))));
+                if flag {
+                    right.extend(leak_marker(theme));
+                }
                 right.extend(stats);
                 right.push(Span::raw(" "));
                 right.extend(meter(c.counts, theme));
+            } else if flag {
+                right.extend(leak_marker(theme));
             }
             let pulse = match app.pulses.get(&c.path).map(|t| now.duration_since(*t)) {
                 Some(age) if age < ttl / 2 => Span::styled(
@@ -566,12 +579,20 @@ pub(crate) fn commit_row(
     } else {
         Span::raw(" ")
     };
-    let left = vec![
+    let mut left = vec![
         Span::styled(c.short.clone(), Style::new().fg(theme.modified)),
         Span::raw(" "),
         marker,
         Span::raw(" "),
     ];
+    let flagged = app.snap.as_ref().is_some_and(|s| {
+        s.leaks
+            .iter()
+            .any(|l| l.source.oid() == Some(c.oid.as_str()))
+    });
+    if flagged {
+        left.extend(leak_marker(theme));
+    }
     let mut middle = vec![Span::raw(c.subject.clone())];
     if w >= 48 {
         for tag in c.refs.iter().filter_map(|r| r.strip_prefix("tag: ")) {

@@ -38,6 +38,8 @@ pub enum Target {
         upstream: Option<String>,
     },
     Stash(usize),
+    /// Possible secrets, drawn from the current snapshot.
+    Leaks,
 }
 
 impl Target {
@@ -63,6 +65,7 @@ impl Target {
             Target::Stash(i) => DetailReq::Commit {
                 rev: format!("stash@{{{i}}}"),
             },
+            Target::Leaks => DetailReq::Leaks,
         }
     }
 
@@ -75,6 +78,7 @@ impl Target {
             }
             Target::Branch { name, .. } => format!("branch {name}"),
             Target::Stash(i) => format!("stash@{{{i}}}"),
+            Target::Leaks => "possible secrets".into(),
         }
     }
 }
@@ -376,6 +380,8 @@ impl App {
             }
             Action::Open(target) => {
                 let req = target.request();
+                // The leaks view draws from the snapshot; nothing to load.
+                let load = req != DetailReq::Leaks;
                 self.stack.push(DetailView {
                     target,
                     req: req.clone(),
@@ -384,7 +390,11 @@ impl App {
                     selected: None,
                 });
                 self.detail_targets.clear();
-                vec![Cmd::Worker(WorkerMsg::Detail(req))]
+                if load {
+                    vec![Cmd::Worker(WorkerMsg::Detail(req))]
+                } else {
+                    Vec::new()
+                }
             }
             Action::Back => {
                 if self.help {
@@ -405,6 +415,18 @@ impl App {
                 self.wrap = !self.wrap;
                 Vec::new()
             }
+        }
+    }
+
+    /// Opens the possible-secrets view, unless there are none or it is
+    /// already on top.
+    fn open_leaks(&mut self) -> Vec<Cmd> {
+        let any = self.snap.as_ref().is_some_and(|s| !s.leaks.is_empty());
+        let on_top = self.stack.last().is_some_and(|v| v.target == Target::Leaks);
+        if any && !on_top {
+            self.perform(Action::Open(Target::Leaks))
+        } else {
+            Vec::new()
         }
     }
 
@@ -430,6 +452,7 @@ impl App {
             KeyCode::Char('q') => return vec![Cmd::Quit],
             KeyCode::Char('f') => return self.perform(Action::Fetch),
             KeyCode::Char('?') => return self.perform(Action::Help),
+            KeyCode::Char('s') => return self.open_leaks(),
             _ => {}
         }
         if self.stack.is_empty() {
@@ -1046,5 +1069,40 @@ mod tests {
         files_snapshot(&mut a, &[], 120, "a.rs discarded", &["a.rs"]);
         assert_eq!(a.live[0].text, "a.rs discarded");
         assert_eq!(a.live[0].path, None);
+    }
+
+    fn with_leak(a: &mut App) {
+        let leak = crate::model::Leak {
+            rule: "env-file",
+            label: ".env file",
+            path: ".env".into(),
+            line: None,
+            snippet: None,
+            source: crate::model::LeakSource::Untracked,
+        };
+        a.handle(UiMsg::Snapshot {
+            snap: Arc::new(Snapshot {
+                leaks: vec![leak],
+                ..Snapshot::default()
+            }),
+            events: vec![],
+            changed: vec![],
+        });
+    }
+
+    #[test]
+    fn s_opens_the_leaks_view_only_when_there_are_leaks() {
+        let mut a = app();
+        assert!(a.handle(ch('s')).is_empty());
+        assert!(a.stack.is_empty(), "nothing to show");
+        with_leak(&mut a);
+        assert!(
+            a.handle(ch('s')).is_empty(),
+            "drawn from the snapshot, not loaded"
+        );
+        assert_eq!(a.stack.len(), 1);
+        assert_eq!(a.stack[0].target, Target::Leaks);
+        a.handle(ch('s'));
+        assert_eq!(a.stack.len(), 1, "not opened twice");
     }
 }

@@ -16,7 +16,7 @@ use ratatui::widgets::Paragraph;
 
 use gitst::app::{App, Cmd};
 use gitst::config::{Config, parse_duration};
-use gitst::git::{CliBackend, DiscoverError, GitBackend, Repo, SnapshotOpts};
+use gitst::git::{CliBackend, DiscoverError, GitBackend, LeakScanConfig, Repo, SnapshotOpts};
 use gitst::ui::{self, theme::Theme};
 use gitst::watch;
 use gitst::worker::{self, FetchStatus, UiMsg, WorkerConfig, WorkerMsg};
@@ -97,7 +97,12 @@ fn run(
         return Ok(());
     };
 
-    let backend: Arc<dyn GitBackend> = Arc::new(CliBackend::new(repo.clone()));
+    let leak_scan = LeakScanConfig {
+        enabled: cfg.leak_scan,
+        allow: gitst::leaks::allow_matcher(&repo.root, &cfg.leak_allow),
+    };
+    let backend: Arc<dyn GitBackend> =
+        Arc::new(CliBackend::new(repo.clone()).with_leak_scan(leak_scan));
     let opts = SnapshotOpts {
         max_changes: cfg.max_changes,
         numstat_max_files: cfg.numstat_max_files,

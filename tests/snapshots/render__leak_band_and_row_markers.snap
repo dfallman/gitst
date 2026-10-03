@@ -1,0 +1,24 @@
+---
+source: tests/render.rs
+expression: out
+---
+ main ↑2 ↓0 ●                          ↻ 2m 
+ origin/main · v0.1.9+4 · stash 1           
+ ⚠ 3 possible secrets · 1 in unpushed commit
+╭ ▾ Changes (6) ────────────────── +66 −12 ╮
+│ ?? .env                     ⚠ +2 ■■      │
+│ ?? notes.md                   +3 ■■      │
+│  D old.rs                     −2 ■■      │
+│ +3 more                                  │
+╰──────────────────────────────────────────╯
+╭ ▾ Activity ──────────────────────────────╮
+│ 04:43 commit 4de1e3c icons: jug on c… 2m │
+│ +3 more                                  │
+╰──────────────────────────────────────────╯
+╭ ▾ Commits ─────────────────────────── ↑2 ╮
+│ 4de1e3c ↑ ⚠ icons: jug on cream       2m │
+│ +3 more                                  │
+╰──────────────────────────────────────────╯
+  ▸ Branches (4)                            
+  ▸ Stashes (1)                             
+ ? help  f fetch  q quit

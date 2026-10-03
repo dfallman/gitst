@@ -14,7 +14,9 @@ use super::layout::Density;
 use super::theme::Theme;
 use super::{now_secs, spans_width};
 use crate::app::{App, ScrollTarget, Target};
-use crate::model::{Commit, CommitDetail, DetailData, DiffBlock, DiffKind};
+use crate::model::{
+    Commit, CommitDetail, DetailData, DiffBlock, DiffKind, Leak, LeakSource, Snapshot,
+};
 
 type DetailLine = (Line<'static>, Option<Target>);
 
@@ -25,33 +27,37 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density)
         return None;
     }
     let w = area.width as usize;
-    let lines: Vec<DetailLine> = match &view.data {
-        None => vec![(Line::from(Span::styled(" loading…", theme.dim)), None)],
-        Some(Err(e)) => vec![(
-            Line::from(Span::styled(format!(" ⚠ {e}"), Style::new().fg(theme.err))),
-            None,
-        )],
-        Some(Ok(DetailData::File(blocks) | DetailData::CommitFile(blocks))) => {
-            diff_lines(blocks, theme, w, app.wrap)
-        }
-        Some(Ok(DetailData::Commit(c))) => commit_lines(c, app, theme, w, d),
-        Some(Ok(DetailData::Branch {
-            ahead,
-            behind,
-            ahead_total,
-            behind_total,
-        })) => {
-            let upstream = match &view.target {
-                Target::Branch {
-                    upstream: Some(u), ..
-                } => u.clone(),
-                _ => "upstream".into(),
-            };
-            let sides = [
-                ("ahead of", &ahead[..], *ahead_total),
-                ("behind", &behind[..], *behind_total),
-            ];
-            branch_lines(sides, &upstream, app, theme, w, d)
+    let lines: Vec<DetailLine> = if view.target == Target::Leaks {
+        leak_lines(app, theme, w)
+    } else {
+        match &view.data {
+            None => vec![(Line::from(Span::styled(" loading…", theme.dim)), None)],
+            Some(Err(e)) => vec![(
+                Line::from(Span::styled(format!(" ⚠ {e}"), Style::new().fg(theme.err))),
+                None,
+            )],
+            Some(Ok(DetailData::File(blocks) | DetailData::CommitFile(blocks))) => {
+                diff_lines(blocks, theme, w, app.wrap)
+            }
+            Some(Ok(DetailData::Commit(c))) => commit_lines(c, app, theme, w, d),
+            Some(Ok(DetailData::Branch {
+                ahead,
+                behind,
+                ahead_total,
+                behind_total,
+            })) => {
+                let upstream = match &view.target {
+                    Target::Branch {
+                        upstream: Some(u), ..
+                    } => u.clone(),
+                    _ => "upstream".into(),
+                };
+                let sides = [
+                    ("ahead of", &ahead[..], *ahead_total),
+                    ("behind", &behind[..], *behind_total),
+                ];
+                branch_lines(sides, &upstream, app, theme, w, d)
+            }
         }
     };
 
@@ -290,6 +296,119 @@ fn branch_lines(
     out
 }
 
+/// Possible secrets, grouped by where they are; each opens its diff.
+fn leak_lines(app: &App, theme: &Theme, w: usize) -> Vec<DetailLine> {
+    let Some(snap) = app.snap.as_ref() else {
+        return Vec::new();
+    };
+    if snap.leaks.is_empty() {
+        return vec![(
+            Line::from(Span::styled(
+                " ✓ no possible secrets",
+                Style::new().fg(theme.add),
+            )),
+            None,
+        )];
+    }
+    let pushed = snap
+        .leaks
+        .iter()
+        .any(|l| matches!(l.source, LeakSource::Pushed(_)));
+    let (advice, style): (&[&str], Style) = if pushed {
+        (
+            &[
+                " Already pushed: rotate the key.",
+                " Rewriting history is not enough.",
+            ],
+            Style::new().fg(theme.err).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            &[" Not pushed yet: amend or remove", " it before you push."],
+            Style::new(),
+        )
+    };
+    let mut out: Vec<DetailLine> = Vec::new();
+    for text in advice {
+        out.push((Line::from(Span::styled(*text, style)), None));
+    }
+    for text in [
+        " False alarm? Add gitst:allow to",
+        " the line, or a leak_allow glob.",
+    ] {
+        out.push((Line::from(Span::styled(text, theme.dim)), None));
+    }
+    let mut leaks: Vec<&Leak> = snap.leaks.iter().collect();
+    leaks.sort_by_key(|l| group_rank(&l.source));
+    let row_w = w.saturating_sub(2);
+    let mut group = String::new();
+    for l in leaks {
+        let title = group_title(&l.source, snap);
+        if title != group {
+            out.push((Line::default(), None));
+            out.push((rule(&title, w, theme), None));
+            group = title;
+        }
+        let place = match l.line {
+            Some(n) => format!("{}:{n}", l.path),
+            None => l.path.clone(),
+        };
+        // The path matters most: the snippet, then the label, give way to it.
+        let mut right = vec![Span::styled(l.label, theme.dim)];
+        if let Some(s) = &l.snippet {
+            right.push(Span::raw(" "));
+            right.push(Span::styled(s.clone(), Style::new().fg(theme.err)));
+        }
+        while !right.is_empty() && width(&place) + 1 + spans_width(&right) > row_w {
+            right.truncate(right.len().saturating_sub(2));
+        }
+        let path_w = row_w.saturating_sub(spans_width(&right) + 1);
+        let line = row(
+            Vec::new(),
+            vec![Span::raw(truncate_left(&place, path_w))],
+            right,
+            row_w,
+        );
+        let target = match l.source.oid() {
+            Some(rev) => Target::CommitFile {
+                rev: rev.to_string(),
+                path: l.path.clone(),
+            },
+            None => Target::File(l.path.clone()),
+        };
+        out.push((line, Some(target)));
+    }
+    out
+}
+
+/// Pushed first: those need a key rotated.
+fn group_rank(s: &LeakSource) -> u8 {
+    match s {
+        LeakSource::Pushed(_) => 0,
+        LeakSource::Untracked => 1,
+        LeakSource::Unstaged => 2,
+        LeakSource::Staged => 3,
+        LeakSource::Commit(_) => 4,
+    }
+}
+
+fn group_title(s: &LeakSource, snap: &Snapshot) -> String {
+    let commit = |oid: &str, mark: &str| {
+        let short: String = oid.chars().take(7).collect();
+        match snap.commits.iter().find(|c| c.oid == oid) {
+            Some(c) => format!("{short} {mark} {}", c.subject),
+            None => format!("{short} {mark}"),
+        }
+    };
+    match s {
+        LeakSource::Untracked => "Untracked".into(),
+        LeakSource::Unstaged => "Unstaged".into(),
+        LeakSource::Staged => "Staged".into(),
+        LeakSource::Commit(o) => commit(o, "↑"),
+        LeakSource::Pushed(o) => commit(o, "pushed"),
+    }
+}
+
 const DASHBOARD_HELP: &[(&str, &str)] = &[
     ("click", "open · fold · button"),
     ("wheel", "scroll"),
@@ -300,6 +419,7 @@ const DASHBOARD_HELP: &[(&str, &str)] = &[
     ("tab", "next section"),
     ("space", "fold section"),
     ("g G", "top / bottom"),
+    ("s", "possible secrets"),
     ("f", "fetch now"),
     ("?", "close help"),
     ("q", "quit"),
@@ -317,6 +437,7 @@ const DETAIL_HELP: &[(&str, &str)] = &[
     ("pgup", "page up"),
     ("g G", "top / bottom"),
     ("w", "wrap long lines"),
+    ("s", "possible secrets"),
     ("f", "fetch now"),
     ("?", "close help"),
     ("q", "quit"),

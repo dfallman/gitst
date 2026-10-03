@@ -12,8 +12,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{Action, App, STALE_LOCK};
-use crate::model::{Head, RepoOp, Snapshot};
+use crate::app::{Action, App, STALE_LOCK, Target};
+use crate::model::{Head, Leak, LeakSource, RepoOp, Snapshot};
 use fmt::{rel_age, truncate_right, width};
 use layout::Density;
 use theme::Theme;
@@ -50,7 +50,21 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     let in_detail = !app.stack.is_empty();
     let mut y = area.y;
     let mut left = area.height;
-    header_line(f, app, &snap, theme, Rect::new(area.x, y, area.width, 1));
+    let max_warnings = match area.height {
+        h if h >= 8 => 2,
+        h if h >= 5 => 1,
+        _ => 0,
+    };
+    // With no room for the band, the header carries the icon.
+    let leak_in_header = !snap.leaks.is_empty() && max_warnings == 0;
+    header_line(
+        f,
+        app,
+        &snap,
+        theme,
+        Rect::new(area.x, y, area.width, 1),
+        leak_in_header,
+    );
     y += 1;
     left -= 1;
     if !in_detail && area.height >= 14 {
@@ -63,19 +77,20 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         left -= 1;
     }
     let hint_rows = u16::from(density.hints && left >= 2);
-    let max_warnings = match area.height {
-        h if h >= 8 => 2,
-        h if h >= 5 => 1,
-        _ => 0,
-    };
-    for line in warnings(app, &snap, theme)
+    let mut band = None;
+    for w in warnings(app, &snap, theme, area.width as usize)
         .into_iter()
         .take(max_warnings.min((left - hint_rows) as usize))
     {
+        let r = Rect::new(area.x, y, area.width, 1);
         f.render_widget(
-            Paragraph::new(fit_line(line, area.width as usize)),
-            Rect::new(area.x, y, area.width, 1),
+            Paragraph::new(fit_line(w.line, area.width as usize)).style(w.fill),
+            r,
         );
+        if let Some(action) = w.action {
+            app.hits.clicks.push((r, action));
+            band = Some(r);
+        }
         y += 1;
         left -= 1;
     }
@@ -98,7 +113,11 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
             Rect::new(area.x, body.y + body.height, area.width, 1),
         );
     }
-    if let Some(r) = app.hovered().filter(|r| Some(*r) != selected) {
+    // The hover tint would hide the band's red.
+    if let Some(r) = app
+        .hovered()
+        .filter(|r| Some(*r) != selected && Some(*r) != band)
+    {
         f.buffer_mut().set_style(r, theme.hover);
     }
     if app.help {
@@ -110,6 +129,61 @@ fn now_secs(app: &App) -> i64 {
     app.now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// `1 possible secret`, `3 possible secrets`.
+pub(crate) fn secrets_label(n: usize) -> String {
+    format!("{n} possible secret{}", if n == 1 { "" } else { "s" })
+}
+
+/// The warning glyph in red.
+pub(crate) fn leak_icon_span(theme: &Theme) -> Span<'static> {
+    Span::styled(
+        theme.leak_icon(),
+        Style::new().fg(theme.err).add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Marks a row that holds a possible secret: the glyph and a space.
+pub(crate) fn leak_marker(theme: &Theme) -> Vec<Span<'static>> {
+    vec![leak_icon_span(theme), Span::raw(" ")]
+}
+
+/// ` ⚠ 3 possible secrets · .env, src/config.rs`, fitted to `w` cells: the
+/// paths are cut first, then the text shortens to ` ⚠ 3 secrets`.
+fn leak_band_text(leaks: &[Leak], icon: &str, w: usize) -> String {
+    let n = leaks.len();
+    let head = format!(" {icon} {}", secrets_label(n));
+    let in_commits = leaks
+        .iter()
+        .filter(|l| matches!(l.source, LeakSource::Commit(_)))
+        .count();
+    let suffix = if leaks
+        .iter()
+        .any(|l| matches!(l.source, LeakSource::Pushed(_)))
+    {
+        "pushed".to_string()
+    } else if in_commits > 0 {
+        let s = if in_commits == 1 { "" } else { "s" };
+        format!("{in_commits} in unpushed commit{s}")
+    } else {
+        let mut paths: Vec<&str> = Vec::new();
+        for l in leaks {
+            if !paths.contains(&l.path.as_str()) {
+                paths.push(&l.path);
+            }
+        }
+        paths.join(", ")
+    };
+    let full = format!("{head} · {suffix}");
+    if width(&full) <= w {
+        full
+    } else if width(&head) + 5 <= w {
+        truncate_right(&full, w)
+    } else {
+        let s = if n == 1 { "" } else { "s" };
+        truncate_right(&format!(" {icon} {n} secret{s}"), w)
+    }
 }
 
 fn branch_spans(snap: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
@@ -158,7 +232,7 @@ fn branch_spans(snap: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
-fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: Rect) {
+fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: Rect, leak: bool) {
     let w = r.width as usize;
     let mut right: Vec<Span<'static>> = Vec::new();
     if snap.has_remote {
@@ -186,7 +260,10 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
         ));
         left.push(Span::raw("  "));
         left.push(Span::styled(
-            view.target.title(),
+            match view.target {
+                Target::Leaks => secrets_label(snap.leaks.len()),
+                _ => view.target.title(),
+            },
             Style::new().add_modifier(Modifier::BOLD),
         ));
         app.hits
@@ -194,6 +271,10 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
             .push((Rect::new(r.x, r.y, 7.min(r.width), 1), Action::Back));
     } else {
         left.extend(branch_spans(snap, theme));
+    }
+    if leak {
+        left.push(Span::raw(" "));
+        left.push(leak_icon_span(theme));
     }
     let right_w = spans_width(&right);
     if right_w > 0 && right_w + 8 <= w {
@@ -228,11 +309,31 @@ fn info_text(snap: &Snapshot) -> String {
     format!(" {}", parts.join(" · "))
 }
 
-fn warnings(app: &App, snap: &Snapshot, theme: &Theme) -> Vec<Line<'static>> {
+/// A row under the header.
+struct Warning {
+    line: Line<'static>,
+    /// Style for the whole row.
+    fill: Style,
+    action: Option<Action>,
+}
+
+fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warning> {
     let err = Style::new().fg(theme.err).add_modifier(Modifier::BOLD);
     let warn = Style::new().fg(theme.warn);
-    let line = |text: String, style: Style| Line::from(Span::styled(format!(" ⚠ {text}"), style));
+    let line = |text: String, style: Style| Warning {
+        line: Line::from(Span::styled(format!(" ⚠ {text}"), style)),
+        fill: Style::new(),
+        action: None,
+    };
     let mut out = Vec::new();
+    // First, so that no other warning can push it off a small pane.
+    if !snap.leaks.is_empty() {
+        out.push(Warning {
+            line: Line::from(leak_band_text(&snap.leaks, theme.leak_icon(), cols)),
+            fill: theme.leak,
+            action: Some(Action::Open(Target::Leaks)),
+        });
+    }
     if let Some(e) = &app.error {
         out.push(line(e.clone(), err));
     }
@@ -252,6 +353,9 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme) -> Vec<Line<'static>> {
     }
     if let Some(w) = &app.config_warning {
         out.push(line(w.clone(), warn));
+    }
+    if let Some(n) = snap.leak_scan_skipped {
+        out.push(line(format!("secret scan skipped · {n} changes"), warn));
     }
     out
 }
@@ -314,6 +418,9 @@ fn draw_tiny(f: &mut Frame, area: Rect, snap: &Snapshot, theme: &Theme) {
     if snap.is_dirty() {
         spans.push(Span::styled("●", Style::new().fg(theme.modified)));
     }
+    if !snap.leaks.is_empty() {
+        spans.push(leak_icon_span(theme));
+    }
     let r = Rect::new(area.x, area.y, area.width, 1);
     f.render_widget(
         Paragraph::new(fit_line(Line::from(spans), area.width as usize)),
@@ -366,4 +473,69 @@ pub(crate) fn line_lr(
     spans.push(Span::raw(" ".repeat(pad)));
     spans.extend(right);
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Leak, LeakSource};
+
+    fn leak(path: &str, source: LeakSource) -> Leak {
+        Leak {
+            rule: "env-file",
+            label: ".env file",
+            path: path.into(),
+            line: None,
+            snippet: None,
+            source,
+        }
+    }
+
+    #[test]
+    fn band_text_names_paths_commits_or_pushed() {
+        let wt = [
+            leak(".env", LeakSource::Untracked),
+            leak("src/a.rs", LeakSource::Staged),
+            leak(".env", LeakSource::Unstaged),
+        ];
+        assert_eq!(
+            leak_band_text(&wt, "⚠", 80),
+            " ⚠ 3 possible secrets · .env, src/a.rs"
+        );
+        assert_eq!(
+            leak_band_text(&wt[..1], "⚠", 80),
+            " ⚠ 1 possible secret · .env"
+        );
+        let c = [
+            leak(".env", LeakSource::Untracked),
+            leak("k", LeakSource::Commit("c1".into())),
+        ];
+        assert_eq!(
+            leak_band_text(&c, "⚠", 80),
+            " ⚠ 2 possible secrets · 1 in unpushed commit"
+        );
+        let p = [
+            leak("k", LeakSource::Commit("c1".into())),
+            leak("k", LeakSource::Pushed("c0".into())),
+        ];
+        assert_eq!(
+            leak_band_text(&p, "⚠", 80),
+            " ⚠ 2 possible secrets · pushed"
+        );
+    }
+
+    #[test]
+    fn band_text_shortens_to_fit() {
+        let wt = [
+            leak(".env", LeakSource::Untracked),
+            leak("src/a.rs", LeakSource::Staged),
+        ];
+        let t = leak_band_text(&wt, "⚠", 30);
+        assert!(
+            t.starts_with(" ⚠ 2 possible secrets · ") && t.ends_with('…') && width(&t) <= 30,
+            "{t}"
+        );
+        assert_eq!(leak_band_text(&wt, "⚠", 20), " ⚠ 2 secrets");
+        assert!(width(&leak_band_text(&wt, "⚠", 5)) <= 5);
+    }
 }

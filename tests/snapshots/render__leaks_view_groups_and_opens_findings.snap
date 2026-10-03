@@ -1,0 +1,24 @@
+---
+source: tests/render.rs
+expression: out
+---
+ ‹ back  3 possible secrets            ↻ 2m 
+ ⚠ 3 possible secrets · 1 in unpushed commit
+ Not pushed yet: amend or remove            
+ it before you push.                        
+ False alarm? Add gitst:allow to            
+ the line, or a leak_allow glob.            
+                                            
+── Untracked ───────────────────────────────
+ .env                             .env file 
+                                            
+── Unstaged ────────────────────────────────
+ src/app.rs:12               AWS access key 
+                                            
+── 4de1e3c ↑ icons: jug on cream ───────────
+ deploy/id_rsa              SSH private key 
+                                            
+                                            
+                                            
+                                            
+ esc back  w wrap  q quit

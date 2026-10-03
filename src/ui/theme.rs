@@ -13,6 +13,8 @@ pub struct Theme {
     pub del: Color,
     pub warn: Color,
     pub err: Color,
+    /// The possible-secrets band.
+    pub leak: Style,
     pub modified: Color,
     pub untracked: Color,
     /// Header band.
@@ -40,6 +42,10 @@ impl Theme {
             del: Color::Red,
             warn: Color::Yellow,
             err: Color::Red,
+            leak: Style::new()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
             modified: Color::Yellow,
             untracked: Color::Magenta,
             band: Style::new().add_modifier(Modifier::BOLD),
@@ -60,6 +66,12 @@ impl Theme {
             hover: Style::new().bg(mix(bg, fg, 0.08)),
             ..Theme::ansi()
         }
+    }
+
+    /// Warning glyph for possible secrets: nf-fa-warning with Nerd Font
+    /// icons.
+    pub fn leak_icon(&self) -> &'static str {
+        if self.nerd { "\u{f071}" } else { "⚠" }
     }
 
     /// Queries the terminal's colours; falls back to plain ANSI styling.
@@ -99,5 +111,20 @@ mod tests {
         assert_eq!(t.add, Color::Green);
         let light = Theme::from_palette((0, 0, 0), (255, 255, 255));
         assert_eq!(light.band.bg, Some(Color::Rgb(230, 230, 230)));
+    }
+
+    #[test]
+    fn leak_band_is_white_on_red_with_an_icon() {
+        let t = Theme::ansi();
+        assert_eq!(
+            (t.leak.fg, t.leak.bg),
+            (Some(Color::White), Some(Color::Red))
+        );
+        assert_eq!(t.leak_icon(), "⚠");
+        let nerd = Theme {
+            nerd: true,
+            ..Theme::ansi()
+        };
+        assert_eq!(nerd.leak_icon(), "\u{f071}");
     }
 }
