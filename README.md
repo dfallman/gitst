@@ -1,4 +1,4 @@
-# gitst
+# Gitst
 **A real-time, glanceable git status monitor for the terminal**
 
 <p align="center">
@@ -7,7 +7,7 @@
 
 Gitst is intended to sit in one pane of a multi-pane terminal setup (using tools like Dantty, tmux, screen, herdr, WezTerm, iTerm2, etc.) next to for instance an editor, a coding agent, and a shell. Gitst shows in real-time what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges, and rebases.
 
-By design, gitst *monitors* git, it doesn't *manipulate* it. This comes with a few benefits, especially for team work scenarios when there's lots of team activity on the repo, and also for personal use in conjunction with coding agents. Being a git monitor, gitst never changes your git repository (apart from `git fetch`), and it never takes over git's `index.lock`, so it cannot (by design) get in the way or obstruct git commands run elsewhere. This is useful for at least two scenarios: 1) when you might want the coding agent to control git but still see what's going on, or 2), like me, you just want to control git manually.
+By design, Gitst *monitors* git, it doesn't *manipulate* it. This comes with a few benefits, especially for team work scenarios when there's lots of team activity on the repo, and also for personal use in conjunction with coding agents. Being a git monitor, Gitst never changes your git repository (apart from `git fetch`), and it never takes over git's `index.lock`, so it cannot (by design) get in the way or obstruct git commands run elsewhere. This is useful for at least two scenarios: 1) when you might want the coding agent to control git but still see what's going on, or 2), like me, you just want to control git manually.
 
 ## Install
 
@@ -17,7 +17,7 @@ With Homebrew (macOS and Linux):
 brew install dfallman/tap/gitst
 ```
 
-Prebuilt binaries for macOS, Linux and Windows are on the
+Prebuilt binaries for macOS, Linux, and Windows are on the
 [releases page](https://github.com/dfallman/gitst/releases). Or build from source
 with Cargo:
 
@@ -30,7 +30,7 @@ Requires `git` on your `PATH`.
 ## Use
 
 Run `gitst` inside a repository, or `gitst <path>`. If the directory is not a
-repository yet, gitst waits and picks it up once `git init` or `git clone` has
+repository yet, Gitst waits and picks it up once `git init` or `git clone` has
 run there.
 
 It does its best to adapt to the terminal window it operates in: sections collapse, borders give way to rules, and columns
@@ -38,35 +38,35 @@ drop out as the pane shrinks, down to a single `branch ↑1 ●` line. Mouse sup
 
 The dashboard has five sections:
 
-- **Changes**: staged, unstaged, untracked and conflicted files, with `+`/`−`
+- **Changes**: staged, unstaged, untracked, and conflicted files, with `+`/`−`
   line counts. A `•` marks a file that just changed.
 - **Activity**: a timeline of commits, amends, checkouts, merges, rebases,
-  resets, pulls, cherry-picks, pushes, fetches, staging, stashes and file edits.
+  resets, pulls, cherry-picks, pushes, fetches, staging, stashes, and file edits.
   Edits that come within a minute of each other merge into one row.
 - **Commits**: recent history, with `↑` on commits not yet pushed.
 - **Branches** and **Stashes**: folded by default.
 
 Warnings appear under the header for possible secrets, conflicts, an
-`index.lock` held for more than 10 seconds, failed fetches and config errors.
+`index.lock` held for more than 10 seconds, failed fetches, and config errors.
 
 ### Secret warnings
 
-gitst looks for things that should not be pushed: `.env` files, SSH and other
+Gitst looks for things that should not be pushed: `.env` files, SSH and other
 private keys, key stores, credentials files, Terraform state, and tokens with a
 recognisable prefix (AWS, GitHub, GitLab, Slack, Stripe, Google, Anthropic,
-OpenAI, npm and SendGrid). It checks untracked files, staged and unstaged
+OpenAI, npm, and SendGrid). It checks untracked files, staged and unstaged
 changes, and commits that are not pushed yet, and shows what it finds in a red
 band under the header. Click the band, or press `s`, to list each finding with
 a masked snippet; a finding opens its diff.
 
-gitst only warns. It never blocks a commit or a push and never changes a file,
+Gitst only warns. It never blocks a commit or a push and never changes a file,
 and it checks everything offline. To silence a false alarm, add `gitst:allow`
 (or `gitleaks:allow`) to the line, or list paths in `leak_allow`. Above
 `numstat_max_files` changes, only file names are checked.
 
 ### Mouse
 
-- **Click** a file, commit, branch, stash or activity row to open it full-pane
+- **Click** a file, commit, branch, stash, or activity row to open it full-pane
   (diffs, commit details, ahead/behind lists). Click `‹ back`, press `Esc`, or
   right-click to return.
 - **Click** a section title to fold it. The **wheel** scrolls what is under the pointer.
@@ -103,9 +103,9 @@ gitst --version
 
 ## Config
 
-Optional. gitst reads the first of these that exists:
+Optional. Gitst reads the first of these that exists:
 `$XDG_CONFIG_HOME/gitst/config.toml` (when that is set),
-`%APPDATA%\gitst\config.toml` (Windows) and `~/.config/gitst/config.toml`.
+`%APPDATA%\gitst\config.toml` (Windows), and `~/.config/gitst/config.toml`.
 All keys are optional; these are the defaults:
 
 ```toml
@@ -120,30 +120,30 @@ leak_scan = true                    # warn about possible secrets
 leak_allow = []                     # paths never warned about (.gitignore syntax)
 ```
 
-Section names for `collapsed` are `changes`, `activity`, `commits`, `branches`
+Section names for `collapsed` are `changes`, `activity`, `commits`, `branches`,
 and `stashes`. Unknown keys and invalid values are named in the UI and keep their
 defaults; the rest of the file still applies.
 
 ## Notes
 
-- Colours come from your terminal's own palette, so gitst follows light and dark
-  themes. When the terminal reports its background colour, gitst uses it for
+- Colours come from your terminal's own palette, so Gitst follows light and dark
+  themes. When the terminal reports its background colour, Gitst uses it for
   subtle tints.
-- gitst follows `status.showUntrackedFiles`. When it is not set, untracked
+- Gitst follows `status.showUntrackedFiles`. When it is not set, untracked
   directories are listed file by file.
-- Diffs are always read plain, whatever your `color.*`, `diff.external` or pager
+- Diffs are always read plain, whatever your `color.*`, `diff.external`, or pager
   settings. Untracked symlinks show their target, and FIFOs and devices are never
   read.
 - Background fetches run without a terminal, so they can never prompt for a
-  password. If a fetch fails, gitst shows `fetch failed: auth` (or `offline`,
+  password. If a fetch fails, Gitst shows `fetch failed: auth` (or `offline`,
   `timeout`, or git's message) and retries with backoff, doubling from the fetch
   interval up to an hour (5, 10, 20, then 60 minutes by default). A fetch that
   runs longer than a minute is stopped.
 - Pushes appear in Activity when they were made from this clone. Git only
   records them in the remote-tracking reflog.
 - Changes are picked up by watching the working tree and `.git`, skipping
-  ignored paths. If the watcher cannot start, gitst polls every 3 seconds.
+  ignored paths. If the watcher cannot start, Gitst polls every 3 seconds.
 
-## Note on AI use
-I've been writing code for over 30 years, and lately LLM agent-assisted coding has rekindled my sense of awe at what code can do. This project was built in Rust using a range of tools, including Anthropic's Claude Code. For me, these tools are simply means to move faster, explore more ideas, and test those ideas and implementations more rigorously than I could (or would ever do) on my own.
+## How it's made
+Gitst is written in Rust, with help from tools like Anthropic's Claude Code. I've been writing code for over 30 years, and working with coding agents has rekindled my sense of awe at what code can do. They let me move faster, try more ideas, and test them more thoroughly than I would on my own.
 
