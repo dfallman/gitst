@@ -1,7 +1,7 @@
 # Gitst
 **A real-time, glanceable git status monitor for the terminal**
 
-Gitst shows in real-time what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges, and rebases.
+Gitst shows in real-time what is happening to a git repository (local as well as remote) as it happens: changed files, commits, pushes, fetches, merges, and rebases.
 
 <p align="center">
   <img width="700" alt="gitst-transp" src="https://github.com/user-attachments/assets/582d783f-7925-439a-835d-0cf7bbc7ea0e" />
