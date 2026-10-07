@@ -5,9 +5,9 @@
   <img width="700" alt="gitst-transp" src="https://github.com/user-attachments/assets/582d783f-7925-439a-835d-0cf7bbc7ea0e" />
 </p>
 
-Gitst is intended to sit in one pane of a multi-pane terminal setup (using tools like Dantty, tmux, screen, herdr, WezTerm, iTerm2, etc.) next to for instance an editor, a coding agent, and a shell. Gitst shows in real-time what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges, and rebases.
+Gitst typically sits in one pane of a multi-pane terminal setup (using tools like Dantty, tmux, screen, herdr, WezTerm, iTerm2, etc.) next to for instance an editor, a coding agent, and a shell. Gitst shows in real-time what is happening to the repository as it happens: changed files, commits, pushes, fetches, merges, and rebases.
 
-By design, Gitst *monitors* git, it doesn't *manipulate* it. This comes with a few benefits, especially for team work scenarios when there's lots of team activity on the repo, and also for personal use in conjunction with coding agents. Being a git monitor, Gitst never changes your git repository (apart from `git fetch`), and it never takes over git's `index.lock`, so it cannot (by design) get in the way or obstruct git commands run elsewhere. This is useful for at least two scenarios: 1) when you might want the coding agent to control git but still see what's going on, or 2), like me, you just want to control git manually.
+By design, Gitst **monitors** git, it doesn't **manipulate** it. This comes with a few benefits, especially for team work scenarios when there's lots of team activity on the repo, and also for personal use in conjunction with coding agents. Being a git monitor, Gitst never changes your git repository (apart from `git fetch`), and it never takes over git's `index.lock`, so it cannot (by design) get in the way or obstruct git commands run elsewhere. This is useful for at least two scenarios: 1) when you might want the coding agent to control git but still see what's going on, or 2), like me, you just want to control git manually.
 
 ## Install
 
