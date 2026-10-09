@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- On Windows, a submodule's own config is read again, so its filter drivers
+  no longer run on every refresh. Git for Windows would not open the path
+  gitst gave it, and the guard went without that config.
+- A submodule's config that cannot be read, or a `.gitmodules` that cannot,
+  shows a `repo config not read` warning naming the file, instead of being
+  skipped without a word. The guard goes without that config, so the
+  submodule's filters may run. The file is tried again on the next refresh.
+
 ## 0.1.12 (2026-10-09)
 
 ### Security

@@ -220,7 +220,8 @@ pub struct Snapshot {
     pub leak_scan_error: Option<String>,
     /// Why the repository's config could not be read, when it could not:
     /// its settings then count as unset, and the guard applies only its
-    /// defaults.
+    /// defaults. Otherwise, why a submodule's config could not be: the
+    /// guard then goes without it.
     pub config_error: Option<String>,
 }
 

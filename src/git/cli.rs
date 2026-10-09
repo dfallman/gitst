@@ -1,5 +1,6 @@
 //! `GitBackend` implemented by running the `git` command.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -184,9 +185,12 @@ impl CliBackend {
 
     /// Config of the submodules' repositories, whose git runs inside a
     /// status with the same overrides. Covers git directories under
-    /// `modules/` and the submodules `.gitmodules` lists.
-    fn submodule_config(&self) -> Vec<ConfigEntry> {
+    /// `modules/` and the submodules `.gitmodules` lists. Also returns why
+    /// one of those files could not be read, if one could not: the guard
+    /// then goes without it, and a submodule's filters may run.
+    fn submodule_config(&self) -> (Vec<ConfigEntry>, Option<String>) {
         let mut files = Vec::new();
+        let mut error = None;
         find_configs(&self.repo.common_dir.join("modules"), 0, &mut files);
         let gitmodules = self.repo.root.join(".gitmodules");
         if gitmodules.is_file() {
@@ -196,7 +200,10 @@ impl CliBackend {
                     &["config", "--file", ".gitmodules", "--list", "-z"],
                     MAX_OUTPUT,
                 )
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    error = Some(format!(".gitmodules: {}", e.message));
+                    Vec::new()
+                });
             for entry in listed.split(|b| *b == 0) {
                 let entry = String::from_utf8_lossy(entry);
                 if let Some((key, path)) = entry.split_once('\n')
@@ -217,6 +224,11 @@ impl CliBackend {
         }
         let read = |f: &Path| {
             let f = f.to_string_lossy();
+            let f = if cfg!(windows) {
+                without_verbatim_prefix(&f)
+            } else {
+                Cow::Borrowed(&*f)
+            };
             let args = [
                 "config",
                 "--file",
@@ -228,26 +240,32 @@ impl CliBackend {
             ];
             self.run(base_command(&self.repo.root), &args, MAX_OUTPUT)
                 .map(|raw| parse::parse_config(&raw))
-                .unwrap_or_default()
         };
         let mut cache = self
             .submodule_configs
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        cached_configs(&mut cache, files, &read)
+        let (entries, unread) = cached_configs(&mut cache, files, &read);
+        let unread = unread.map(|(f, e)| {
+            let f = f.strip_prefix(&self.repo.root).unwrap_or(&f);
+            format!("{}: {e}", f.display())
+        });
+        (entries, error.or(unread))
     }
 
     /// Reads the config and replaces the overrides every later command
-    /// gets. Returns the config, and why it could not be read if it could
-    /// not: the guard then has only its defaults.
+    /// gets. Returns the config, and why it, or a submodule's, could not be
+    /// read if it could not: the guard then has only its defaults, or goes
+    /// without that submodule's config.
     fn refresh_guard(&self) -> (Vec<ConfigEntry>, Option<String>) {
         let (config, error) = match self.read_config() {
             Ok(config) => (config, None),
             Err(e) => (Vec::new(), Some(e.message)),
         };
-        let guard = Guard::new(&config, &self.submodule_config(), &Guard::env);
+        let (submodules, submodule_error) = self.submodule_config();
+        let guard = Guard::new(&config, &submodules, &Guard::env);
         *self.guard.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(guard);
-        (config, error)
+        (config, error.or(submodule_error))
     }
 
     /// Commits on a local branch or HEAD that no remote-tracking ref
@@ -506,14 +524,17 @@ struct CachedConfig {
 
 /// The entries of `files`, in order, reading with `read` only a file that
 /// is new or whose size or modification time moved since it was last
-/// read. Files no longer listed leave the cache.
+/// read. Files no longer listed leave the cache. A file that could not be
+/// read is left out and not cached, so the next call tries it again; the
+/// first such file comes back with why.
 fn cached_configs(
     cache: &mut HashMap<PathBuf, CachedConfig>,
     files: Vec<PathBuf>,
-    read: &dyn Fn(&Path) -> Vec<ConfigEntry>,
-) -> Vec<ConfigEntry> {
+    read: &dyn Fn(&Path) -> Result<Vec<ConfigEntry>, GitError>,
+) -> (Vec<ConfigEntry>, Option<(PathBuf, String)>) {
     cache.retain(|p, _| files.contains(p));
     let mut out = Vec::new();
+    let mut error = None;
     for f in files {
         let Ok(meta) = std::fs::metadata(&f) else {
             cache.remove(&f);
@@ -524,7 +545,14 @@ fn cached_configs(
             .get(&f)
             .is_some_and(|c| c.len == len && c.mtime == mtime);
         if !fresh {
-            let entries = read(&f);
+            let entries = match read(&f) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    cache.remove(&f);
+                    error.get_or_insert((f, e.message));
+                    continue;
+                }
+            };
             cache.insert(
                 f.clone(),
                 CachedConfig {
@@ -536,7 +564,19 @@ fn cached_configs(
         }
         out.extend(cache[&f].entries.iter().cloned());
     }
-    out
+    (out, error)
+}
+
+/// `path` without the `\\?\` that `canonicalize` puts in front of it on
+/// Windows. Git for Windows will not open a path with a `?` in it (it can
+/// still change into one), so a `--file` with the prefix reads nothing.
+/// `\\?\UNC\server\share` goes back to `\\server\share`.
+fn without_verbatim_prefix(path: &str) -> Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{rest}"))
+    } else {
+        Cow::Borrowed(path.strip_prefix(r"\\?\").unwrap_or(path))
+    }
 }
 
 /// Collects `config` and `config.worktree` files of the git directories
@@ -1344,6 +1384,15 @@ fn wait_grace(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn verbatim_prefixes_are_taken_off_for_git() {
+        use super::without_verbatim_prefix as plain;
+        assert_eq!(plain(r"\\?\C:\r\.git\config"), r"C:\r\.git\config");
+        assert_eq!(plain(r"\\?\UNC\srv\share\config"), r"\\srv\share\config");
+        assert_eq!(plain(r"C:\r\.git\config"), r"C:\r\.git\config");
+        assert_eq!(plain("/r/.git/config"), "/r/.git/config");
+    }
+
+    #[test]
     fn submodule_config_files_are_read_once_until_they_change() {
         use std::cell::Cell;
         use std::collections::HashMap;
@@ -1356,27 +1405,54 @@ mod tests {
         let reads = Cell::new(0);
         let read = |p: &Path| {
             reads.set(reads.get() + 1);
-            vec![super::ConfigEntry {
+            Ok(vec![super::ConfigEntry {
                 scope: "local".into(),
                 key: "a.b".into(),
                 value: std::fs::read_to_string(p).unwrap().trim().to_string(),
-            }]
+            }])
         };
-        let first = super::cached_configs(&mut cache, vec![f.clone()], &read);
-        assert_eq!(first.len(), 1);
+        let (first, error) = super::cached_configs(&mut cache, vec![f.clone()], &read);
+        assert_eq!((first.len(), error), (1, None));
         assert_eq!(
-            super::cached_configs(&mut cache, vec![f.clone()], &read),
+            super::cached_configs(&mut cache, vec![f.clone()], &read).0,
             first
         );
         assert_eq!(reads.get(), 1, "an unchanged file is not read again");
         std::fs::write(&f, "[a]\n\tb = 22\n").unwrap();
         assert_ne!(
-            super::cached_configs(&mut cache, vec![f.clone()], &read),
+            super::cached_configs(&mut cache, vec![f.clone()], &read).0,
             first
         );
         assert_eq!(reads.get(), 2);
-        assert!(super::cached_configs(&mut cache, vec![], &read).is_empty());
+        assert!(
+            super::cached_configs(&mut cache, vec![], &read)
+                .0
+                .is_empty()
+        );
         assert!(cache.is_empty(), "a file gone is forgotten");
+    }
+
+    #[test]
+    fn a_submodule_config_that_cannot_be_read_is_reported_and_read_again() {
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("config");
+        std::fs::write(&f, "[a]\n\tb = 1\n").unwrap();
+        let mut cache = HashMap::new();
+        let reads = Cell::new(0);
+        let read = |_: &Path| {
+            reads.set(reads.get() + 1);
+            Err(super::GitError::new("bad config line 1"))
+        };
+        for n in 1..=2 {
+            let (entries, error) = super::cached_configs(&mut cache, vec![f.clone()], &read);
+            assert!(entries.is_empty());
+            assert_eq!(error, Some((f.clone(), "bad config line 1".to_string())));
+            assert_eq!(reads.get(), n, "a failed read is not cached");
+        }
     }
 
     use std::ffi::OsStr;

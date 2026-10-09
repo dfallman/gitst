@@ -1228,6 +1228,42 @@ fn a_submodules_own_config_runs_nothing_on_a_refresh() {
 }
 
 #[test]
+fn a_submodule_config_that_cannot_be_read_is_warned_about() {
+    let lib = TestRepo::new();
+    lib.commit_file("f", "1\n", "lib");
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        lib.path().to_str().unwrap(),
+        "lib",
+    ]);
+    r.git(&["commit", "-qm", "add lib"]);
+    // A broken file the submodule's config includes only when read from
+    // the superproject, as gitst reads it: git itself still works.
+    let bad = r.dir.path().join("bad.config");
+    std::fs::write(&bad, "[\n").unwrap();
+    let git_dir = r.git(&["rev-parse", "--absolute-git-dir"]);
+    let git_dir = git_dir.trim().replace('\\', "/");
+    let sub = r.path().join("lib");
+    r.git(&[
+        "-C",
+        sub.to_str().unwrap(),
+        "config",
+        &format!("includeIf.gitdir:{git_dir}.path"),
+        &bad.display().to_string().replace('\\', "/"),
+    ]);
+    r.git(&["--no-optional-locks", "status"]);
+    let s = snap(&r);
+    let e = s.config_error.unwrap_or_default();
+    assert!(e.contains("modules") && e.contains("bad config"), "{e:?}");
+}
+
+#[test]
 fn the_repositorys_own_config_runs_nothing_on_a_fetch() {
     let r = TestRepo::new();
     r.commit_file("a", "1", "one");
