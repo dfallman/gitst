@@ -2,16 +2,18 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::guard::Guard;
 use super::leakscan::{LeakScanConfig, LeakScanner, MAX_SCANNED_COMMITS};
 use super::parse::{
-    self, BRANCH_FORMAT, LOG_FORMAT, REFLOG_FORMAT, REPO_CONFIG_KEYS, STASH_FORMAT,
+    self, BRANCH_FORMAT, CONFIG_LIST, ConfigEntry, LOG_FORMAT, REFLOG_FORMAT, STASH_FORMAT,
 };
 use super::{FetchError, GitBackend, GitError, Repo, SnapshotOpts, classify_fetch_stderr};
 use crate::model::{
@@ -31,9 +33,19 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const BRANCH_LOG: usize = 50;
 /// Upper bound on remote-tracking reflogs read per refresh.
 const MAX_REMOTE_REFLOGS: usize = 10;
+/// Most output read from one git command. A command that writes more is
+/// stopped, so no output can take the memory gitst has.
+const MAX_OUTPUT: usize = 256 << 20;
+/// Most of a diff read for a detail view; more could not be read anyway.
+const MAX_SHOWN_DIFF: usize = 16 << 20;
+/// Most patch text the secret scan reads in one command.
+const MAX_PATCH: usize = 64 << 20;
+/// Most of stderr kept; only its first line is ever shown.
+const MAX_STDERR: usize = 64 << 10;
 
 /// A `git` command that can never take optional locks, prompt, or colour
-/// its output, whatever the user's configuration says.
+/// its output, whatever the user's configuration says. It does not guard
+/// against the repository's config; see `CliBackend::command`.
 pub(crate) fn base_command(cwd: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("--no-optional-locks")
@@ -49,10 +61,11 @@ pub(crate) fn base_command(cwd: &Path) -> Command {
             "diff.suppressBlankEmpty=false",
             "-c",
             "core.quotePath=false",
-            "-c",
-            "log.showSignature=false",
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
+        // A partial clone's status or diff fetches a missing blob itself;
+        // not from a refresh (git 2.45 and newer).
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
         .stdin(Stdio::null());
@@ -63,6 +76,13 @@ pub struct CliBackend {
     repo: Repo,
     timeout: Duration,
     leaks: LeakScanner,
+    /// Overrides from the config read by the last snapshot.
+    guard: Mutex<Arc<Guard>>,
+    /// Submodule config files as last read, so that a refresh runs git
+    /// only for one that changed.
+    submodule_configs: Mutex<HashMap<PathBuf, CachedConfig>>,
+    /// Set by `stop`: gitst is quitting.
+    stop: AtomicBool,
 }
 
 impl CliBackend {
@@ -71,6 +91,9 @@ impl CliBackend {
             repo,
             timeout: GIT_TIMEOUT,
             leaks: LeakScanner::new(LeakScanConfig::default()),
+            guard: Mutex::default(),
+            submodule_configs: Mutex::default(),
+            stop: AtomicBool::new(false),
         }
     }
 
@@ -87,15 +110,34 @@ impl CliBackend {
         }
     }
 
+    fn guard(&self) -> Arc<Guard> {
+        self.guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A git command that runs no program the repository's config names.
     pub(crate) fn command(&self) -> Command {
-        base_command(&self.repo.root)
+        let mut cmd = base_command(&self.repo.root);
+        self.guard().apply(&mut cmd);
+        cmd
     }
 
     /// Runs git and returns stdout; a non-zero exit becomes the first stderr
     /// line. A command still running after the timeout is stopped, so one
     /// wedged call cannot hold up every later snapshot and detail.
     pub(crate) fn git(&self, args: &[&str]) -> Result<Vec<u8>, GitError> {
-        let mut cmd = self.command();
+        self.run(self.command(), args, MAX_OUTPUT)
+    }
+
+    /// `git` with at most `cap` bytes of output; past it the command is
+    /// stopped and fails with `GitError::too_large`.
+    fn git_capped(&self, args: &[&str], cap: usize) -> Result<Vec<u8>, GitError> {
+        self.run(self.command(), args, cap)
+    }
+
+    fn run(&self, mut cmd: Command, args: &[&str], cap: usize) -> Result<Vec<u8>, GitError> {
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(unix)]
         {
@@ -103,18 +145,23 @@ impl CliBackend {
             // Its own group, so a stop reaches hooks and helpers too.
             cmd.process_group(0);
         }
-        let (status, stdout, stderr) = match run_bounded(&mut cmd, self.timeout, None) {
-            Ok(Run::Exited {
-                status,
-                stdout,
-                stderr,
-            }) => (status, stdout, stderr),
-            Ok(_) => {
-                let name = args.first().copied().unwrap_or_default();
-                return Err(GitError(format!("git {name} timed out")));
-            }
-            Err(e) => return Err(GitError(format!("git: {e}"))),
-        };
+        let name = subcommand(args);
+        let cancelled = || GitError::new(format!("git {name} cancelled"));
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(cancelled());
+        }
+        let (status, stdout, stderr) =
+            match run_bounded(&mut cmd, self.timeout, Some(&self.stop), cap, false) {
+                Ok(Run::Exited {
+                    status,
+                    stdout,
+                    stderr,
+                }) => (status, stdout, stderr),
+                Ok(Run::TooLarge) => return Err(GitError::too_large(name)),
+                Ok(Run::Cancelled) => return Err(cancelled()),
+                Ok(Run::TimedOut) => return Err(GitError::new(format!("git {name} timed out"))),
+                Err(e) => return Err(GitError::new(format!("git: {e}"))),
+            };
         if status.success() {
             Ok(stdout)
         } else {
@@ -123,7 +170,126 @@ impl CliBackend {
                 .lines()
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or("git failed");
-            Err(GitError(line.trim_start_matches("fatal: ").to_string()))
+            Err(GitError::new(line.trim_start_matches("fatal: ")))
+        }
+    }
+
+    /// Every config entry with its scope. `git config` runs nothing, so it
+    /// needs no guard; and with one, the overrides would list as the user's
+    /// own. Fails on a git before 2.26, which has no `--show-scope`.
+    fn read_config(&self) -> Result<Vec<ConfigEntry>, GitError> {
+        self.run(base_command(&self.repo.root), &CONFIG_LIST, MAX_OUTPUT)
+            .map(|raw| parse::parse_config(&raw))
+    }
+
+    /// Config of the submodules' repositories, whose git runs inside a
+    /// status with the same overrides. Covers git directories under
+    /// `modules/` and the submodules `.gitmodules` lists.
+    fn submodule_config(&self) -> Vec<ConfigEntry> {
+        let mut files = Vec::new();
+        find_configs(&self.repo.common_dir.join("modules"), 0, &mut files);
+        let gitmodules = self.repo.root.join(".gitmodules");
+        if gitmodules.is_file() {
+            let listed = self
+                .run(
+                    base_command(&self.repo.root),
+                    &["config", "--file", ".gitmodules", "--list", "-z"],
+                    MAX_OUTPUT,
+                )
+                .unwrap_or_default();
+            for entry in listed.split(|b| *b == 0) {
+                let entry = String::from_utf8_lossy(entry);
+                if let Some((key, path)) = entry.split_once('\n')
+                    && key.starts_with("submodule.")
+                    && key.ends_with(".path")
+                {
+                    let git_dir = self.repo.root.join(path).join(".git");
+                    if git_dir.is_dir() {
+                        files.extend(
+                            ["config", "config.worktree"]
+                                .map(|f| git_dir.join(f))
+                                .into_iter()
+                                .filter(|f| f.is_file()),
+                        );
+                    }
+                }
+            }
+        }
+        let read = |f: &Path| {
+            let f = f.to_string_lossy();
+            let args = [
+                "config",
+                "--file",
+                &f,
+                "--includes",
+                "--list",
+                "--show-scope",
+                "-z",
+            ];
+            self.run(base_command(&self.repo.root), &args, MAX_OUTPUT)
+                .map(|raw| parse::parse_config(&raw))
+                .unwrap_or_default()
+        };
+        let mut cache = self
+            .submodule_configs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cached_configs(&mut cache, files, &read)
+    }
+
+    /// Reads the config and replaces the overrides every later command
+    /// gets. Returns the config, and why it could not be read if it could
+    /// not: the guard then has only its defaults.
+    fn refresh_guard(&self) -> (Vec<ConfigEntry>, Option<String>) {
+        let (config, error) = match self.read_config() {
+            Ok(config) => (config, None),
+            Err(e) => (Vec::new(), Some(e.message)),
+        };
+        let guard = Guard::new(&config, &self.submodule_config(), &Guard::env);
+        *self.guard.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(guard);
+        (config, error)
+    }
+
+    /// Commits on a local branch or HEAD that no remote-tracking ref
+    /// has, newest first, or `None` if git could not say. Not
+    /// `@{upstream}..HEAD`: a commit pushed to another branch, or merged in
+    /// from one, is already out, whatever the upstream says; and one on
+    /// another branch is as close to a push. Without a remote, that is
+    /// every commit, so a remote added later finds them scanned; the cap is
+    /// then the normal state of a history, and `has_remote` false keeps it
+    /// out of `errors`.
+    fn unpushed(
+        &self,
+        unborn: bool,
+        has_remote: bool,
+        errors: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        // One more than is scanned, to tell whether any were left out.
+        let n = format!("-n{}", MAX_SCANNED_COMMITS + 1);
+        let mut args = vec!["rev-list", n.as_str(), "--branches"];
+        if !unborn {
+            args.push("HEAD");
+        }
+        args.extend(["--not", "--remotes"]);
+        match self.git(&args) {
+            Ok(out) => {
+                let mut oids: Vec<String> = String::from_utf8_lossy(&out)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                let over = oids.len() > MAX_SCANNED_COMMITS;
+                oids.truncate(MAX_SCANNED_COMMITS);
+                if over && has_remote {
+                    errors.push(format!(
+                        "only the newest {MAX_SCANNED_COMMITS} unpushed commits"
+                    ));
+                }
+                Some(oids)
+            }
+            Err(e) => {
+                errors.push(e.message);
+                None
+            }
         }
     }
 
@@ -157,20 +323,17 @@ impl CliBackend {
 
     /// Staged and unstaged diffs of one path, or its contents when untracked.
     fn file_detail(&self, path: &str) -> Result<Vec<DiffBlock>, GitError> {
-        let staged = self.git(&[
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--cached",
-            "--",
-            path,
-        ])?;
-        let unstaged = self.git(&["diff", "--no-color", "--no-ext-diff", "--", path])?;
-        let mut blocks = nonempty_block("Staged".into(), parse::parse_diff(&staged));
-        blocks.extend(nonempty_block(
-            "Unstaged".into(),
-            parse::parse_diff(&unstaged),
-        ));
+        let diff = |cached: bool| {
+            // `--no-textconv`: a diff driver is a command from config.
+            let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
+            if cached {
+                args.push("--cached");
+            }
+            args.extend(["--", path]);
+            shown_diff(self.git_capped(&args, MAX_SHOWN_DIFF))
+        };
+        let mut blocks = nonempty_block("Staged".into(), diff(true)?);
+        blocks.extend(nonempty_block("Unstaged".into(), diff(false)?));
         let size = std::fs::metadata(self.repo.root.join(path))
             .map(|m| m.len())
             .ok();
@@ -235,9 +398,11 @@ impl CliBackend {
         }
     }
 
-    /// `git fetch` as run in the background.
-    pub(crate) fn fetch_command(&self, prune: bool) -> Command {
-        let mut cmd = self.command();
+    /// `git fetch` as run in the background, with the overrides `guard`
+    /// gives for a fetch.
+    pub(crate) fn fetch_command(&self, prune: bool, guard: &Guard) -> Command {
+        let mut cmd = base_command(&self.repo.root);
+        guard.apply_fetch(&mut cmd);
         // No askpass helper, GUI credential manager or ssh passphrase dialog
         // may pop up for a fetch the user did not start.
         cmd.args(["-c", "credential.interactive=false", "fetch", "--quiet"])
@@ -245,6 +410,14 @@ impl CliBackend {
             .env("SSH_ASKPASS", "")
             .env("SSH_ASKPASS_REQUIRE", "never")
             .env("GCM_INTERACTIVE", "never");
+        // The remote's own `upload-pack` runs here for a local remote.
+        // Submodules have their own config, and maintenance its own hooks;
+        // a background fetch starts neither.
+        cmd.args([
+            "--upload-pack=git-upload-pack",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+        ]);
         if prune {
             cmd.arg("--prune");
         }
@@ -323,6 +496,88 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// A config file's entries as last read, and the size and modification
+/// time it had then.
+struct CachedConfig {
+    len: u64,
+    mtime: Option<SystemTime>,
+    entries: Vec<ConfigEntry>,
+}
+
+/// The entries of `files`, in order, reading with `read` only a file that
+/// is new or whose size or modification time moved since it was last
+/// read. Files no longer listed leave the cache.
+fn cached_configs(
+    cache: &mut HashMap<PathBuf, CachedConfig>,
+    files: Vec<PathBuf>,
+    read: &dyn Fn(&Path) -> Vec<ConfigEntry>,
+) -> Vec<ConfigEntry> {
+    cache.retain(|p, _| files.contains(p));
+    let mut out = Vec::new();
+    for f in files {
+        let Ok(meta) = std::fs::metadata(&f) else {
+            cache.remove(&f);
+            continue;
+        };
+        let (len, mtime) = (meta.len(), meta.modified().ok());
+        let fresh = cache
+            .get(&f)
+            .is_some_and(|c| c.len == len && c.mtime == mtime);
+        if !fresh {
+            let entries = read(&f);
+            cache.insert(
+                f.clone(),
+                CachedConfig {
+                    len,
+                    mtime,
+                    entries,
+                },
+            );
+        }
+        out.extend(cache[&f].entries.iter().cloned());
+    }
+    out
+}
+
+/// Collects `config` and `config.worktree` files of the git directories
+/// under `dir`, a `modules/` directory, which nest for nested submodules.
+fn find_configs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    const MAX_DEPTH: usize = 32;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        // Not followed: a link could lead anywhere, or in a circle.
+        let Ok(kind) = e.file_type() else {
+            continue;
+        };
+        let name = e.file_name();
+        if kind.is_dir()
+            && depth < MAX_DEPTH
+            && !matches!(name.to_str(), Some("objects" | "refs" | "logs"))
+        {
+            find_configs(&e.path(), depth + 1, out);
+        } else if kind.is_file() && matches!(name.to_str(), Some("config" | "config.worktree")) {
+            out.push(e.path());
+        }
+    }
+}
+
+/// A diff for a detail view, or a line saying it is too large to show.
+fn shown_diff(out: Result<Vec<u8>, GitError>) -> Result<Vec<DiffLine>, GitError> {
+    match out {
+        Ok(raw) => Ok(parse::parse_diff(&raw)),
+        Err(e) if e.is_too_large() => Ok(vec![DiffLine {
+            kind: DiffKind::Meta,
+            text: format!(
+                "diff too large to show · over {}",
+                human_size(MAX_SHOWN_DIFF as u64)
+            ),
+        }]),
+        Err(e) => Err(e),
+    }
+}
+
 fn nonempty_block(title: String, lines: Vec<DiffLine>) -> Vec<DiffBlock> {
     if lines.is_empty() {
         Vec::new()
@@ -356,12 +611,8 @@ impl GitBackend for CliBackend {
     }
 
     fn snapshot(&self, opts: &SnapshotOpts) -> Result<Snapshot, GitError> {
-        // Exits 1 when no key is set.
-        let config = parse::parse_repo_config(
-            &self
-                .git(&["config", "-z", "--get-regexp", REPO_CONFIG_KEYS])
-                .unwrap_or_default(),
-        );
+        let (entries, config_error) = self.refresh_guard();
+        let config = parse::parse_repo_config(&entries);
         let raw = self.git(&[
             "status",
             "--porcelain=v2",
@@ -381,13 +632,22 @@ impl GitBackend for CliBackend {
         let unborn = matches!(head, Head::Unborn(_));
 
         let leak_on = self.leaks.enabled();
-        let git = |args: &[&str]| self.git(args);
+        let git = |args: &[&str]| self.git_capped(args, MAX_PATCH);
         let mut leaks = Vec::new();
+        // Parts of the secret scan that could not run.
+        let mut scan_errors = Vec::new();
         // Paths left out stay `Counts::Unknown`, which shows as blank.
         let counted = changes.len() <= opts.numstat_max_files;
         if counted {
-            let unstaged = self.git(&["diff", "--no-ext-diff", "--numstat", "-z"]);
-            let staged = self.git(&["diff", "--no-ext-diff", "--cached", "--numstat", "-z"]);
+            let unstaged = self.git(&["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z"]);
+            let staged = self.git(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+                "--numstat",
+                "-z",
+            ]);
             // Half a count would be wrong, so both diffs or neither.
             let mut counts: HashMap<String, Counts> = HashMap::new();
             if let (Ok(unstaged), Ok(staged)) = (unstaged, staged) {
@@ -414,7 +674,10 @@ impl GitBackend for CliBackend {
         // Past the numstat limit only file names are checked.
         let leak_scan_skipped = (leak_on && !counted).then_some(changes.len());
         if leak_on {
-            leaks.extend(self.leaks.worktree(&git, &changes, counted));
+            leaks.extend(
+                self.leaks
+                    .worktree(&git, &changes, counted, &mut scan_errors),
+            );
         }
 
         changes.sort_by(|a, b| {
@@ -424,6 +687,11 @@ impl GitBackend for CliBackend {
         });
         let changes_omitted = changes.len().saturating_sub(opts.max_changes);
         changes.truncate(opts.max_changes);
+        for c in &mut changes {
+            c.modified = std::fs::symlink_metadata(self.repo.root.join(&c.path))
+                .and_then(|m| m.modified())
+                .ok();
+        }
 
         let upstream = header.upstream.clone().map(|name| Upstream {
             name,
@@ -432,8 +700,6 @@ impl GitBackend for CliBackend {
         });
 
         let mut commits = Vec::new();
-        // Commits on no remote, newest first; `None` if git could not say.
-        let mut unpushed: Option<Vec<String>> = Some(Vec::new());
         if !unborn {
             let n = format!("-n{}", opts.commits);
             let fmt = format!("--format={LOG_FORMAT}");
@@ -449,28 +715,6 @@ impl GitBackend for CliBackend {
                     c.unpushed = ahead.contains(&c.oid);
                 }
             }
-            // Not `@{upstream}..HEAD`: a commit pushed to another branch, or
-            // merged in from one, is already out, whatever the upstream says.
-            if leak_on && config.has_remote {
-                unpushed = self
-                    .git(&[
-                        "rev-list",
-                        &format!("-n{MAX_SCANNED_COMMITS}"),
-                        "HEAD",
-                        "--not",
-                        "--remotes",
-                    ])
-                    .ok()
-                    .map(|out| {
-                        String::from_utf8_lossy(&out)
-                            .lines()
-                            .map(str::to_string)
-                            .collect()
-                    });
-            }
-        }
-        if leak_on {
-            leaks.extend(self.leaks.commits(&git, unpushed.as_deref()));
         }
 
         let branches = self
@@ -517,6 +761,18 @@ impl GitBackend for CliBackend {
             }
         }
 
+        if leak_on {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            self.leaks.recent_pushes(&git, now, &mut scan_errors);
+            let unpushed = self.unpushed(unborn, config.has_remote, &mut scan_errors);
+            leaks.extend(
+                self.leaks
+                    .commits(&git, unpushed.as_deref(), &mut scan_errors),
+            );
+        }
+
         let tag = if unborn {
             None
         } else {
@@ -547,6 +803,8 @@ impl GitBackend for CliBackend {
             has_remote: config.has_remote,
             leaks,
             leak_scan_skipped,
+            leak_scan_error: (!scan_errors.is_empty()).then(|| scan_errors.join(" · ")),
+            config_error,
         })
     }
 
@@ -562,6 +820,8 @@ impl GitBackend for CliBackend {
                 let stat = self.git(&[
                     "show",
                     "--format=",
+                    "--no-ext-diff",
+                    "--no-textconv",
                     "--numstat",
                     "-z",
                     "--diff-merges=first-parent",
@@ -577,20 +837,24 @@ impl GitBackend for CliBackend {
                 }))
             }
             DetailReq::CommitFile { rev, path } => {
-                let out = self.git(&[
-                    "show",
-                    "--format=",
-                    "--no-color",
-                    "--no-ext-diff",
-                    "--diff-merges=first-parent",
-                    rev,
-                    "--",
-                    path,
-                ])?;
+                let out = self.git_capped(
+                    &[
+                        "show",
+                        "--format=",
+                        "--no-color",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--diff-merges=first-parent",
+                        rev,
+                        "--",
+                        path,
+                    ],
+                    MAX_SHOWN_DIFF,
+                );
                 let title: String = rev.chars().take(12).collect();
                 Ok(DetailData::CommitFile(nonempty_block(
                     title,
-                    parse::parse_diff(&out),
+                    shown_diff(out)?,
                 )))
             }
             DetailReq::Branch { name, upstream } => {
@@ -621,7 +885,7 @@ impl GitBackend for CliBackend {
                     behind_total,
                 })
             }
-            DetailReq::Leaks => Err(GitError("possible secrets come with the snapshot".into())),
+            DetailReq::Leaks => Err(GitError::new("possible secrets come with the snapshot")),
         }
     }
 
@@ -629,17 +893,29 @@ impl GitBackend for CliBackend {
         if cancel.load(Ordering::SeqCst) {
             return Err(FetchError::Cancelled);
         }
-        let mut cmd = self.fetch_command(prune);
-        detach(&mut cmd);
-        match run_bounded(&mut cmd, timeout, Some(cancel)) {
+        // Read just before the fetch, not at the last snapshot. Without
+        // it the guard would take away the user's own helpers and ssh
+        // command: better not to fetch.
+        let config = self
+            .read_config()
+            .map_err(|e| FetchError::Other(format!("repo config not read · {}", e.message)))?;
+        let guard = Guard::new(&config, &[], &Guard::env);
+        let mut cmd = self.fetch_command(prune, &guard);
+        // Fetch writes nothing to stdout; a flood is not a fetch.
+        match run_bounded(&mut cmd, timeout, Some(cancel), 0, true) {
             Ok(Run::Exited { status, .. }) if status.success() => Ok(()),
             Ok(Run::Exited { stderr, .. }) => {
                 Err(classify_fetch_stderr(&String::from_utf8_lossy(&stderr)))
             }
             Ok(Run::TimedOut) => Err(FetchError::Timeout),
             Ok(Run::Cancelled) => Err(FetchError::Cancelled),
+            Ok(Run::TooLarge) => Err(FetchError::Other("too much output".into())),
             Err(e) => Err(FetchError::Other(e.to_string())),
         }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -652,31 +928,46 @@ enum Run {
     },
     TimedOut,
     Cancelled,
+    /// Wrote more to stdout than allowed, and was stopped.
+    TooLarge,
 }
 
 /// Runs `cmd`, collecting whichever of stdout and stderr are piped, and
-/// stops it and everything it started after `timeout` or once `cancel` is
-/// set. On Unix `cmd` must start a process group (see `ProcessTree`).
+/// stops it and everything it started after `timeout`, once `cancel` is
+/// set, or once stdout passes `cap` bytes. Past `MAX_STDERR`, stderr is
+/// read and dropped. `detached` cuts the command off from the terminal.
+/// On Unix `cmd` must start a process group (see `ProcessTree`).
 fn run_bounded(
     cmd: &mut Command,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
+    cap: usize,
+    detached: bool,
 ) -> std::io::Result<Run> {
     /// How often a cancel is noticed while the command runs.
     const TICK: Duration = Duration::from_millis(50);
+    prepare(cmd, detached);
     let mut child = cmd.spawn()?;
-    let tree = ProcessTree::adopt(&child);
+    let tree = ProcessTree::adopt(&mut child)?;
     let (closed_tx, closed) = mpsc::channel();
-    let stdout = child.stdout.take().map(|p| drain(p, closed_tx.clone()));
-    let stderr = child.stderr.take().map(|p| drain(p, closed_tx.clone()));
+    let stdout = child
+        .stdout
+        .take()
+        .map(|p| drain(p, Limit::Stop(cap), closed_tx.clone()));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|p| drain(p, Limit::Keep(MAX_STDERR), closed_tx.clone()));
     drop(closed_tx);
     let mut open = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
+    let mut too_large = false;
     let deadline = Instant::now() + timeout;
     let mut nap = Duration::from_millis(1);
     loop {
         // Pipes close when the command exits, so waiting on them wakes at
         // once; polling for the exit only starts after that.
         if open == 0
+            && !too_large
             && let Some(status) = child.try_wait()?
         {
             let join =
@@ -687,7 +978,9 @@ fn run_bounded(
                 stderr: join(stderr),
             });
         }
-        let stop = if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+        let stop = if too_large {
+            Some(Run::TooLarge)
+        } else if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
             Some(Run::Cancelled)
         } else if Instant::now() >= deadline {
             Some(Run::TimedOut)
@@ -702,7 +995,8 @@ fn run_bounded(
         if open > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             match closed.recv_timeout(left.min(TICK)) {
-                Ok(()) => open -= 1,
+                Ok(Pipe::Closed) => open -= 1,
+                Ok(Pipe::Over) => too_large = true,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => open = 0,
             }
@@ -713,38 +1007,90 @@ fn run_bounded(
     }
 }
 
-/// Reads a pipe to its end on its own thread, so neither pipe can fill up
-/// and stall the child, then reports the pipe closed.
-fn drain(mut pipe: impl Read + Send + 'static, closed: Sender<()>) -> JoinHandle<Vec<u8>> {
+/// How much of a pipe `drain` keeps.
+#[derive(Clone, Copy)]
+enum Limit {
+    /// At most this many bytes; one more, and the command must stop.
+    Stop(usize),
+    /// The first this many bytes; the rest is read and dropped.
+    Keep(usize),
+}
+
+/// What `drain` reports.
+enum Pipe {
+    Closed,
+    /// Passed a `Limit::Stop`; reading has stopped.
+    Over,
+}
+
+/// Reads a pipe on its own thread, so neither pipe can fill up and stall
+/// the child, then reports the pipe closed, or over its limit.
+fn drain(
+    mut pipe: impl Read + Send + 'static,
+    limit: Limit,
+    done: Sender<Pipe>,
+) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        let _ = closed.send(());
+        match limit {
+            Limit::Stop(cap) => {
+                let _ = (&mut pipe).take(cap as u64 + 1).read_to_end(&mut buf);
+                if buf.len() > cap {
+                    let _ = done.send(Pipe::Over);
+                    return Vec::new();
+                }
+            }
+            Limit::Keep(cap) => {
+                let _ = (&mut pipe).take(cap as u64).read_to_end(&mut buf);
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+            }
+        }
+        let _ = done.send(Pipe::Closed);
         buf
     })
 }
 
-/// Cuts a fetch off from the terminal so neither git nor ssh can ever prompt
-/// over the TUI.
+/// The git command in `args`, past any `-c key=value`, for messages.
+fn subcommand<'a>(args: &[&'a str]) -> &'a str {
+    let mut args = args.iter();
+    while let Some(a) = args.next() {
+        if *a == "-c" {
+            args.next();
+        } else {
+            return a;
+        }
+    }
+    ""
+}
+
+/// With `detached`, cuts the command off from the terminal so that neither
+/// git nor ssh can ever prompt over the TUI.
 #[cfg(unix)]
-fn detach(cmd: &mut Command) {
+fn prepare(cmd: &mut Command, detached: bool) {
     use std::os::unix::process::CommandExt;
-    // A new session has no controlling terminal; it also makes git a group
-    // leader, so `ProcessTree::terminate` can signal everything it starts.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+    if detached {
+        // A new session has no controlling terminal; it also makes git a
+        // group leader, so `ProcessTree::terminate` can signal everything
+        // it starts.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
 }
 
+/// Starts the command suspended, for `ProcessTree::adopt` to resume once it
+/// is in its job, and with `detached`, without a console: then there is
+/// nothing for git or ssh to prompt on.
 #[cfg(windows)]
-fn detach(cmd: &mut Command) {
+fn prepare(cmd: &mut Command, detached: bool) {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Without a console there is nothing for git or ssh to prompt on.
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+    // One call sets every flag: a later one replaces it.
+    let console = if detached { CREATE_NO_WINDOW } else { 0 };
+    cmd.creation_flags(CREATE_SUSPENDED | console);
 }
 
 /// A git command and every process it starts: its process group, which
@@ -754,8 +1100,8 @@ struct ProcessTree;
 
 #[cfg(unix)]
 impl ProcessTree {
-    fn adopt(_child: &Child) -> Self {
-        ProcessTree
+    fn adopt(_child: &mut Child) -> std::io::Result<Self> {
+        Ok(ProcessTree)
     }
 
     /// Stops a timed-out or cancelled command and everything it started.
@@ -782,22 +1128,27 @@ struct ProcessTree {
 
 #[cfg(windows)]
 impl ProcessTree {
-    fn adopt(child: &Child) -> Self {
+    /// Puts the child, started suspended by `prepare`, in a job, then lets
+    /// it run, so that nothing it starts can be outside the job.
+    fn adopt(child: &mut Child) -> std::io::Result<Self> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
-        // Anything the child starts before this is outside the job. That
-        // window is short (git has barely begun loading), but not closed:
-        // std cannot start a process suspended or already in a job.
         let job = unsafe {
             let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if h.is_null() {
-                return ProcessTree { job: None };
+                None
+            } else {
+                let job = OwnedHandle::from_raw_handle(h);
+                (AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) != 0)
+                    .then_some(job)
             }
-            let job = OwnedHandle::from_raw_handle(h);
-            (AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) != 0)
-                .then_some(job)
         };
-        ProcessTree { job }
+        if !resume(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other("could not start git"));
+        }
+        Ok(ProcessTree { job })
     }
 
     /// Stops a timed-out or cancelled command and everything it started.
@@ -831,6 +1182,40 @@ impl ProcessTree {
             TerminateJobObject(job, STOPPED_EXIT_CODE);
         }
     }
+}
+
+/// Resumes every thread of the suspended process `pid`: std keeps no handle
+/// to its first thread. Returns whether any was resumed.
+#[cfg(windows)]
+fn resume(pid: u32) -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    let mut resumed = false;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let snap = OwnedHandle::from_raw_handle(snap);
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut more = Thread32First(snap.as_raw_handle(), &mut entry) != 0;
+        while more {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if !thread.is_null() {
+                    let thread = OwnedHandle::from_raw_handle(thread);
+                    resumed |= ResumeThread(thread.as_raw_handle()) != u32::MAX;
+                }
+            }
+            more = Thread32Next(snap.as_raw_handle(), &mut entry) != 0;
+        }
+    }
+    resumed
 }
 
 /// Exit status for a stopped command on Windows, as if by SIGTERM.
@@ -958,6 +1343,42 @@ fn wait_grace(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn submodule_config_files_are_read_once_until_they_change() {
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("config");
+        std::fs::write(&f, "[a]\n\tb = 1\n").unwrap();
+        let mut cache = HashMap::new();
+        let reads = Cell::new(0);
+        let read = |p: &Path| {
+            reads.set(reads.get() + 1);
+            vec![super::ConfigEntry {
+                scope: "local".into(),
+                key: "a.b".into(),
+                value: std::fs::read_to_string(p).unwrap().trim().to_string(),
+            }]
+        };
+        let first = super::cached_configs(&mut cache, vec![f.clone()], &read);
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            super::cached_configs(&mut cache, vec![f.clone()], &read),
+            first
+        );
+        assert_eq!(reads.get(), 1, "an unchanged file is not read again");
+        std::fs::write(&f, "[a]\n\tb = 22\n").unwrap();
+        assert_ne!(
+            super::cached_configs(&mut cache, vec![f.clone()], &read),
+            first
+        );
+        assert_eq!(reads.get(), 2);
+        assert!(super::cached_configs(&mut cache, vec![], &read).is_empty());
+        assert!(cache.is_empty(), "a file gone is forgotten");
+    }
+
     use std::ffi::OsStr;
 
     use super::*;
@@ -1024,7 +1445,7 @@ mod tests {
 
     #[test]
     fn fetch_disables_every_prompt() {
-        let cmd = backend().fetch_command(false);
+        let cmd = backend().fetch_command(false, &Guard::default());
         let envs: HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
         let env = |k: &str| {
             envs.get(OsStr::new(k))
@@ -1033,6 +1454,7 @@ mod tests {
                 .and_then(OsStr::to_str)
         };
         assert_eq!(env("GIT_TERMINAL_PROMPT"), Some("0"));
+        assert_eq!(env("GIT_NO_LAZY_FETCH"), Some("1"));
         assert_eq!(
             env("GIT_ASKPASS"),
             Some(""),

@@ -40,8 +40,9 @@ const MAX_BURST: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// One recursive watch. FSEvents and ReadDirectoryChangesW watch a whole
-    /// tree with one handle, so ignored directories cost nothing to watch,
-    /// and `Relevance` drops their events cheaply.
+    /// tree with one handle, so ignored directories cost nothing to watch.
+    /// Their events still arrive; `Relevance` drops them cheaply, and they
+    /// neither start nor lengthen a burst.
     Recursive,
     /// One watch per directory that is not ignored, added as directories
     /// appear. inotify and kqueue need a watch per directory, and a
@@ -310,10 +311,24 @@ fn spawn_with(repo: &Repo, out: Sender<WorkerMsg>, mode: Mode) -> notify::Result
                 if !relevant {
                     continue;
                 }
-                let start = Instant::now();
-                while start.elapsed() < MAX_BURST {
-                    match rx.recv_timeout(DEBOUNCE) {
-                        Ok(ev) => rewalk |= on_event(ev).1,
+                // The burst ends after a quiet period without relevant
+                // events: a build writing to `target/` must not hold back
+                // the refresh for an edit next to it.
+                let end = Instant::now() + MAX_BURST;
+                let mut quiet = Instant::now() + DEBOUNCE;
+                loop {
+                    let wait = quiet.min(end).saturating_duration_since(Instant::now());
+                    if wait.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(wait) {
+                        Ok(ev) => {
+                            let (relevant, gitignore) = on_event(ev);
+                            rewalk |= gitignore;
+                            if relevant {
+                                quiet = Instant::now() + DEBOUNCE;
+                            }
+                        }
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
@@ -370,16 +385,20 @@ fn follow_new_dirs(
     }
 }
 
-/// Watches one directory (not recursively) and signals on any change. Used
-/// while waiting for a repository to appear.
-pub fn spawn_dir(dir: &Path, out: Sender<()>) -> notify::Result<WatchHandle> {
+/// Watches one directory (not recursively) and calls `wake` once per burst
+/// of changes, until it returns false. Used while waiting for a repository
+/// to appear.
+pub fn spawn_dir(
+    dir: &Path,
+    wake: impl Fn() -> bool + Send + 'static,
+) -> notify::Result<WatchHandle> {
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut w = watcher(tx)?;
     w.watch(dir, RecursiveMode::NonRecursive)?;
     std::thread::spawn(move || {
         while rx.recv().is_ok() {
             while rx.recv_timeout(DEBOUNCE).is_ok() {}
-            if out.send(()).is_err() {
+            if !wake() {
                 return;
             }
         }

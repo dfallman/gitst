@@ -39,6 +39,9 @@ pub struct Change {
     pub x: char,
     pub y: char,
     pub counts: Counts,
+    /// When the path was last written, so that an edit that leaves the
+    /// line counts as they were still shows as a change.
+    pub modified: Option<SystemTime>,
 }
 
 /// Lines added and removed by a change, as far as they are known.
@@ -212,6 +215,13 @@ pub struct Snapshot {
     pub leaks: Vec<Leak>,
     /// The number of changes, when there were too many to scan contents.
     pub leak_scan_skipped: Option<usize>,
+    /// What part of the secret scan could not run, and why. The findings
+    /// that part last gave are kept.
+    pub leak_scan_error: Option<String>,
+    /// Why the repository's config could not be read, when it could not:
+    /// its settings then count as unset, and the guard applies only its
+    /// defaults.
+    pub config_error: Option<String>,
 }
 
 impl Default for Snapshot {
@@ -234,6 +244,8 @@ impl Default for Snapshot {
             has_remote: false,
             leaks: Vec::new(),
             leak_scan_skipped: None,
+            leak_scan_error: None,
+            config_error: None,
         }
     }
 }

@@ -1,4 +1,5 @@
-//! The git worker thread: refreshes snapshots, loads details, schedules fetches.
+//! The git worker threads: one refreshes snapshots and schedules fetches,
+//! another loads details, so that opening a diff never waits on a refresh.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender};
@@ -48,6 +49,8 @@ pub enum UiMsg {
     /// SIGHUP, SIGTERM or SIGINT: the terminal is gone or gitst was asked
     /// to stop.
     Quit,
+    /// Something outside changed; look again.
+    Wake,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -89,12 +92,22 @@ impl FetchSlot {
 /// shuts the worker down.
 pub struct WorkerHandle {
     tx: Sender<WorkerMsg>,
+    /// The detail thread's inbox; `None` stops it.
+    details: Sender<Option<DetailReq>>,
     fetch: Arc<FetchSlot>,
+    backend: Arc<dyn GitBackend>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl WorkerHandle {
     pub fn send(&self, msg: WorkerMsg) -> Result<(), SendError<WorkerMsg>> {
-        self.tx.send(msg)
+        match msg {
+            WorkerMsg::Detail(req) => self
+                .details
+                .send(Some(req.clone()))
+                .map_err(|_| SendError(WorkerMsg::Detail(req))),
+            msg => self.tx.send(msg),
+        }
     }
 
     /// A second sender to the worker's inbox.
@@ -102,17 +115,25 @@ impl WorkerHandle {
         self.tx.clone()
     }
 
-    /// Stops the worker and waits for any running fetch to exit. Fetches
-    /// run in their own session, so nothing else would stop them, and a
-    /// fetch left running can hold ref locks long after gitst is gone.
+    /// Stops the worker and waits for it, and for any running fetch, to
+    /// exit. Git runs in its own process group or session, so nothing else
+    /// would stop it: a fetch left running can hold ref locks long after
+    /// gitst is gone, and a status can keep a hook running.
     pub fn shutdown(&self) {
         let _ = self.tx.send(WorkerMsg::Shutdown);
+        let _ = self.details.send(None);
+        self.backend.stop();
         let thread = {
             let mut slot = self.fetch.thread();
             self.fetch.cancel.store(true, Ordering::SeqCst);
             slot.take()
         };
         if let Some(t) = thread {
+            let _ = t.join();
+        }
+        let threads =
+            std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
+        for t in threads {
             let _ = t.join();
         }
     }
@@ -130,13 +151,43 @@ fn due_in(delay: Duration) -> Option<Instant> {
     Instant::now().checked_add(delay)
 }
 
-/// Starts the worker thread.
+/// Answers detail requests until a `None`. Requests that queued up while
+/// one ran are each answered, the same one only once.
+fn serve_details(backend: Arc<dyn GitBackend>, rx: Receiver<Option<DetailReq>>, ui: Sender<UiMsg>) {
+    while let Ok(Some(first)) = rx.recv() {
+        let mut reqs = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            let Some(req) = next else { return };
+            if !reqs.contains(&req) {
+                reqs.push(req);
+            }
+        }
+        for req in reqs {
+            let data = backend.detail(&req).map_err(|e| e.message);
+            if ui.send(UiMsg::Detail(req, data)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Starts the worker threads.
 pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>) -> WorkerHandle {
     let (tx, rx) = mpsc::channel();
     let inbox = tx.clone();
+    let (details, details_rx) = mpsc::channel();
+    let detail_thread = {
+        let (backend, ui) = (backend.clone(), ui.clone());
+        std::thread::Builder::new()
+            .name("gitst-details".into())
+            .spawn(move || serve_details(backend, details_rx, ui))
+            .expect("spawn detail thread")
+    };
+    let worker_details = details.clone();
     let slot = Arc::new(FetchSlot::default());
     let fetch_slot = slot.clone();
-    std::thread::Builder::new()
+    let handle_backend = backend.clone();
+    let thread = std::thread::Builder::new()
         .name("gitst-worker".into())
         .spawn(move || {
             let fetch = FetchStatus {
@@ -148,6 +199,7 @@ pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>)
                 cfg,
                 ui,
                 inbox,
+                details: worker_details,
                 slot: fetch_slot,
                 prev: None,
                 fetch,
@@ -158,7 +210,13 @@ pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>)
             .run(rx)
         })
         .expect("spawn worker thread");
-    WorkerHandle { tx, fetch: slot }
+    WorkerHandle {
+        tx,
+        details,
+        fetch: slot,
+        backend: handle_backend,
+        threads: Mutex::new(vec![thread, detail_thread]),
+    }
 }
 
 struct Worker {
@@ -166,6 +224,8 @@ struct Worker {
     cfg: WorkerConfig,
     ui: Sender<UiMsg>,
     inbox: Sender<WorkerMsg>,
+    /// For a detail request that came through `WorkerHandle::sender`.
+    details: Sender<Option<DetailReq>>,
     slot: Arc<FetchSlot>,
     prev: Option<Arc<Snapshot>>,
     fetch: FetchStatus,
@@ -204,10 +264,7 @@ impl Worker {
                         refresh = true;
                     }
                     WorkerMsg::Detail(req) => {
-                        let data = self.backend.detail(&req).map_err(|e| e.0);
-                        if self.ui.send(UiMsg::Detail(req, data)).is_err() {
-                            return;
-                        }
+                        let _ = self.details.send(Some(req));
                     }
                     WorkerMsg::Shutdown => return,
                 }
@@ -254,7 +311,7 @@ impl Worker {
                 });
             }
             Err(e) => {
-                let _ = self.ui.send(UiMsg::RefreshError(e.0));
+                let _ = self.ui.send(UiMsg::RefreshError(e.message));
             }
         }
     }
@@ -343,6 +400,9 @@ mod tests {
         last_fetch: Option<SystemTime>,
         started: Mutex<Sender<()>>,
         release: Mutex<Receiver<()>>,
+        /// While set, a snapshot waits for `unhold`.
+        hold: AtomicBool,
+        unhold: Mutex<Receiver<()>>,
     }
 
     impl GitBackend for Fake {
@@ -350,6 +410,13 @@ mod tests {
             &self.repo
         }
         fn snapshot(&self, _: &SnapshotOpts) -> Result<Snapshot, GitError> {
+            if self.hold.load(Ordering::SeqCst) {
+                let _ = self
+                    .unhold
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+            }
             Ok(Snapshot {
                 has_remote: self.has_remote.load(Ordering::SeqCst),
                 last_fetch: self.last_fetch,
@@ -357,7 +424,7 @@ mod tests {
             })
         }
         fn detail(&self, _: &DetailReq) -> Result<DetailData, GitError> {
-            Err(GitError("none".into()))
+            Err(GitError::new("none"))
         }
         fn fetch(&self, _: bool, _: Duration, _: &AtomicBool) -> Result<(), FetchError> {
             let _ = self.started.lock().unwrap().send(());
@@ -376,11 +443,13 @@ mod tests {
         ui: Receiver<UiMsg>,
         started: Receiver<()>,
         release: Sender<()>,
+        unhold: Sender<()>,
     }
 
     fn harness(interval: Duration, last_fetch: Option<SystemTime>) -> Harness {
         let (started_tx, started) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
+        let (unhold, unhold_rx) = mpsc::channel();
         let fake = Arc::new(Fake {
             repo: Repo {
                 root: "/r".into(),
@@ -391,6 +460,8 @@ mod tests {
             last_fetch,
             started: Mutex::new(started_tx),
             release: Mutex::new(release_rx),
+            hold: AtomicBool::new(false),
+            unhold: Mutex::new(unhold_rx),
         });
         let (ui_tx, ui) = mpsc::channel();
         let cfg = WorkerConfig {
@@ -409,6 +480,7 @@ mod tests {
             ui,
             started,
             release,
+            unhold,
         };
         h.next_snapshot();
         h
@@ -475,6 +547,28 @@ mod tests {
             h.fetch_starts(Duration::from_secs(3)),
             "timer never resumed"
         );
+    }
+
+    #[test]
+    fn a_detail_does_not_wait_for_a_slow_refresh() {
+        let h = harness(Duration::ZERO, None);
+        h.fake.hold.store(true, Ordering::SeqCst);
+        h.worker.send(WorkerMsg::Refresh).unwrap();
+        // Give the refresh time to start and block.
+        std::thread::sleep(Duration::from_millis(100));
+        let req = DetailReq::Commit { rev: "HEAD".into() };
+        h.worker.send(WorkerMsg::Detail(req.clone())).unwrap();
+        let got = loop {
+            match h.ui.recv_timeout(Duration::from_secs(2)) {
+                Ok(UiMsg::Detail(r, _)) => break r,
+                Ok(_) => {}
+                Err(e) => panic!("no detail while the refresh ran: {e}"),
+            }
+        };
+        assert_eq!(got, req);
+        h.fake.hold.store(false, Ordering::SeqCst);
+        h.unhold.send(()).unwrap();
+        h.next_snapshot();
     }
 
     #[test]

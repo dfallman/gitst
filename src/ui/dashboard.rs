@@ -281,7 +281,8 @@ fn build(
             rows: activity(snap, app, theme, w, d),
         },
         SectionId::Commits => {
-            let unpushed = snap.commits.iter().filter(|c| c.unpushed).count();
+            // All of them, not those among the commits loaded.
+            let unpushed = snap.upstream.as_ref().map_or(0, |u| u.ahead);
             let summary = if unpushed > 0 {
                 vec![Span::styled(
                     format!("↑{unpushed}"),

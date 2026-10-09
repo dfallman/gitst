@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
+use crate::ui::layout::SectionId;
+
+/// Values `icons` takes, in any case.
+const ICONS: [&str; 2] = ["none", "nerd"];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub fetch_interval: String,
@@ -78,8 +83,27 @@ impl Config {
                     _ => false,
                 },
                 "fetch_prune" => set(&mut c.fetch_prune, value),
-                "collapsed" => set(&mut c.collapsed, value),
-                "icons" => set(&mut c.icons, value),
+                "collapsed" => match value.try_into::<Vec<String>>() {
+                    Ok(names) => {
+                        c.collapsed.clear();
+                        for name in names {
+                            if SectionId::ALL.iter().any(|id| id.key() == name) {
+                                c.collapsed.push(name);
+                            } else {
+                                bad.push(format!("collapsed {name:?} (unknown section)"));
+                            }
+                        }
+                        true
+                    }
+                    Err(_) => false,
+                },
+                "icons" => match value.try_into::<String>() {
+                    Ok(v) if ICONS.contains(&v.to_ascii_lowercase().as_str()) => {
+                        c.icons = v.to_ascii_lowercase();
+                        true
+                    }
+                    _ => false,
+                },
                 "pulse_seconds" => set(&mut c.pulse_seconds, value),
                 "max_changes" => set(&mut c.max_changes, value),
                 "numstat_max_files" => set(&mut c.numstat_max_files, value),
@@ -224,6 +248,23 @@ mod tests {
         assert_eq!((c.fetch_prune, c.pulse_seconds), (false, 4));
         assert!(warning.unwrap().contains("fetch_prune"));
         assert_eq!(Config::from_toml("pulse_seconds = 4").1, None);
+    }
+
+    #[test]
+    fn section_names_and_icons_are_checked() {
+        let (c, warning) = Config::from_toml("collapsed = [\"branchess\", \"stashes\"]");
+        assert_eq!(c.collapsed, vec!["stashes"]);
+        assert!(
+            warning
+                .unwrap()
+                .contains("collapsed \"branchess\" (unknown section)"),
+            "a typo is named"
+        );
+        let (c, warning) = Config::from_toml("icons = \"Nerd\"");
+        assert_eq!((c.icons.as_str(), warning), ("nerd", None));
+        let (c, warning) = Config::from_toml("icons = \"emoji\"");
+        assert_eq!(c.icons, "none");
+        assert!(warning.unwrap().contains("icons (invalid)"));
     }
 
     #[test]

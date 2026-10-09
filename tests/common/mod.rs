@@ -1,9 +1,13 @@
 #![allow(dead_code)]
 
+use std::io::Read;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// A throwaway repository driven by the real git CLI, isolated from the
 /// user's global and system config.
@@ -109,15 +113,53 @@ impl TestRepo {
     }
 }
 
-/// Points `origin` at an ssh transport that writes its pid to the returned
-/// file and then hangs.
-#[cfg(unix)]
-pub fn hanging_remote(r: &TestRepo) -> PathBuf {
-    let pid_file = r.dir.path().join("ssh.pid");
-    r.git(&["remote", "add", "origin", "ssh://example.invalid/x.git"]);
-    let ssh = format!("sh -c 'echo $$ > {}; exec sleep 30' --", pid_file.display());
-    r.git(&["config", "core.sshCommand", &ssh]);
-    pid_file
+/// A remote that takes a fetch's connection and never answers, so the
+/// fetch hangs until it is stopped. Seeing the connection close shows that
+/// the process holding it, git's HTTP transport, has exited.
+pub struct HangingRemote {
+    events: Receiver<Conn>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Conn {
+    Opened,
+    Closed,
+}
+
+impl HangingRemote {
+    /// Starts the remote and adds it to `r` as `origin`.
+    pub fn add_to(r: &TestRepo) -> HangingRemote {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x.git", listener.local_addr().unwrap());
+        r.git(&["remote", "add", "origin", &url]);
+        let (tx, events) = channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                if tx.send(Conn::Opened).is_err() {
+                    break;
+                }
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                    let _ = tx.send(Conn::Closed);
+                });
+            }
+        });
+        HangingRemote { events }
+    }
+
+    /// Waits for a fetch to connect.
+    pub fn wait_for_fetch(&self) {
+        let got = self.events.recv_timeout(Duration::from_secs(10));
+        assert_eq!(got, Ok(Conn::Opened), "no fetch connected");
+    }
+
+    /// Whether the connection closes within `limit`.
+    pub fn closes_within(&self, limit: Duration) -> bool {
+        self.events.recv_timeout(limit) == Ok(Conn::Closed)
+    }
 }
 
 #[cfg(unix)]

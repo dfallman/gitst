@@ -32,7 +32,8 @@ const COMMITS: usize = 50;
 struct Cli {
     /// Directory inside the repository to show (default: current directory)
     path: Option<PathBuf>,
-    /// Turn off background fetching (the ↻ button and `f` still fetch)
+    /// Turn off background fetching (the ↻ button and `f` still fetch);
+    /// wins over --interval
     #[arg(long)]
     no_fetch: bool,
     /// Time between background fetches, such as 30s, 5m or 1h
@@ -93,7 +94,7 @@ fn run(
             }
         })?;
 
-    let Some(repo) = wait_for_repo(terminal, &ui_rx, path, theme)? else {
+    let Some(repo) = wait_for_repo(terminal, &ui_rx, ui_tx.clone(), path, theme)? else {
         return Ok(());
     };
 
@@ -130,7 +131,12 @@ fn run(
     let (_watch, poll) = match watch::spawn(&repo, worker.sender()) {
         Ok(h) => (Some(h), None),
         Err(e) => {
-            app.config_warning = Some(format!("file watching failed ({e}); polling"));
+            // Added to a config warning, not put in its place.
+            let watch = format!("file watching failed ({e}); polling");
+            app.config_warning = Some(match app.config_warning.take() {
+                Some(w) => format!("{w} · {watch}"),
+                None => watch,
+            });
             (None, Some(Duration::from_secs(3)))
         }
     };
@@ -186,10 +192,10 @@ fn run(
 fn wait_for_repo(
     terminal: &mut DefaultTerminal,
     ui_rx: &Receiver<UiMsg>,
+    ui_tx: mpsc::Sender<UiMsg>,
     path: &Path,
     theme: &Theme,
 ) -> Result<Option<Repo>> {
-    let (dir_tx, dir_rx) = mpsc::channel();
     let mut _dir_watch = None;
     loop {
         let message = match Repo::discover(path) {
@@ -200,7 +206,8 @@ fn wait_for_repo(
             Err(DiscoverError::Other(_)) => "cannot read repository",
         };
         if _dir_watch.is_none() {
-            _dir_watch = watch::spawn_dir(path, dir_tx.clone()).ok();
+            let wake = ui_tx.clone();
+            _dir_watch = watch::spawn_dir(path, move || wake.send(UiMsg::Wake).is_ok()).ok();
         }
         let shown = path.display().to_string();
         terminal.draw(|f| {
@@ -236,7 +243,6 @@ fn wait_for_repo(
             Ok(UiMsg::Quit) | Err(RecvTimeoutError::Disconnected) => return Ok(None),
             _ => {}
         }
-        while dir_rx.try_recv().is_ok() {}
     }
 }
 

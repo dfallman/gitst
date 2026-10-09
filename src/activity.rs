@@ -198,29 +198,36 @@ pub fn diff_snapshots(
         .map(|(c, _)| c.path.clone())
         .chain(left.iter().map(|c| c.path.clone()))
         .collect();
-    if !left.is_empty() {
-        events.push(files_event(&paths, next, now));
-    } else if !changed.is_empty() {
-        let moved_to_index = |to_index: bool| {
-            changed.iter().all(|(c, old)| {
-                old.is_some_and(|o| {
-                    o.counts == c.counts && (o.x == ' ') == to_index && (c.x == ' ') != to_index
-                })
-            })
-        };
-        if moved_to_index(true) {
-            events.push(event(
-                ActivityKind::Stage,
-                format!("staged {}", plural(changed.len(), "file")),
-            ));
-        } else if moved_to_index(false) {
-            events.push(event(
-                ActivityKind::Stage,
-                format!("unstaged {}", plural(changed.len(), "file")),
-            ));
-        } else {
-            events.push(files_event(&paths, next, now));
-        }
+    // A path that only moved into or out of the index, the rest unchanged.
+    let moved = |(c, old): &(&Change, Option<&&Change>), to_index: bool| {
+        old.is_some_and(|o| {
+            o.counts == c.counts && (o.x == ' ') == to_index && (c.x == ' ') != to_index
+        })
+    };
+    let staged = changed.iter().filter(|c| moved(c, true)).count();
+    let unstaged = changed.iter().filter(|c| moved(c, false)).count();
+    // Stage rows come with an edit in the same refresh, as `git add`
+    // right after a save often does.
+    if staged > 0 {
+        events.push(event(
+            ActivityKind::Stage,
+            format!("staged {}", plural(staged, "file")),
+        ));
+    }
+    if unstaged > 0 {
+        events.push(event(
+            ActivityKind::Stage,
+            format!("unstaged {}", plural(unstaged, "file")),
+        ));
+    }
+    let edited: Vec<String> = changed
+        .iter()
+        .filter(|c| !moved(c, true) && !moved(c, false))
+        .map(|(c, _)| c.path.clone())
+        .chain(left.iter().map(|c| c.path.clone()))
+        .collect();
+    if !edited.is_empty() {
+        events.push(files_event(&edited, next, now));
     }
     if next.stash_count > prev.stash_count {
         // The stash takes the time of the reset `git stash` wrote, which
@@ -289,6 +296,7 @@ mod tests {
             x,
             y,
             counts: Counts::lines(a, r),
+            modified: None,
         }
     }
 
@@ -298,6 +306,16 @@ mod tests {
             oid: Some("o1".into()),
             ..Snapshot::default()
         }
+    }
+
+    #[test]
+    fn a_stage_and_an_edit_in_one_refresh_are_both_shown() {
+        let before = snap_with(vec![ch("a.rs", ' ', 'M', 1, 0), ch("b.rs", ' ', 'M', 1, 0)]);
+        let after = snap_with(vec![ch("a.rs", 'M', ' ', 1, 0), ch("b.rs", ' ', 'M', 3, 0)]);
+        let (events, paths) = diff(&before, &after, 50);
+        let texts: Vec<&str> = events.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["staged 1 file", "b.rs +3"]);
+        assert_eq!(paths, vec!["a.rs", "b.rs"]);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod cli;
+mod guard;
 pub mod leakscan;
 pub mod parse;
 
@@ -72,11 +73,38 @@ impl Repo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitError(pub String);
+pub struct GitError {
+    pub message: String,
+    /// The command wrote more than gitst reads and was stopped. A kind of
+    /// its own, not read from the message: git's own stderr becomes a
+    /// message too.
+    too_large: bool,
+}
+
+impl GitError {
+    pub fn new(message: impl Into<String>) -> GitError {
+        GitError {
+            message: message.into(),
+            too_large: false,
+        }
+    }
+
+    /// `git <cmd>` wrote more than gitst reads.
+    pub fn too_large(cmd: &str) -> GitError {
+        GitError {
+            message: format!("git {cmd} output too large"),
+            too_large: true,
+        }
+    }
+
+    pub fn is_too_large(&self) -> bool {
+        self.too_large
+    }
+}
 
 impl std::fmt::Display for GitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -111,6 +139,8 @@ pub fn classify_fetch_stderr(stderr: &str) -> FetchError {
         "could not read Username",
         "could not read Password",
         "terminal prompts disabled",
+        // With `credential.interactive=false` and no helper to ask.
+        "unable to get password",
         "Host key verification failed",
     ];
     // Checked before OFFLINE: curl reports a timeout as
@@ -156,6 +186,9 @@ pub trait GitBackend: Send + Sync {
     fn detail(&self, req: &DetailReq) -> Result<DetailData, GitError>;
     /// Runs `git fetch`, stopping it after `timeout` or once `cancel` is set.
     fn fetch(&self, prune: bool, timeout: Duration, cancel: &AtomicBool) -> Result<(), FetchError>;
+    /// Stops any git command running for a snapshot or detail, and fails
+    /// every later one, for a quit.
+    fn stop(&self) {}
 }
 
 #[cfg(test)]
@@ -163,11 +196,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn too_large_is_a_kind_not_a_message() {
+        assert!(GitError::too_large("log").is_too_large());
+        assert!(!GitError::new("git log output too large").is_too_large());
+    }
+
+    #[test]
     fn classify_stderr() {
         assert_eq!(
             classify_fetch_stderr(
                 "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n"
             ),
+            FetchError::Auth
+        );
+        assert_eq!(
+            classify_fetch_stderr("fatal: unable to get password from user\n"),
             FetchError::Auth
         );
         assert_eq!(

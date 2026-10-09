@@ -1,7 +1,8 @@
 name: CI
 
 # Checks formatting and lints, and runs the tests, on every push and pull
-# request, on each platform gitst is released for.
+# request, on each platform gitst is released for, and checks dependencies
+# for known advisories. The toolchain comes from rust-toolchain.toml.
 
 on:
   push:
@@ -38,3 +39,14 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check dependencies against the RustSec advisory database
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

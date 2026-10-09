@@ -13,7 +13,7 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{TestRepo, exits_within, hanging_remote, wait_for_pid};
+use common::{HangingRemote, TestRepo};
 
 const ENTER_ALT: &str = "\x1b[?1049h";
 const LEAVE_ALT: &str = "\x1b[?1049l";
@@ -146,17 +146,43 @@ fn repo() -> TestRepo {
 fn hangup_stops_the_fetch_and_exits() {
     let r = repo();
     // With no FETCH_HEAD, the first background fetch starts at once.
-    let pid_file = hanging_remote(&r);
+    let remote = HangingRemote::add_to(&r);
     let mut tui = Tui::start(&r.path());
-    let pid = wait_for_pid(&pid_file);
+    remote.wait_for_fetch();
     tui.signal(libc::SIGHUP);
     assert!(
         tui.exits_within(Duration::from_secs(5)),
         "gitst ignored SIGHUP"
     );
     assert!(
-        exits_within(&pid, Duration::from_secs(2)),
-        "fetch transport {pid} outlived gitst"
+        remote.closes_within(Duration::from_secs(2)),
+        "fetch transport outlived gitst"
+    );
+}
+
+#[test]
+fn git_init_is_picked_up_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let tui = Tui::start(dir.path());
+    tui.wait_for(
+        |out| out.contains("not a git repository"),
+        "the waiting screen",
+    );
+    // Past the first look, so only the watch can say that it changed.
+    std::thread::sleep(Duration::from_millis(300));
+    let t = Instant::now();
+    let made = Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .status()
+        .unwrap();
+    assert!(made.success());
+    tui.wait_for(|out| out.contains("(no commits)"), "the dashboard");
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
     );
 }
 
@@ -193,9 +219,9 @@ fn ctrl_z_hands_back_the_terminal_and_resumes() {
 fn the_spinner_keeps_turning_while_the_mouse_moves() {
     let r = repo();
     // A background fetch that never finishes keeps the spinner up.
-    let pid_file = hanging_remote(&r);
+    let remote = HangingRemote::add_to(&r);
     let mut tui = Tui::start(&r.path());
-    wait_for_pid(&pid_file);
+    remote.wait_for_fetch();
     std::thread::sleep(Duration::from_millis(300));
     let before = tui.output().len();
     let start = Instant::now();

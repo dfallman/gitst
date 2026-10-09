@@ -22,11 +22,89 @@ type DetailLine = (Line<'static>, Option<Target>);
 
 /// Draws the top detail view into `area`; returns the selected line's rect.
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density) -> Option<Rect> {
-    let view = app.stack.last()?;
+    app.stack.last()?;
     if area.height == 0 {
         return None;
     }
-    let w = area.width as usize;
+    let height = area.height as usize;
+    let mut text = area;
+    let (lines, text_width) = fit(area.width, height, |w| view_lines(app, theme, w, d))?;
+    text.width = text_width;
+    app.page = height;
+    app.detail_targets = lines.iter().map(|(_, t)| t.clone()).collect();
+    let view = app.stack.last_mut()?;
+    let max_scroll = lines.len().saturating_sub(height);
+    if let Some(sel) = view.selected {
+        if sel < view.scroll {
+            view.scroll = sel;
+        } else if sel >= view.scroll + height {
+            view.scroll = sel + 1 - height;
+        }
+    }
+    view.scroll = view.scroll.min(max_scroll);
+    let (scroll, selected) = (view.scroll, view.selected);
+
+    app.hits.scrolls.push((area, ScrollTarget::Detail));
+    let mut selected_rect = None;
+    for (i, (line, target)) in lines.iter().enumerate().skip(scroll).take(height) {
+        let r = Rect::new(text.x, text.y + (i - scroll) as u16, text.width, 1);
+        f.render_widget(Paragraph::new(line.clone()), r);
+        if let Some(t) = target {
+            app.hits
+                .clicks
+                .push((r, crate::app::Action::Open(t.clone())));
+        }
+        if selected == Some(i) {
+            f.buffer_mut().set_style(r, theme.select);
+            selected_rect = Some(r);
+        }
+    }
+    if max_scroll > 0 {
+        let mut state = ScrollbarState::new(max_scroll)
+            .position(scroll)
+            .viewport_content_length(height);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(theme.border)
+            .thumb_symbol("┃")
+            .thumb_style(Style::new().fg(theme.accent));
+        f.render_stateful_widget(
+            bar,
+            area.inner(Margin {
+                vertical: 0,
+                horizontal: 0,
+            }),
+            &mut state,
+        );
+    }
+    selected_rect
+}
+
+/// Lays the view out for a pane `width` wide and `height` tall, and says
+/// how wide the text is: one column less when the lines overflow, which a
+/// scrollbar takes. Laid out without that column first: a view that
+/// overflows, the heavy case, is then laid out once, and only a view that
+/// fits, which is short, is laid out again at the full width.
+fn fit(
+    width: u16,
+    height: usize,
+    mut lines_at: impl FnMut(usize) -> Option<Vec<DetailLine>>,
+) -> Option<(Vec<DetailLine>, u16)> {
+    if width <= 1 {
+        return Some((lines_at(width as usize)?, width));
+    }
+    let narrow = lines_at(width as usize - 1)?;
+    if narrow.len() > height {
+        return Some((narrow, width - 1));
+    }
+    Some((lines_at(width as usize)?, width))
+}
+
+/// The top detail view's lines, laid out `w` cells wide.
+fn view_lines(app: &App, theme: &Theme, w: usize, d: Density) -> Option<Vec<DetailLine>> {
+    let view = app.stack.last()?;
     let lines: Vec<DetailLine> = if view.target == Target::Leaks {
         leak_lines(app, theme, w)
     } else {
@@ -60,58 +138,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density)
             }
         }
     };
-
-    let height = area.height as usize;
-    app.page = height;
-    app.detail_targets = lines.iter().map(|(_, t)| t.clone()).collect();
-    let view = app.stack.last_mut()?;
-    let max_scroll = lines.len().saturating_sub(height);
-    if let Some(sel) = view.selected {
-        if sel < view.scroll {
-            view.scroll = sel;
-        } else if sel >= view.scroll + height {
-            view.scroll = sel + 1 - height;
-        }
-    }
-    view.scroll = view.scroll.min(max_scroll);
-    let (scroll, selected) = (view.scroll, view.selected);
-
-    app.hits.scrolls.push((area, ScrollTarget::Detail));
-    let mut selected_rect = None;
-    for (i, (line, target)) in lines.iter().enumerate().skip(scroll).take(height) {
-        let r = Rect::new(area.x, area.y + (i - scroll) as u16, area.width, 1);
-        f.render_widget(Paragraph::new(line.clone()), r);
-        if let Some(t) = target {
-            app.hits
-                .clicks
-                .push((r, crate::app::Action::Open(t.clone())));
-        }
-        if selected == Some(i) {
-            f.buffer_mut().set_style(r, theme.select);
-            selected_rect = Some(r);
-        }
-    }
-    if max_scroll > 0 {
-        let mut state = ScrollbarState::new(max_scroll)
-            .position(scroll)
-            .viewport_content_length(height);
-        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(Some("│"))
-            .track_style(theme.border)
-            .thumb_symbol("┃")
-            .thumb_style(Style::new().fg(theme.accent));
-        f.render_stateful_widget(
-            bar,
-            area.inner(Margin {
-                vertical: 0,
-                horizontal: 0,
-            }),
-            &mut state,
-        );
-    }
-    selected_rect
+    Some(lines)
 }
 
 /// Splits `s` into pieces of at most `max` cells, never inside a cluster.
@@ -521,6 +548,32 @@ pub fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overflowing_view_is_laid_out_once_without_the_scrollbar_column() {
+        let lines = |n: usize| -> Option<Vec<DetailLine>> { Some(vec![(Line::raw(""), None); n]) };
+        let mut widths = Vec::new();
+        let (laid, w) = fit(10, 3, |w| {
+            widths.push(w);
+            lines(5)
+        })
+        .unwrap();
+        assert_eq!(widths, vec![9], "the heavy case is laid out once");
+        assert_eq!((laid.len(), w), (5, 9));
+        widths.clear();
+        let (laid, w) = fit(10, 3, |w| {
+            widths.push(w);
+            lines(2)
+        })
+        .unwrap();
+        assert_eq!(
+            widths,
+            vec![9, 10],
+            "a view that fits takes the whole width"
+        );
+        assert_eq!((laid.len(), w), (2, 10));
+        assert_eq!(fit(1, 3, |w| lines(w + 4)).unwrap().1, 1);
+    }
 
     #[test]
     fn wrap_keeps_clusters_whole_and_within_width() {

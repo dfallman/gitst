@@ -39,7 +39,10 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         );
         return;
     };
-    if density.tiny {
+    let in_detail = !app.stack.is_empty();
+    // An open view is drawn at any width: it only cuts its lines shorter,
+    // and the one-line summary would hide it while keys still went to it.
+    if density.tiny && !in_detail {
         draw_tiny(f, area, &snap, theme);
         if app.help {
             detail::draw_short_help(f, theme, area);
@@ -47,7 +50,6 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         return;
     }
 
-    let in_detail = !app.stack.is_empty();
     let mut y = area.y;
     let mut left = area.height;
     let max_warnings = match area.height {
@@ -78,10 +80,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     }
     let hint_rows = u16::from(density.hints && left >= 2);
     let mut band = None;
-    for w in warnings(app, &snap, theme, area.width as usize)
-        .into_iter()
-        .take(max_warnings.min((left - hint_rows) as usize))
-    {
+    let mut error_shown = false;
+    let rows = max_warnings.min((left - hint_rows) as usize);
+    for w in fit_warnings(warnings(app, &snap, theme, area.width as usize), rows) {
         let r = Rect::new(area.x, y, area.width, 1);
         f.render_widget(
             Paragraph::new(fit_line(w.line, area.width as usize)).style(w.fill),
@@ -91,6 +92,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
             app.hits.clicks.push((r, action));
             band = Some(r);
         }
+        error_shown |= w.error;
         y += 1;
         left -= 1;
     }
@@ -101,7 +103,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     } else {
         dashboard::draw(f, app, &snap, theme, body, density)
     };
-    if app.error.is_some() {
+    // Stale, and saying why; dimmed without the reason, it would only
+    // look broken.
+    if error_shown {
         f.buffer_mut()
             .set_style(body, Style::new().add_modifier(Modifier::DIM));
     }
@@ -315,6 +319,41 @@ struct Warning {
     /// Style for the whole row.
     fill: Style,
     action: Option<Action>,
+    /// What a shared row says for it; `None` for the secrets band, which
+    /// keeps a row of its own.
+    text: Option<(String, Style)>,
+    /// The refresh error: the body below is stale.
+    error: bool,
+}
+
+/// Fits `warnings` into `rows`: when there are more, the last row carries
+/// all that are left, joined, so that none is dropped without a trace.
+fn fit_warnings(mut warnings: Vec<Warning>, rows: usize) -> Vec<Warning> {
+    if warnings.len() <= rows || rows == 0 {
+        warnings.truncate(rows);
+        return warnings;
+    }
+    let rest = warnings.split_off(rows - 1);
+    match rest.first() {
+        // The band comes first and alone takes the only row.
+        Some(w) if w.text.is_none() => warnings.extend(rest.into_iter().take(1)),
+        Some(_) => {
+            let style = rest[0].text.as_ref().map_or(Style::new(), |t| t.1);
+            let joined: Vec<&str> = rest
+                .iter()
+                .filter_map(|w| w.text.as_ref().map(|t| t.0.as_str()))
+                .collect();
+            warnings.push(Warning {
+                line: Line::from(Span::styled(format!(" ⚠ {}", joined.join(" · ")), style)),
+                fill: Style::new(),
+                action: None,
+                text: None,
+                error: rest.iter().any(|w| w.error),
+            });
+        }
+        None => {}
+    }
+    warnings
 }
 
 fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warning> {
@@ -324,6 +363,8 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
         line: Line::from(Span::styled(format!(" ⚠ {text}"), style)),
         fill: Style::new(),
         action: None,
+        text: Some((text, style)),
+        error: false,
     };
     let mut out = Vec::new();
     // First, so that no other warning can push it off a small pane.
@@ -332,10 +373,22 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
             line: Line::from(leak_band_text(&snap.leaks, theme.leak_icon(), cols)),
             fill: theme.leak,
             action: Some(Action::Open(Target::Leaks)),
+            text: None,
+            error: false,
         });
     }
+    // Next, so that it is never what a shared row cuts off.
     if let Some(e) = &app.error {
-        out.push(line(e.clone(), err));
+        out.push(Warning {
+            error: true,
+            ..line(e.clone(), err)
+        });
+    }
+    if let Some(e) = &snap.leak_scan_error {
+        out.push(line(format!("secret scan incomplete · {e}"), warn));
+    }
+    if let Some(e) = &snap.config_error {
+        out.push(line(format!("repo config not read · {e}"), warn));
     }
     let conflicts = snap.changes.iter().filter(|c| c.conflicted()).count();
     if conflicts > 0 {

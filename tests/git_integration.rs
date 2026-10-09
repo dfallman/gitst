@@ -6,9 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use common::TestRepo;
-#[cfg(unix)]
-use common::{exits_within, hanging_remote, wait_for_pid};
+use common::{HangingRemote, TestRepo};
 use gitst::git::{
     CliBackend, DiscoverError, FetchError, GitBackend, LeakScanConfig, Repo, SnapshotOpts,
 };
@@ -509,6 +507,39 @@ fn watcher_signals_refresh() {
 }
 
 #[test]
+fn a_busy_ignored_directory_does_not_hold_back_a_refresh() {
+    let r = TestRepo::new();
+    r.write(".gitignore", "target/\n");
+    r.commit_file("a", "1", "one");
+    r.write("target/x", "0");
+    let (tx, rx) = channel();
+    let _h = watch::spawn(&Repo::discover(&r.path()).ok().unwrap(), tx).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let stop = Arc::new(AtomicBool::new(false));
+    let build = {
+        let (stop, target) = (stop.clone(), r.path().join("target/x"));
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                i += 1;
+                let _ = std::fs::write(&target, i.to_string());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let t = Instant::now();
+    r.write("a", "2");
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    let took = t.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    build.join().unwrap();
+    assert!(matches!(got, Ok(WorkerMsg::Refresh)));
+    // A burst lasts at most a second; the edit needs only the quiet time.
+    assert!(took < Duration::from_millis(800), "{took:?}");
+}
+
+#[test]
 fn relevance_follows_info_exclude_edits_and_nested_repos() {
     let r = TestRepo::new();
     r.commit_file("a", "1", "one");
@@ -570,8 +601,7 @@ fn relevance_respects_info_exclude() {
 fn fetch_times_out_and_returns() {
     let r = TestRepo::new();
     r.commit_file("a", "1", "one");
-    r.git(&["remote", "add", "origin", "ssh://example.invalid/x.git"]);
-    r.git(&["config", "core.sshCommand", "sh -c 'sleep 30' --"]);
+    let _remote = HangingRemote::add_to(&r);
     let t = Instant::now();
     let err = backend(&r)
         .fetch(false, Duration::from_millis(500), &AtomicBool::new(false))
@@ -580,30 +610,28 @@ fn fetch_times_out_and_returns() {
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
 }
 
-#[cfg(unix)]
 #[test]
 fn fetch_stops_when_cancelled() {
     let r = TestRepo::new();
     r.commit_file("a", "1", "one");
-    let pid_file = hanging_remote(&r);
+    let remote = HangingRemote::add_to(&r);
     let cancel = Arc::new(AtomicBool::new(false));
     let b = backend(&r);
     let flag = cancel.clone();
     let fetch = std::thread::spawn(move || b.fetch(false, Duration::from_secs(30), &flag));
-    let pid = wait_for_pid(&pid_file);
+    remote.wait_for_fetch();
     let t = Instant::now();
     cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(fetch.join().unwrap(), Err(FetchError::Cancelled));
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
-    assert!(exits_within(&pid, Duration::from_secs(2)));
+    assert!(remote.closes_within(Duration::from_secs(2)));
 }
 
-#[cfg(unix)]
 #[test]
 fn worker_shutdown_stops_running_fetch() {
     let r = TestRepo::new();
     r.commit_file("a", "1", "one");
-    let pid_file = hanging_remote(&r);
+    let remote = HangingRemote::add_to(&r);
     let (tx, rx) = channel();
     let cfg = WorkerConfig {
         opts: opts(),
@@ -613,13 +641,13 @@ fn worker_shutdown_stops_running_fetch() {
     let w = worker::spawn(Arc::new(backend(&r)), cfg, tx);
     recv_until(&rx, |m| matches!(m, UiMsg::Snapshot { .. }).then_some(()));
     w.send(WorkerMsg::Fetch { manual: true }).unwrap();
-    let pid = wait_for_pid(&pid_file);
+    remote.wait_for_fetch();
     let t = Instant::now();
     w.shutdown();
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     assert!(
-        exits_within(&pid, Duration::from_secs(2)),
-        "fetch transport {pid} outlived shutdown"
+        remote.closes_within(Duration::from_secs(2)),
+        "fetch transport outlived shutdown"
     );
 }
 
@@ -702,34 +730,6 @@ fn untracked_fifo_and_symlink_do_not_hang_detail() {
         let _ = tx.send(b.snapshot(&opts()).is_ok());
     });
     assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(true));
-}
-
-#[cfg(unix)]
-#[test]
-fn hung_git_command_times_out() {
-    use std::os::unix::fs::PermissionsExt;
-    let r = TestRepo::new();
-    r.commit_file("a", "1", "one");
-    let pid_file = r.dir.path().join("hook.pid");
-    let hook = r.dir.path().join("hook.sh");
-    let script = format!(
-        "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
-        pid_file.display()
-    );
-    std::fs::write(&hook, script).unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // `git status` waits for the fsmonitor hook.
-    r.git(&["config", "core.fsmonitor", hook.to_str().unwrap()]);
-    let b = backend(&r).with_timeout(Duration::from_millis(500));
-    let t = Instant::now();
-    let err = b.snapshot(&opts()).unwrap_err();
-    assert!(err.0.contains("timed out"), "{err}");
-    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
-    let pid = wait_for_pid(&pid_file);
-    assert!(
-        exits_within(&pid, Duration::from_secs(2)),
-        "hook {pid} outlived the timeout"
-    );
 }
 
 #[test]
@@ -829,7 +829,14 @@ fn an_edited_tracked_env_file_is_not_flagged_again() {
     let r = TestRepo::new();
     r.commit_file(".env", "A=1\n", "one");
     r.write(".env", "A=2\n");
-    assert!(snap(&r).leaks.is_empty());
+    // The commit that added it is, as it is not pushed.
+    let s = snap(&r);
+    let sources: Vec<&LeakSource> = s.leaks.iter().map(|l| &l.source).collect();
+    assert!(
+        matches!(sources[..], [LeakSource::Commit(_)]),
+        "{:?}",
+        s.leaks
+    );
 }
 
 #[test]
@@ -904,22 +911,152 @@ fn a_leak_amended_away_is_dropped() {
 }
 
 #[test]
-fn leaks_on_a_branch_without_upstream_and_none_without_a_remote() {
+fn a_pruned_leak_does_not_hold_back_a_pushed_one() {
+    // A flagged commit amended away and pruned is an object git no longer
+    // knows. The check for the other flagged commits must still run.
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    r.commit_file("k.txt", &format!("{}\n", aws_key()), "key on main");
+    r.git(&["checkout", "-q", "-b", "feat"]);
+    r.write(".env", "A=1\n");
+    r.git(&["add", ".env"]);
+    r.git(&["commit", "-q", "-m", "env"]);
+    let b = backend(&r);
+    let s = b.snapshot(&opts()).unwrap();
+    assert_eq!(s.leaks.len(), 2, "{:?}", s.leaks);
+    let key = s.commits[1].oid.clone();
+    r.git(&["rm", "-q", "--cached", ".env"]);
+    std::fs::remove_file(r.path().join(".env")).unwrap();
+    r.git(&["commit", "-q", "--amend", "--no-edit", "--allow-empty"]);
+    r.git(&["reflog", "expire", "--expire-unreachable=now", "--all"]);
+    r.git(&["gc", "-q", "--prune=now"]);
+    r.git(&["checkout", "-q", "main"]);
+    r.git(&["push", "-q"]);
+    let s = b.snapshot(&opts()).unwrap();
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "k.txt", &LeakSource::Pushed(key))]
+    );
+    assert_eq!(s.leak_scan_error, None);
+}
+
+#[test]
+fn leaks_on_a_branch_without_upstream_or_without_a_remote() {
     let r = TestRepo::new();
     r.commit_file("a.txt", "1\n", "one");
     r.git(&["checkout", "-q", "-b", "feat"]);
     r.commit_file("k.txt", &format!("{}\n", aws_key()), "local key");
-    assert!(
-        snap(&r).leaks.is_empty(),
-        "no remote: commits are not scanned"
+    let b = backend(&r);
+    let s = b.snapshot(&opts()).unwrap();
+    let oid = s.commits[0].oid.clone();
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "k.txt", &LeakSource::Commit(oid.clone()))],
+        "no remote yet: every commit is unpushed"
     );
     r.git(&["checkout", "-q", "main"]);
     r.with_bare_remote();
     r.git(&["checkout", "-q", "feat"]);
-    let s = snap(&r);
+    let s = b.snapshot(&opts()).unwrap();
     assert!(s.upstream.is_none());
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "k.txt", &LeakSource::Commit(oid.clone()))]
+    );
+    // A remote added and pushed to between two refreshes.
+    r.git(&["push", "-q", "origin", "feat"]);
+    let s = b.snapshot(&opts()).unwrap();
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "k.txt", &LeakSource::Pushed(oid))]
+    );
+}
+
+#[test]
+fn a_branch_that_is_not_checked_out_is_scanned() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    r.git(&["checkout", "-q", "-b", "other"]);
+    r.commit_file("k.txt", &format!("{}\n", aws_key()), "key on other");
+    r.git(&["checkout", "-q", "main"]);
+    let b = backend(&r);
+    let s = b.snapshot(&opts()).unwrap();
     assert_eq!(s.leaks.len(), 1, "{:?}", s.leaks);
     assert!(matches!(s.leaks[0].source, LeakSource::Commit(_)));
+    r.git(&["push", "-q", "origin", "other"]);
+    let s = b.snapshot(&opts()).unwrap();
+    assert!(
+        matches!(
+            s.leaks[..],
+            [Leak {
+                source: LeakSource::Pushed(_),
+                ..
+            }]
+        ),
+        "{:?}",
+        s.leaks
+    );
+}
+
+#[test]
+fn a_commit_pushed_before_gitst_saw_it_is_reported_as_pushed() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    r.commit_file("deploy.txt", &format!("{}\n", aws_key()), "add deploy key");
+    r.git(&["push", "-q"]);
+    let s = snap(&r);
+    let oid = s.commits[0].oid.clone();
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "deploy.txt", &LeakSource::Pushed(oid))]
+    );
+}
+
+#[test]
+fn a_commit_pushed_to_a_ref_that_is_no_upstream_is_reported_as_pushed() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    r.commit_file("deploy.txt", &format!("{}\n", aws_key()), "add deploy key");
+    r.git(&["push", "-q", "origin", "HEAD:feature"]);
+    let s = snap(&r);
+    let oid = s.commits[0].oid.clone();
+    assert_eq!(
+        leak_list(&s),
+        vec![("aws-access-key", "deploy.txt", &LeakSource::Pushed(oid))]
+    );
+}
+
+#[test]
+fn more_than_fifty_unpushed_commits_are_reported() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    r.with_bare_remote();
+    for i in 0..52 {
+        r.git(&["commit", "-q", "--allow-empty", "-m", &format!("c{i}")]);
+    }
+    let s = snap(&r);
+    assert_eq!(
+        s.leak_scan_error.as_deref(),
+        Some("only the newest 50 unpushed commits")
+    );
+}
+
+#[test]
+fn a_repository_without_a_remote_is_not_warned_about_the_cap() {
+    // Without a remote every commit is unpushed, and the cap is the normal
+    // state of a repository with a history, not something to warn about on
+    // every refresh.
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "1\n", "one");
+    for i in 0..52 {
+        r.git(&["commit", "-q", "--allow-empty", "-m", &format!("c{i}")]);
+    }
+    let s = snap(&r);
+    assert_eq!(s.leak_scan_error, None);
 }
 
 #[test]
@@ -998,4 +1135,215 @@ fn a_key_pushed_to_a_branch_other_than_the_upstream_counts_as_pushed() {
         leak_list(&s),
         vec![("aws-access-key", "deploy.txt", &LeakSource::Pushed(oid))]
     );
+}
+
+/// A shell command that appends `name` to `log`, for config that must
+/// never run.
+fn tripwire(log: &Path, name: &str) -> String {
+    let log = log.display().to_string().replace('\\', "/");
+    format!("echo {name} >> '{log}'")
+}
+
+/// What the tripwires wrote, clearing it.
+fn take_log(log: &Path) -> String {
+    let ran = std::fs::read_to_string(log).unwrap_or_default();
+    let _ = std::fs::remove_file(log);
+    ran
+}
+
+#[test]
+fn the_repositorys_own_config_runs_nothing_on_a_refresh_or_a_diff() {
+    let r = TestRepo::new();
+    let log = r.dir.path().join("ran.log");
+    r.write(".gitattributes", "*.txt filter=evil diff=evil\n");
+    r.git(&["add", ".gitattributes"]);
+    r.commit_file("a.txt", "1\n", "one");
+    r.git(&["config", "core.fsmonitor", &tripwire(&log, "fsmonitor")]);
+    r.git(&["config", "filter.evil.clean", &tripwire(&log, "clean")]);
+    r.git(&["config", "filter.evil.smudge", &tripwire(&log, "smudge")]);
+    r.git(&["config", "filter.evil.required", "true"]);
+    r.git(&["config", "diff.evil.textconv", &tripwire(&log, "textconv")]);
+    r.write("a.txt", "2\n");
+    // Plain git runs every one of them.
+    let _ = r.try_git(&["--no-optional-locks", "status"]);
+    let _ = r.try_git(&["show", "HEAD"]);
+    let ran = take_log(&log);
+    for name in ["fsmonitor", "clean", "smudge", "textconv"] {
+        assert!(
+            ran.contains(name),
+            "{name} did not run in plain git: {ran:?}"
+        );
+    }
+    let b = backend(&r);
+    let s = b.snapshot(&opts()).unwrap();
+    assert_eq!(counts(&s), vec![("a.txt", Counts::lines(1, 1))]);
+    b.detail(&DetailReq::File {
+        path: "a.txt".into(),
+    })
+    .unwrap();
+    b.detail(&DetailReq::CommitFile {
+        rev: "HEAD".into(),
+        path: "a.txt".into(),
+    })
+    .unwrap();
+    assert_eq!(take_log(&log), "");
+}
+
+#[test]
+fn a_submodules_own_config_runs_nothing_on_a_refresh() {
+    let lib = TestRepo::new();
+    lib.write(".gitattributes", "* filter=sub\n");
+    lib.git(&["add", ".gitattributes"]);
+    lib.commit_file("f", "1\n", "lib");
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        lib.path().to_str().unwrap(),
+        "lib",
+    ]);
+    r.git(&["commit", "-qm", "add lib"]);
+    let log = r.dir.path().join("ran.log");
+    let sub = r.path().join("lib");
+    let sub = sub.to_str().unwrap();
+    r.git(&[
+        "-C",
+        sub,
+        "config",
+        "filter.sub.clean",
+        &tripwire(&log, "clean"),
+    ]);
+    r.git(&["-C", sub, "config", "filter.sub.required", "true"]);
+    // Same size, so git must read the file to see whether it changed.
+    r.write("lib/f", "2\n");
+    let _ = r.try_git(&["--no-optional-locks", "status"]);
+    assert!(take_log(&log).contains("clean"), "plain git ran nothing");
+    let s = snap(&r);
+    assert_eq!(s.changes.len(), 1, "{:?}", s.changes);
+    assert_eq!(take_log(&log), "");
+}
+
+#[test]
+fn the_repositorys_own_config_runs_nothing_on_a_fetch() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let remote = r.with_bare_remote();
+    let other = TestRepo::clone_from(&remote);
+    other.commit_file("a", "2", "two");
+    other.git(&["push", "-q"]);
+    let log = r.dir.path().join("ran.log");
+    let upload = format!("{}; git-upload-pack", tripwire(&log, "uploadpack"));
+    r.git(&["config", "remote.origin.uploadpack", &upload]);
+    r.git(&["config", "protocol.ext.allow", "always"]);
+    let _ = r.try_git(&["ls-remote", "origin"]);
+    assert!(
+        take_log(&log).contains("uploadpack"),
+        "plain git ran nothing"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = r.path().join(".git/hooks/reference-transaction");
+        std::fs::write(&hook, format!("#!/bin/sh\n{}\n", tripwire(&log, "hook"))).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    backend(&r)
+        .fetch(false, Duration::from_secs(30), &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(snap(&r).upstream.unwrap().behind, 1, "fetched");
+    assert_eq!(take_log(&log), "");
+}
+
+#[test]
+fn a_local_ssh_command_does_not_run_on_a_fetch() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.git(&["remote", "add", "origin", "ssh://example.invalid/x.git"]);
+    let log = r.dir.path().join("ran.log");
+    r.git(&[
+        "config",
+        "core.sshCommand",
+        &format!("{}; false", tripwire(&log, "ssh")),
+    ]);
+    let _ = r.try_git(&["ls-remote", "origin"]);
+    assert!(take_log(&log).contains("ssh"), "plain git ran nothing");
+    // Plain ssh runs instead, and finds no such host.
+    let _ = backend(&r).fetch(false, Duration::from_secs(20), &AtomicBool::new(false));
+    assert_eq!(take_log(&log), "");
+}
+
+/// A server that answers every request with 401, so git asks the
+/// credential helpers.
+fn asks_for_credentials() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/x.git", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    url
+}
+
+#[test]
+fn a_local_credential_helper_does_not_run_on_a_fetch() {
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    let url = asks_for_credentials();
+    r.git(&["remote", "add", "origin", &url]);
+    let log = r.dir.path().join("ran.log");
+    let helper = format!("!{}", tripwire(&log, "helper"));
+    r.git(&["config", "credential.helper", &helper]);
+    r.git(&["config", &format!("credential.{url}.helper"), &helper]);
+    let plain = std::process::Command::new("git")
+        .args(["-C", r.path().to_str().unwrap(), "ls-remote", "origin"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(!plain.status.success());
+    assert!(take_log(&log).contains("helper"), "plain git ran nothing");
+    let err = backend(&r)
+        .fetch(false, Duration::from_secs(20), &AtomicBool::new(false))
+        .unwrap_err();
+    assert_eq!(err, FetchError::Auth);
+    assert_eq!(take_log(&log), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_remote_helper_from_the_work_tree_does_not_run_on_a_fetch() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = TestRepo::new();
+    r.commit_file("a", "1", "one");
+    r.with_bare_remote();
+    let log = r.dir.path().join("ran.log");
+    // `git-remote-../x` is `x` in a directory named `git-remote-..`.
+    let helper = r.path().join("git-remote-../x");
+    r.write(
+        "git-remote-../x",
+        &format!("#!/bin/sh\n{}\n", tripwire(&log, "helper")),
+    );
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    r.git(&["config", "remote.origin.vcs", "../x"]);
+    let _ = r.try_git(&["fetch", "-q"]);
+    assert!(take_log(&log).contains("helper"), "plain git ran nothing");
+    let err = backend(&r)
+        .fetch(false, Duration::from_secs(20), &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(
+        matches!(err, FetchError::Other(ref m) if m.contains("not allowed")),
+        "{err:?}"
+    );
+    assert_eq!(take_log(&log), "");
 }

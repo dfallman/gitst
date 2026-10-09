@@ -1,6 +1,6 @@
 [package]
 name = "gitst"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 description = "Live, glanceable git status TUI for small terminal panes"
 license = "MIT"
@@ -30,6 +30,7 @@ signal-hook = "0.3"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",

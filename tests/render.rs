@@ -34,6 +34,7 @@ fn ch(path: &str, x: char, y: char, a: u32, r: u32) -> Change {
         x,
         y,
         counts: Counts::lines(a, r),
+        modified: None,
     }
 }
 
@@ -152,6 +153,8 @@ fn fixture() -> Snapshot {
         has_remote: true,
         leaks: Vec::new(),
         leak_scan_skipped: None,
+        leak_scan_error: None,
+        config_error: None,
     }
 }
 
@@ -296,6 +299,37 @@ fn tiny_width_is_one_line() {
 }
 
 #[test]
+fn an_open_view_is_drawn_at_a_tiny_width() {
+    let mut app = new_app(leaky());
+    app.handle(key('s'));
+    let out = draw(&mut app, 20, 10);
+    assert!(out.contains("‹ back"), "{out}");
+    assert!(out.contains(".env"), "the findings, not the summary: {out}");
+    let out = draw(&mut app, 20, 1);
+    assert!(out.starts_with(" ‹ back"), "{out}");
+    open(&mut app, Target::File("a".into()));
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Ok(file_data()),
+    ));
+    for (w, h) in [(1, 1), (5, 3), (12, 2), (23, 40)] {
+        draw(&mut app, w, h);
+    }
+    let out = draw(&mut app, 20, 12);
+    assert!(out.contains("Unstaged"), "{out}");
+    app.handle(UiMsg::Input(Event::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))));
+    app.handle(UiMsg::Input(Event::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))));
+    let out = draw(&mut app, 20, 6);
+    assert!(out.lines().skip(1).all(|l| l.trim().is_empty()), "{out}");
+}
+
+#[test]
 fn clean_tree() {
     let mut s = fixture();
     s.changes.clear();
@@ -413,6 +447,50 @@ fn stale_snapshot_error_is_shown() {
     app.handle(UiMsg::RefreshError("index file corrupt".into()));
     let out = draw(&mut app, 44, 20);
     assert!(out.contains("index file corrupt"), "{out}");
+}
+
+#[test]
+fn warnings_past_the_last_row_share_it() {
+    let mut s = leaky();
+    s.changes.insert(0, ch("conflict.rs", 'U', 'U', 3, 1));
+    let mut app = new_app(s);
+    app.handle(UiMsg::RefreshError("index file corrupt".into()));
+    app.handle(UiMsg::Fetch(FetchStatus {
+        last_error: Some(gitst::git::FetchError::Offline),
+        ..FetchStatus::default()
+    }));
+    let out = draw(&mut app, 80, 20);
+    let rows: Vec<&str> = out.lines().skip(2).take(2).collect();
+    assert!(rows[0].contains("3 possible secrets"), "{out}");
+    assert!(
+        rows[1].contains("index file corrupt · 1 conflict · fetch failed: offline"),
+        "{out}"
+    );
+}
+
+/// How many cells of a `w`×`h` draw are dimmed.
+fn dimmed(app: &mut App, w: u16, h: u16) -> usize {
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| gitst::ui::draw(f, app, &Theme::ansi())).unwrap();
+    let buf = t.backend().buffer();
+    buf.content()
+        .iter()
+        .filter(|c| c.modifier.contains(ratatui::style::Modifier::DIM))
+        .count()
+}
+
+#[test]
+fn the_body_dims_only_while_the_error_says_why() {
+    let mut app = new_app(leaky());
+    let clean = (dimmed(&mut app, 44, 10), dimmed(&mut app, 44, 6));
+    app.handle(UiMsg::RefreshError("index file corrupt".into()));
+    // Room for two warning rows: the band, then the error.
+    assert!(draw(&mut app, 44, 10).contains("index file corrupt"));
+    assert!(dimmed(&mut app, 44, 10) > clean.0);
+    // One row, which the band takes.
+    let out = draw(&mut app, 44, 6);
+    assert!(!out.contains("index file corrupt"), "{out}");
+    assert_eq!(dimmed(&mut app, 44, 6), clean.1, "{out}");
 }
 
 #[test]
@@ -560,6 +638,43 @@ fn branch_view() {
 }
 
 #[test]
+fn the_scrollbar_has_a_column_of_its_own() {
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("a".into()));
+    // Wrapped at 30 columns, the second piece fills the row, so its last
+    // character would sit under the bar.
+    let line = format!("{}{}Z", "x".repeat(28), "y".repeat(28));
+    let lines: Vec<(DiffKind, &str)> = (0..30).map(|_| (DiffKind::Add, line.as_str())).collect();
+    app.handle(UiMsg::Detail(
+        DetailReq::File { path: "a".into() },
+        Ok(DetailData::File(vec![diff_block("Unstaged", &lines)])),
+    ));
+    app.handle(key('w'));
+    let out = draw(&mut app, 30, 12);
+    assert!(out.contains('Z'), "{out}");
+    for row in out.lines().filter(|l| l.contains(['x', 'y', 'Z'])) {
+        assert!("│┃".contains(row.chars().last().unwrap()), "{out}");
+    }
+}
+
+#[test]
+fn bidi_controls_in_paths_never_reach_the_terminal() {
+    let mut s = leaky();
+    let path = "evil\u{202E}txt.exe\u{2066}\u{200F}";
+    s.changes.insert(0, ch(path, '?', '?', 1, 0));
+    s.leaks[0].path = path.into();
+    let mut app = new_app(s);
+    let out = draw(&mut app, 60, 20);
+    assert!(out.contains("eviltxt.exe"), "{out}");
+    app.handle(key('s'));
+    let out = draw(&mut app, 60, 20);
+    assert!(out.contains("eviltxt.exe"), "{out}");
+    for c in ['\u{202E}', '\u{2066}', '\u{200F}'] {
+        assert!(!out.contains(c), "{c:?} drawn");
+    }
+}
+
+#[test]
 fn help_overlay() {
     let mut app = new_app(fixture());
     app.handle(key('?'));
@@ -609,6 +724,17 @@ fn stale_lock_warning_appears_without_a_new_snapshot() {
     assert!(wake <= Duration::from_secs(8), "{wake:?}");
     app.now += Duration::from_secs(9);
     assert!(draw(&mut app, 44, 20).contains("index.lock held 11s"));
+}
+
+#[test]
+fn a_config_that_could_not_be_read_is_warned_about() {
+    let mut s = fixture();
+    s.config_error = Some("unknown option `show-scope'".into());
+    let out = render(60, 20, s);
+    assert!(
+        out.contains("repo config not read · unknown option `show-scope'"),
+        "{out}"
+    );
 }
 
 #[test]

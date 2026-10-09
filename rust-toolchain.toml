@@ -1,0 +1,6 @@
+# The compiler that CI tests with and releases are built with, rather than
+# whatever a runner happens to have. Raise it on purpose, in its own change.
+[toolchain]
+channel = "1.96.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

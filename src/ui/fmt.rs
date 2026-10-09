@@ -69,10 +69,13 @@ pub fn truncate_right(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// Compact age: `now`, `45s`, `12m`, `3h`, `2d`, `5w`, `3mo`, `2y`.
+/// Compact age: `now`, `45s`, `12m`, `3h`, `2d`, `5w`, `3mo`, `2y`. A time
+/// more than a minute ahead, after the clock was set back, is `in 3h`;
+/// less is clock skew, and `now`.
 pub fn rel_age(secs: i64) -> String {
     const DAY: i64 = 86_400;
     match secs {
+        s if s < -60 => format!("in {}", rel_age(s.saturating_neg())),
         s if s < 10 => "now".into(),
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
@@ -141,6 +144,8 @@ mod tests {
     #[test]
     fn ages() {
         assert_eq!(rel_age(-5), "now");
+        assert_eq!(rel_age(-3 * 3600), "in 3h");
+        assert_eq!(rel_age(i64::MIN), format!("in {}", rel_age(i64::MAX)));
         assert_eq!(rel_age(3), "now");
         assert_eq!(rel_age(45), "45s");
         assert_eq!(rel_age(720), "12m");

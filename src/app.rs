@@ -189,6 +189,25 @@ pub struct App {
     pub redraw: bool,
 }
 
+/// Whether an open view of `req` may be out of date once `next` replaces
+/// `prev`, with `changed` the paths whose status, counts, or contents moved.
+/// Commits, commit files, and stashes never change.
+fn stale(req: &DetailReq, prev: Option<&Snapshot>, next: &Snapshot, changed: &[String]) -> bool {
+    let Some(prev) = prev else {
+        return matches!(req, DetailReq::File { .. } | DetailReq::Branch { .. });
+    };
+    match req {
+        DetailReq::File { path } => {
+            let listed = |s: &Snapshot| s.changes.iter().any(|c| &c.path == path);
+            prev.oid != next.oid || changed.contains(path) || listed(prev) != listed(next)
+        }
+        DetailReq::Branch { .. } => {
+            prev.oid != next.oid || prev.branches != next.branches || prev.reflog != next.reflog
+        }
+        _ => false,
+    }
+}
+
 impl App {
     pub fn new(cfg: &Config, fetch: FetchStatus) -> App {
         let folded = SectionId::ALL
@@ -265,6 +284,11 @@ impl App {
                 events,
                 changed,
             } => {
+                let reload = self
+                    .stack
+                    .last()
+                    .filter(|v| stale(&v.req, self.snap.as_deref(), &snap, &changed))
+                    .map(|v| v.req.clone());
                 self.snap = Some(snap);
                 self.snap_at = self.now;
                 self.error = None;
@@ -279,14 +303,10 @@ impl App {
                 for path in changed {
                     self.pulses.insert(path, now);
                 }
-                match self.stack.last() {
-                    Some(v)
-                        if matches!(v.req, DetailReq::File { .. } | DetailReq::Branch { .. }) =>
-                    {
-                        vec![Cmd::Worker(WorkerMsg::Detail(v.req.clone()))]
-                    }
-                    _ => Vec::new(),
-                }
+                reload
+                    .map(|req| Cmd::Worker(WorkerMsg::Detail(req)))
+                    .into_iter()
+                    .collect()
             }
             UiMsg::RefreshError(e) => {
                 self.error = Some(e);
@@ -308,6 +328,7 @@ impl App {
             }
             UiMsg::Suspend => vec![Cmd::Suspend],
             UiMsg::Quit => vec![Cmd::Quit],
+            UiMsg::Wake => Vec::new(),
         }
     }
 
@@ -822,6 +843,50 @@ mod tests {
     }
 
     #[test]
+    fn an_open_file_reloads_only_when_it_may_have_changed() {
+        let mut a = app();
+        let change = |path: &str, added| crate::model::Change {
+            path: path.into(),
+            orig_path: None,
+            x: ' ',
+            y: 'M',
+            counts: crate::model::Counts::lines(added, 0),
+            modified: None,
+        };
+        let snap = |changes| UiMsg::Snapshot {
+            snap: Arc::new(Snapshot {
+                changes,
+                oid: Some("c1".into()),
+                ..Snapshot::default()
+            }),
+            events: vec![],
+            changed: vec![],
+        };
+        a.handle(snap(vec![change("a", 1), change("b", 1)]));
+        a.perform(Action::Open(Target::File("a".into())));
+        assert!(detail_req(&a.handle(snap(vec![change("a", 1), change("b", 2)]))).is_none());
+        let edited = UiMsg::Snapshot {
+            snap: Arc::new(Snapshot {
+                changes: vec![change("a", 1)],
+                oid: Some("c1".into()),
+                ..Snapshot::default()
+            }),
+            events: vec![],
+            changed: vec!["a".into()],
+        };
+        assert!(detail_req(&a.handle(edited)).is_some(), "edited");
+        let committed = UiMsg::Snapshot {
+            snap: Arc::new(Snapshot {
+                oid: Some("c2".into()),
+                ..Snapshot::default()
+            }),
+            events: vec![],
+            changed: vec![],
+        };
+        assert!(detail_req(&a.handle(committed)).is_some(), "committed");
+    }
+
+    #[test]
     fn keyboard_navigation_over_nav_items() {
         let mut a = app();
         a.nav = vec![
@@ -1002,6 +1067,7 @@ mod tests {
                 x: ' ',
                 y: 'M',
                 counts: crate::model::Counts::lines(*n, 0),
+                modified: None,
             })
             .collect();
         let event = ActivityEvent {

@@ -123,16 +123,19 @@ jobs:
       - name: Regenerate formula and push to dfallman/homebrew-tap
         env:
           # Fine-grained PAT with contents:write on dfallman/homebrew-tap.
-          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
-          if [ -z "$TAP_TOKEN" ]; then
+          if [ -z "$GH_TOKEN" ]; then
             echo "TAP_GITHUB_TOKEN secret not set; skipping tap update."
             exit 0
           fi
           tag="${GITHUB_REF_NAME}"
           sha() { sha256sum "artifacts/gitst-${tag}-$1.tar.gz" | cut -d' ' -f1; }
 
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/dfallman/homebrew-tap.git" tap
+          # git asks gh for the token, so it is never in a URL, a command
+          # line, or a log line that echoes either.
+          gh auth setup-git
+          gh repo clone dfallman/homebrew-tap tap -- --quiet
           mkdir -p tap/Formula
           cat > tap/Formula/gitst.rb << EOF
           # typed: false
