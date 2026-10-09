@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.12 (2026-10-09)
 
 ### Security
 
