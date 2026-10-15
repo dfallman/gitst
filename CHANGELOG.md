@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The version no longer goes up with each commit. `scripts/release.sh`
+  bumps it (minor by default), tags the release, and pushes it.
+
+## 0.1.14 (2026-10-15)
+
+### Added
+
+- Each change shows how long ago its file was last written, at the right
+  of its row like the ages in Activity, until the path would run short.
+- The top line starts with the repository's folder name, when there is
+  room: `gitst · main`.
+- The help box shows the version in its title.
+
+### Changed
+
+- The fold triangles are larger: `▼` and `▶`.
+- Ages are redrawn as they change, each second under a minute, instead of
+  up to 30 seconds late. Without a file watcher, polling keeps its own
+  pace, so this does not run git more often.
+
 ## 0.1.13 (2026-10-09)
 
 ### Security

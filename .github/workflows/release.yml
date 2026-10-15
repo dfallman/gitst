@@ -2,9 +2,10 @@ name: Release
 
 # Builds gitst for macOS, Linux and Windows and attaches the binaries to a
 # GitHub release, then updates the Homebrew formula in dfallman/homebrew-tap,
-# whenever a version tag (X.Y.Z, no "v") is pushed:
+# whenever a version tag (X.Y.Z, no "v") is pushed. scripts/release.sh
+# bumps the version, tags it, and pushes both:
 #
-#   git tag 0.1.1 && git push origin 0.1.1
+#   scripts/release.sh            # or: patch, major, X.Y.Z
 #
 # The tag must match the version in Cargo.toml.
 
@@ -55,8 +56,8 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build (release)
-        # --locked works because the pre-commit hook (.githooks) keeps
-        # Cargo.lock's gitst version in step with Cargo.toml.
+        # --locked works because scripts/release.sh bumps Cargo.lock's
+        # gitst version along with Cargo.toml's.
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
