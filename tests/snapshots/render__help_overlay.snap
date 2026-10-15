@@ -1,26 +1,26 @@
 ---
 source: tests/render.rs
-expression: "draw(&mut app, 44, 22)"
+expression: unversioned(&out)
 ---
- main ↑2 ↓0 ●                          ↻ 2m 
+ spritz · main ↑2 ↓0 ●                 ↻ 2m 
  origin/main · v0.1.9+4 · stash 1           
-╭ ▾ Changes (5) ────────────────── +64 −12 ╮
-│ ?╭ gitst ─────────────────────────────╮  │
+╭ ▼ Changes (5) ────────────────── +64 −12 ╮
+│ ?╭─────────── gitst xxxxxx ───────────╮  │
 │  │ click       open · fold · button   │  │
 │  │ wheel       scroll                 │  │
 │  │                                    │  │
 │ A│ j k ↑ ↓     move                   │  │
 ╰──│ enter l     open · fold            │──╯
-╭ ▾│ esc h       clear selection        │──╮
+╭ ▼│ esc h       clear selection        │──╮
 │ 0│ tab         next section           │m │
 │ 0│ space       fold section           │h │
 │ 0│ g G         top / bottom           │h │
 │ 0│ s           possible secrets       │h │
 ╰──│ f           fetch now              │──╯
-╭ ▾│ ?           close help             │2 ╮
+╭ ▼│ ?           close help             │2 ╮
 │ 4│ q           quit                   │m │
 │ +╰────────────────────────────────────╯  │
 ╰──────────────────────────────────────────╯
-  ▸ Branches (4)                            
-  ▸ Stashes (1)                             
+  ▶ Branches (4)                            
+  ▶ Stashes (1)                             
  ? help  f fetch  q quit

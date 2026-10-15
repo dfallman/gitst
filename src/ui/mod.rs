@@ -4,7 +4,7 @@ pub mod fmt;
 pub mod layout;
 pub mod theme;
 
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -14,7 +14,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, App, STALE_LOCK, Target};
 use crate::model::{Head, Leak, LeakSource, RepoOp, Snapshot};
-use fmt::{rel_age, truncate_right, width};
+use fmt::{age_changes_in, rel_age, truncate_right, width};
 use layout::Density;
 use theme::Theme;
 
@@ -26,6 +26,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     app.nav.clear();
     app.row_targets.clear();
     app.detail_targets.clear();
+    app.age_wake.set(None);
     let area = f.area();
     if area.width == 0 || area.height == 0 {
         return;
@@ -129,10 +130,26 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     }
 }
 
-fn now_secs(app: &App) -> i64 {
-    app.now
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+/// `rel_age` of a unix time as of `app.now`, noting when it next changes.
+pub(crate) fn age_of(app: &App, unix: i64) -> String {
+    let since = app.now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    age(app, since.as_secs() as i64 - unix, since.subsec_nanos())
+}
+
+/// `rel_age` of a measured time, noting when it next changes.
+pub(crate) fn age_for(app: &App, d: Duration) -> String {
+    age(app, d.as_secs() as i64, d.subsec_nanos())
+}
+
+/// `rel_age(secs)`, bringing `app.age_wake` forward to when it next reads
+/// differently. The age is `nanos` into its current second.
+fn age(app: &App, secs: i64, nanos: u32) -> String {
+    // A little after the change, so the redraw does not land just before it.
+    let next = Duration::from_secs(age_changes_in(secs) as u64) + Duration::from_millis(10)
+        - Duration::from_nanos(nanos.into());
+    app.age_wake
+        .set(Some(app.age_wake.get().map_or(next, |w| w.min(next))));
+    rel_age(secs)
 }
 
 /// `1 possible secret`, `3 possible secrets`.
@@ -248,7 +265,7 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
             format!("{} fetch", SPINNER[(millis / 100) as usize % SPINNER.len()])
         } else {
             match snap.last_fetch.and_then(|t| app.now.duration_since(t).ok()) {
-                Some(age) => format!("↻ {}", rel_age(age.as_secs() as i64)),
+                Some(age) => format!("↻ {}", age_for(app, age)),
                 None if snap.last_fetch.is_some() => "↻ now".into(),
                 None => "↻ –".into(),
             }
@@ -274,7 +291,19 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
             .clicks
             .push((Rect::new(r.x, r.y, 7.min(r.width), 1), Action::Back));
     } else {
-        left.extend(branch_spans(snap, theme));
+        let branch = branch_spans(snap, theme);
+        // The branch matters more, so the name goes first when room is short.
+        if let Some(name) = &app.repo_name {
+            let needed = 1 + width(name) + 3 + spans_width(&branch) + 1 + spans_width(&right);
+            if needed <= w {
+                left.push(Span::styled(
+                    name.clone(),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ));
+                left.push(Span::styled(" · ", theme.dim));
+            }
+        }
+        left.extend(branch);
     }
     if leak {
         left.push(Span::raw(" "));
@@ -396,10 +425,7 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
         out.push(line(format!("{conflicts} conflict{s}"), err));
     }
     if let Some(age) = app.lock_age().filter(|a| *a >= STALE_LOCK) {
-        out.push(line(
-            format!("index.lock held {}", rel_age(age.as_secs() as i64)),
-            warn,
-        ));
+        out.push(line(format!("index.lock held {}", age_for(app, age)), warn));
     }
     if let Some(e) = &app.fetch.last_error {
         out.push(line(format!("fetch failed: {}", e.label()), warn));

@@ -127,6 +127,10 @@ fn run(
         },
     );
     app.config_warning = warning;
+    app.repo_name = repo
+        .root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
     // Without a watcher, fall back to refreshing every few seconds.
     let (_watch, poll) = match watch::spawn(&repo, worker.sender()) {
         Ok(h) => (Some(h), None),
@@ -144,24 +148,31 @@ fn run(
     // Ages, the spinner and pulses change with time alone, so a redraw is
     // due by this time even if every message until then is one that does
     // not redraw, such as a pointer move.
+    // Polling keeps its own time, so redraws for ages, which can come each
+    // second, do not refresh any more often.
     let mut due = Instant::now();
+    let mut poll_due = poll.map(|p| Instant::now() + p);
     loop {
         if app.take_redraw() {
             app.now = SystemTime::now();
             terminal.draw(|f| ui::draw(f, &mut app, theme))?;
-            let wait = poll.map_or(app.next_wakeup(), |p| p.min(app.next_wakeup()));
-            due = Instant::now() + wait;
+            due = Instant::now() + app.next_wakeup();
         }
-        let first = match ui_rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+        let until = poll_due.map_or(due, |p| p.min(due));
+        let first = match ui_rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(m) => Some(m),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        if Instant::now() >= due {
+        let now = Instant::now();
+        if now >= due {
             app.redraw = true;
-            if poll.is_some() {
-                let _ = worker.send(WorkerMsg::Refresh);
-            }
+        }
+        if let (Some(p), Some(at)) = (poll, poll_due)
+            && now >= at
+        {
+            let _ = worker.send(WorkerMsg::Refresh);
+            poll_due = Some(now + p);
         }
         let mut quit = false;
         app.now = SystemTime::now();

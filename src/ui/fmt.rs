@@ -87,6 +87,49 @@ pub fn rel_age(secs: i64) -> String {
     }
 }
 
+/// Seconds until `rel_age(secs)` reads differently, as `secs` grows by one
+/// a second.
+pub fn age_changes_in(secs: i64) -> i64 {
+    const DAY: i64 = 86_400;
+    if secs < -60 {
+        // `in …` counts down: it changes as the age drops below the unit it
+        // shows, and becomes `now` once less than a minute ahead.
+        let ahead = secs.saturating_neg();
+        let unit = unit_of(ahead);
+        return (ahead % unit + 1).min(ahead - 60);
+    }
+    if secs < 10 {
+        return 10 - secs;
+    }
+    // A unit's count changes each unit, and the unit itself at the end of
+    // its range, which need not fall on a whole number of units.
+    let end = match secs {
+        s if s < 60 => 60,
+        s if s < 3600 => 3600,
+        s if s < DAY => DAY,
+        s if s < 7 * DAY => 7 * DAY,
+        s if s < 60 * DAY => 60 * DAY,
+        s if s < 365 * DAY => 365 * DAY,
+        _ => return 365 * DAY - secs % (365 * DAY),
+    };
+    let unit = unit_of(secs);
+    (unit - secs % unit).min(end - secs)
+}
+
+/// The unit `rel_age` counts a non-negative age in.
+fn unit_of(secs: i64) -> i64 {
+    const DAY: i64 = 86_400;
+    match secs {
+        s if s < 60 => 1,
+        s if s < 3600 => 60,
+        s if s < DAY => 3600,
+        s if s < 7 * DAY => DAY,
+        s if s < 60 * DAY => 7 * DAY,
+        s if s < 365 * DAY => 30 * DAY,
+        _ => 365 * DAY,
+    }
+}
+
 /// Local wall-clock `HH:MM` for a unix time.
 pub fn clock(unix: i64) -> String {
     match Local.timestamp_opt(unix, 0) {
@@ -154,6 +197,46 @@ mod tests {
         assert_eq!(rel_age(21 * 86400), "3w");
         assert_eq!(rel_age(90 * 86400), "3mo");
         assert_eq!(rel_age(800 * 86400), "2y");
+    }
+
+    #[test]
+    fn age_changes_exactly_when_its_label_does() {
+        const DAY: i64 = 86_400;
+        let starts = [
+            -400 * DAY,
+            -61 * DAY,
+            -8 * DAY,
+            -DAY - 5,
+            -3601,
+            -125,
+            -61,
+            -60,
+            0,
+            9,
+            10,
+            59,
+            60,
+            3599,
+            DAY - 1,
+            7 * DAY - 1,
+            60 * DAY - 1,
+            365 * DAY - 1,
+            400 * DAY,
+        ];
+        for s in starts {
+            let n = age_changes_in(s);
+            assert!(n >= 1, "{s}: {n}");
+            // Checking each second is too slow for the longest units.
+            if n <= 2 * DAY {
+                for k in 1..n {
+                    assert_eq!(rel_age(s + k), rel_age(s), "{s}+{k}");
+                }
+            }
+            assert_ne!(rel_age(s + n), rel_age(s), "{s}+{n}");
+        }
+        assert_eq!(age_changes_in(59 * DAY), DAY, "8w becomes 2mo");
+        assert!(age_changes_in(i64::MAX) >= 1);
+        assert!(age_changes_in(i64::MIN) >= 1);
     }
 
     #[test]

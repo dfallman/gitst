@@ -1,7 +1,7 @@
 //! The stacked, collapsible dashboard.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -9,10 +9,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 
-use super::fmt::{clock, rel_age, truncate_left};
+use super::fmt::{clock, truncate_left, width};
 use super::layout::{Density, SectionId, SectionReq, Slot, allocate};
 use super::theme::Theme;
-use super::{leak_marker, line_lr, now_secs, spans_width, truncate_spans};
+use super::{age_of, leak_marker, line_lr, spans_width, truncate_spans};
 use crate::activity::{ActivityKind, merged};
 use crate::app::{Action, App, NavItem, ScrollTarget, Target};
 use crate::model::{Change, Commit, Counts, Snapshot};
@@ -20,6 +20,10 @@ use crate::model::{Change, Commit, Counts, Snapshot};
 /// Most activity rows kept in the section.
 const ACTIVITY_ROWS: usize = 100;
 const METER_CELLS: usize = 5;
+/// Path cells a change row keeps before it gives up its age.
+const MIN_PATH: usize = 20;
+/// Cells set aside for a change's age: a space and up to `12mo`.
+const AGE_RESERVE: usize = 5;
 
 struct Row {
     line: Line<'static>,
@@ -253,7 +257,7 @@ fn pad_right(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
 
 fn title_spans(s: &Section, expanded: bool, theme: &Theme) -> Vec<Span<'static>> {
     let mut spans = vec![
-        Span::styled(if expanded { "▾ " } else { "▸ " }, theme.dim),
+        Span::styled(if expanded { "▼ " } else { "▶ " }, theme.dim),
         Span::styled(s.id.title(), Style::new().add_modifier(Modifier::BOLD)),
     ];
     if let Some(n) = s.count {
@@ -435,12 +439,28 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
         .filter(|l| l.source.oid().is_none())
         .map(|l| l.path.as_str())
         .collect();
+    // The age goes before the squares do: only while the path keeps room.
+    let fixed = 3 + stats_w + if d.stats { 1 + METER_CELLS } else { 0 } + 2;
+    let path_room = w.saturating_sub(fixed + 1);
+    let ages: Vec<Option<String>> = if d.ages && path_room >= MIN_PATH + AGE_RESERVE {
+        snap.changes
+            .iter()
+            .map(|c| {
+                let t = c.modified?.duration_since(UNIX_EPOCH).ok()?;
+                Some(age_of(app, t.as_secs() as i64))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let age_w = ages.iter().flatten().map(|a| width(a)).max();
     let ttl = Duration::from_secs(app.pulse_secs);
     let now = Instant::now();
     let mut rows: Vec<Row> = snap
         .changes
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let mut left = status_spans(c, theme);
             left.push(Span::raw(" "));
             let mut right = Vec::new();
@@ -470,6 +490,10 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
             };
             right.push(Span::raw(" "));
             right.push(pulse);
+            if let Some(age_w) = age_w {
+                let age = ages[i].as_deref().unwrap_or("");
+                right.push(Span::styled(format!(" {age:>age_w$}"), theme.dim));
+            }
             let display = match &c.orig_path {
                 Some(orig) => format!("{orig} → {}", c.path),
                 None => c.path.clone(),
@@ -543,7 +567,7 @@ fn activity(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> 
 
 fn age_span(time: i64, app: &App, theme: &Theme, d: Density) -> Vec<Span<'static>> {
     if d.ages {
-        vec![Span::styled(rel_age(now_secs(app) - time), theme.dim)]
+        vec![Span::styled(age_of(app, time), theme.dim)]
     } else {
         Vec::new()
     }

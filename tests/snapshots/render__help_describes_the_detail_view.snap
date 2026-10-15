@@ -1,10 +1,10 @@
 ---
 source: tests/render.rs
-expression: out
+expression: unversioned(&out)
 ---
  ‹ back  a                             ↻ 2m 
 ── Staged ──────────────────────────────────
-@@ ╭ gitst ─────────────────────────────╮╌╌╌
+@@ ╭─────────── gitst xxxxxx ───────────╮╌╌╌
 -us│ click       open · button          │   
 +us│ wheel       scroll                 │   
    │ right-click back                   │   

@@ -2,15 +2,15 @@
 source: tests/render.rs
 expression: "render(30, 12, fixture())"
 ---
- main ↑2 ↓0 ●            ↻ 2m 
- ▾ Changes (5) ────────────── 
+ spritz · main ↑2 ↓0 ●   ↻ 2m 
+ ▼ Changes (5) ────────────── 
  ?? notes.md                  
   D old.rs                    
  +3 more                      
- ▾ Activity ───────────────── 
+ ▼ Activity ───────────────── 
  04:43 commit 4de1e3c ico… 2m 
  +3 more                      
- ▸ Commits                 ↑2 
- ▸ Branches (4)               
- ▸ Stashes (1)                
+ ▶ Commits                 ↑2 
+ ▶ Branches (4)               
+ ▶ Stashes (1)                
  ? help  f fetch  q quit

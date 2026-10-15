@@ -38,6 +38,14 @@ fn ch(path: &str, x: char, y: char, a: u32, r: u32) -> Change {
     }
 }
 
+/// `c`, last written `secs_ago`.
+fn edited(c: Change, secs_ago: i64) -> Change {
+    Change {
+        modified: Some(UNIX_EPOCH + Duration::from_secs(at(secs_ago) as u64)),
+        ..c
+    }
+}
+
 fn commit(short: &str, subject: &str, ago: i64, unpushed: bool, refs: &[&str]) -> Commit {
     Commit {
         oid: format!("{short}0000000000000000000000000000000000"),
@@ -90,11 +98,11 @@ fn fixture() -> Snapshot {
         }),
         op: None,
         changes: vec![
-            ch("notes.md", '?', '?', 3, 0),
+            edited(ch("notes.md", '?', '?', 3, 0), 45),
             ch("old.rs", ' ', 'D', 0, 2),
-            ch("src/app.rs", ' ', 'M', 42, 7),
-            ch("src/git.rs", ' ', 'M', 9, 3),
-            ch("src/watch.rs", 'A', ' ', 10, 0),
+            edited(ch("src/app.rs", ' ', 'M', 42, 7), 120),
+            edited(ch("src/git.rs", ' ', 'M', 9, 3), 6 * 86_400),
+            edited(ch("src/watch.rs", 'A', ' ', 10, 0), 3600),
         ],
         changes_omitted: 0,
         commits: vec![
@@ -221,6 +229,7 @@ fn new_app(snap: Snapshot) -> App {
         },
     );
     app.now = UNIX_EPOCH + Duration::from_secs(NOW as u64);
+    app.repo_name = Some("spritz".into());
     app.handle(UiMsg::Snapshot {
         snap: Arc::new(snap),
         events: vec![],
@@ -245,6 +254,13 @@ fn draw(app: &mut App, w: u16, h: u16) -> String {
     let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
     t.draw(|f| gitst::ui::draw(f, app, &Theme::ansi())).unwrap();
     text(&t)
+}
+
+/// `out` with the app's version, which changes each release, masked at
+/// the same width so the snapshot stays put.
+fn unversioned(out: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    out.replace(version, &"x".repeat(version.len()))
 }
 
 fn render(w: u16, h: u16, snap: Snapshot) -> String {
@@ -411,7 +427,7 @@ fn click_on_title_folds_section() {
     let y = out.lines().position(|l| l.contains("Changes")).unwrap() as u16;
     app.handle(click(5, y));
     let out = draw(&mut app, 44, 28);
-    assert!(out.contains("▸ Changes"), "{out}");
+    assert!(out.contains("▶ Changes"), "{out}");
     assert!(!out.contains("src/app.rs"), "{out}");
 }
 
@@ -664,8 +680,10 @@ fn bidi_controls_in_paths_never_reach_the_terminal() {
     s.changes.insert(0, ch(path, '?', '?', 1, 0));
     s.leaks[0].path = path.into();
     let mut app = new_app(s);
+    app.repo_name = Some("re\u{202E}po".into());
     let out = draw(&mut app, 60, 20);
     assert!(out.contains("eviltxt.exe"), "{out}");
+    assert!(out.contains("repo · main"), "{out}");
     app.handle(key('s'));
     let out = draw(&mut app, 60, 20);
     assert!(out.contains("eviltxt.exe"), "{out}");
@@ -678,7 +696,12 @@ fn bidi_controls_in_paths_never_reach_the_terminal() {
 fn help_overlay() {
     let mut app = new_app(fixture());
     app.handle(key('?'));
-    insta::assert_snapshot!(draw(&mut app, 44, 22));
+    let out = draw(&mut app, 44, 22);
+    assert!(
+        out.contains(&format!(" gitst {} ", env!("CARGO_PKG_VERSION"))),
+        "{out}"
+    );
+    insta::assert_snapshot!(unversioned(&out));
     app.handle(click(1, 1));
     assert!(!app.help);
 }
@@ -851,7 +874,7 @@ fn help_describes_the_detail_view() {
     ));
     app.handle(key('?'));
     let out = draw(&mut app, 44, 22);
-    insta::assert_snapshot!(out);
+    insta::assert_snapshot!(unversioned(&out));
     assert!(out.contains("page down"), "{out}");
     assert!(!out.contains("fold section"), "{out}");
     assert!(!out.contains("next section"), "{out}");
@@ -1089,4 +1112,32 @@ fn skipped_scan_note_comes_last() {
         at("index.lock held") < at("⚠ secret scan skipped · 812 changes"),
         "{out}"
     );
+}
+
+#[test]
+fn ages_wake_the_ui_when_they_next_read_differently() {
+    let mut app = new_app(fixture());
+    // notes.md is 45s old, so it next changes in a second.
+    draw(&mut app, 120, 40);
+    let wake = app.next_wakeup();
+    assert!(
+        wake > Duration::from_millis(900) && wake <= Duration::from_millis(1010),
+        "{wake:?}"
+    );
+
+    // Half a second on, the redraw still lands just after the change.
+    app.now += Duration::from_millis(500);
+    draw(&mut app, 120, 40);
+    let wake = app.next_wakeup();
+    assert!(wake <= Duration::from_millis(510), "{wake:?}");
+
+    // With everything old, ages wait no longer than the idle redraw.
+    let mut s = fixture();
+    s.changes.clear();
+    s.commits.clear();
+    s.reflog.clear();
+    s.last_fetch = None;
+    let mut app = new_app(s);
+    draw(&mut app, 120, 40);
+    assert_eq!(app.next_wakeup(), Duration::from_secs(30));
 }

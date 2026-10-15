@@ -1,6 +1,7 @@
 //! UI state and input handling. Drawing fills in the hit map and navigation
 //! list; input is resolved against whatever was drawn last.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -155,6 +156,8 @@ pub struct App {
     pub snap: Option<Arc<Snapshot>>,
     pub error: Option<String>,
     pub config_warning: Option<String>,
+    /// The work tree's folder name, shown before the branch.
+    pub repo_name: Option<String>,
     pub fetch: FetchStatus,
     pub live: Vec<ActivityEvent>,
     pub pulses: HashMap<String, Instant>,
@@ -185,6 +188,8 @@ pub struct App {
     pub detail_targets: Vec<Option<Target>>,
     /// Filled by draw: rows of the section or detail body, for paging.
     pub page: usize,
+    /// Filled by draw: how long until an age on screen reads differently.
+    pub age_wake: Cell<Option<Duration>>,
     /// Whether something on screen may have changed since the last draw.
     pub redraw: bool,
 }
@@ -218,6 +223,7 @@ impl App {
             snap: None,
             error: None,
             config_warning: None,
+            repo_name: None,
             fetch,
             live: Vec::new(),
             pulses: HashMap::new(),
@@ -238,6 +244,7 @@ impl App {
             row_targets: HashMap::new(),
             detail_targets: Vec::new(),
             page: 10,
+            age_wake: Cell::new(None),
             redraw: true,
         }
     }
@@ -341,6 +348,7 @@ impl App {
             .filter(|a| *a < STALE_LOCK)
             .map(|a| (STALE_LOCK - a).max(Duration::from_millis(200)));
         let wake = self.base_wakeup(ttl);
+        let wake = self.age_wake.get().map_or(wake, |a| a.min(wake));
         lock.map_or(wake, |l| l.min(wake))
     }
 

@@ -9,10 +9,10 @@ use ratatui::widgets::{
 };
 
 use super::dashboard::{commit_row, meter, row, stats_spans};
-use super::fmt::{clock, clusters, rel_age, truncate_left, width};
+use super::fmt::{clock, clusters, truncate_left, width};
 use super::layout::Density;
 use super::theme::Theme;
-use super::{now_secs, spans_width};
+use super::{age_of, spans_width};
 use crate::app::{App, ScrollTarget, Target};
 use crate::model::{
     Commit, CommitDetail, DetailData, DiffBlock, DiffKind, Leak, LeakSource, Snapshot,
@@ -225,11 +225,7 @@ fn commit_lines(
         Span::styled(" commit ", theme.dim),
         Span::styled(c.oid.clone(), Style::new().fg(theme.modified)),
     ])));
-    let when = format!(
-        " · {} ago · {}",
-        rel_age(now_secs(app) - c.time),
-        clock(c.time)
-    );
+    let when = format!(" · {} ago · {}", age_of(app, c.time), clock(c.time));
     out.push(plain(Line::from(vec![
         Span::raw(format!(" {}", c.author)),
         Span::styled(when, theme.dim),
@@ -525,10 +521,13 @@ pub fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.accent))
-        .title(Span::styled(
-            " gitst ",
-            Style::new().add_modifier(Modifier::BOLD),
-        ));
+        .title(
+            Line::from(Span::styled(
+                concat!(" gitst ", env!("CARGO_PKG_VERSION"), " "),
+                Style::new().add_modifier(Modifier::BOLD),
+            ))
+            .centered(),
+        );
     let inner = block.inner(r);
     f.render_widget(Clear, r);
     f.render_widget(block, r);
