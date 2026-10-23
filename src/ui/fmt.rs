@@ -69,6 +69,45 @@ pub fn truncate_right(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Wraps `s` at spaces into at most `lines` lines of `max` cells, breaking
+/// a word only when it alone is wider. Text past the last line is cut,
+/// and that line ends in `…`.
+pub fn wrap_words(s: &str, max: usize, lines: usize) -> Vec<String> {
+    let (max, lines) = (max.max(1), lines.max(1));
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0;
+    for word in s.split(' ').filter(|w| !w.is_empty()) {
+        let w = width(word);
+        if used > 0 && used + 1 + w <= max {
+            cur.push(' ');
+            cur.push_str(word);
+            used += 1 + w;
+            continue;
+        }
+        if used > 0 {
+            out.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        for (_, g, gw) in clusters(word) {
+            if used + gw > max && used > 0 {
+                out.push(std::mem::take(&mut cur));
+                used = 0;
+            }
+            cur.push_str(g);
+            used += gw;
+        }
+    }
+    if used > 0 || out.is_empty() {
+        out.push(cur);
+    }
+    if out.len() > lines {
+        let rest = out.split_off(lines - 1).join(" ");
+        out.push(truncate_right(&rest, max));
+    }
+    out
+}
+
 /// Compact age: `now`, `45s`, `12m`, `3h`, `2d`, `5w`, `3mo`, `2y`. A time
 /// more than a minute ahead, after the clock was set back, is `in 3h`;
 /// less is clock skew, and `now`.
@@ -159,6 +198,27 @@ mod tests {
         assert!(t.ends_with(".md"));
         assert!(width(&truncate_left("🎉🎉🎉/🎉🎉🎉🎉.md", 5)) <= 5);
         assert!(width(&truncate_left("日本語", 1)) <= 1);
+    }
+
+    #[test]
+    fn wrap_words_breaks_at_spaces_and_cuts_the_last_line() {
+        assert_eq!(
+            wrap_words("fetch failed: offline", 30, 3),
+            ["fetch failed: offline"]
+        );
+        assert_eq!(
+            wrap_words("config.toml: ignored colour, fetch_interval", 20, 3),
+            ["config.toml: ignored", "colour,", "fetch_interval"]
+        );
+        assert_eq!(
+            wrap_words("one two three four five six", 9, 2),
+            ["one two", "three fo…"]
+        );
+        assert_eq!(wrap_words("abcdefgh", 3, 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap_words("", 10, 3), [""]);
+        for line in wrap_words(&"日本語 ".repeat(9), 5, 3) {
+            assert!(width(&line) <= 5, "{line:?}");
+        }
     }
 
     #[test]

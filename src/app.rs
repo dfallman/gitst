@@ -93,6 +93,8 @@ pub enum Action {
     Help,
     Quit,
     ToggleWrap,
+    /// Hides these warnings until they change.
+    Clear(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +158,11 @@ pub struct App {
     pub snap: Option<Arc<Snapshot>>,
     pub error: Option<String>,
     pub config_warning: Option<String>,
+    /// Warnings cleared from view, by key. A key is dropped once its
+    /// warning is gone, so the warning shows again if it comes back.
+    pub cleared: HashSet<String>,
+    /// Filled by draw: keys of the warnings that `c` clears.
+    pub clearable: Vec<String>,
     /// The work tree's folder name, shown before the branch.
     pub repo_name: Option<String>,
     pub fetch: FetchStatus,
@@ -223,6 +230,8 @@ impl App {
             snap: None,
             error: None,
             config_warning: None,
+            cleared: HashSet::new(),
+            clearable: Vec::new(),
             repo_name: None,
             fetch,
             live: Vec::new(),
@@ -444,6 +453,10 @@ impl App {
                 self.wrap = !self.wrap;
                 Vec::new()
             }
+            Action::Clear(keys) => {
+                self.cleared.extend(keys);
+                Vec::new()
+            }
         }
     }
 
@@ -482,6 +495,7 @@ impl App {
             KeyCode::Char('f') => return self.perform(Action::Fetch),
             KeyCode::Char('?') => return self.perform(Action::Help),
             KeyCode::Char('s') => return self.open_leaks(),
+            KeyCode::Char('c') => return self.perform(Action::Clear(self.clearable.clone())),
             _ => {}
         }
         if self.stack.is_empty() {

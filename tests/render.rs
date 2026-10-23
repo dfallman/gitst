@@ -475,13 +475,123 @@ fn warnings_past_the_last_row_share_it() {
         last_error: Some(gitst::git::FetchError::Offline),
         ..FetchStatus::default()
     }));
-    let out = draw(&mut app, 80, 20);
-    let rows: Vec<&str> = out.lines().skip(2).take(2).collect();
+    // Room for two warning rows.
+    let out = draw(&mut app, 80, 10);
+    let rows: Vec<&str> = out.lines().skip(1).take(2).collect();
     assert!(rows[0].contains("3 possible secrets"), "{out}");
     assert!(
         rows[1].contains("index file corrupt · 1 conflict · fetch failed: offline"),
         "{out}"
     );
+}
+
+const LONG_WARNING: &str = "config.toml: ignored colour, fetch_interval, \
+    pulse_secs, collapsed \"branchess\", leak_allow \"a{b\" (invalid), \
+    icons (invalid), show_ages, theme";
+
+#[test]
+fn a_long_warning_wraps_onto_spare_rows() {
+    let mut app = new_app(fixture());
+    app.config_warning = Some(LONG_WARNING.into());
+    let out = draw(&mut app, 44, 20);
+    let rows: Vec<&str> = out.lines().skip(2).take(4).collect();
+    assert!(
+        rows[0].starts_with(" ⚠ config.toml: ignored colour,"),
+        "{out}"
+    );
+    assert!(
+        rows[1].starts_with("   fetch_interval, pulse_secs,"),
+        "{out}"
+    );
+    assert!(rows[2].trim_end().ends_with('…'), "{out}");
+    assert!(rows[3].starts_with('╭'), "{out}");
+    // With one row, it is cut there.
+    let out = draw(&mut app, 44, 6);
+    let row = out.lines().nth(1).unwrap();
+    let next = out.lines().nth(2).unwrap();
+    assert!(
+        row.trim_end().ends_with('…') && !next.starts_with("   "),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_wrapped_warning_leaves_rows_for_the_others() {
+    let mut s = fixture();
+    s.changes.insert(0, ch("conflict.rs", 'U', 'U', 3, 1));
+    let mut app = new_app(s);
+    app.config_warning = Some(LONG_WARNING.into());
+    let out = draw(&mut app, 44, 20);
+    let rows: Vec<&str> = out.lines().skip(2).take(3).collect();
+    assert!(rows[0].contains("1 conflict"), "{out}");
+    assert!(rows[1].starts_with(" ⚠ config.toml"), "{out}");
+    assert!(
+        rows[2].starts_with("   fetch_interval") && rows[2].trim_end().ends_with('…'),
+        "{out}"
+    );
+}
+
+#[test]
+fn c_clears_warnings_until_they_change() {
+    let mut s = leaky();
+    s.changes.insert(0, ch("conflict.rs", 'U', 'U', 3, 1));
+    let mut app = new_app(s);
+    app.config_warning = Some("config.toml: ignored colour".into());
+    let out = draw(&mut app, 80, 20);
+    assert!(
+        out.contains("1 conflict") && out.contains("c clear"),
+        "{out}"
+    );
+    app.handle(key('c'));
+    let out = draw(&mut app, 80, 20);
+    assert!(
+        !out.contains("1 conflict") && !out.contains("ignored colour"),
+        "{out}"
+    );
+    assert!(!out.contains("c clear"), "{out}");
+    // The secrets band stays.
+    assert!(out.contains("3 possible secrets"), "{out}");
+
+    // A failed fetch is new, so it shows; once fetching works again and
+    // then fails, it shows again after being cleared.
+    let offline = || {
+        UiMsg::Fetch(FetchStatus {
+            last_error: Some(gitst::git::FetchError::Offline),
+            ..FetchStatus::default()
+        })
+    };
+    app.handle(offline());
+    assert!(draw(&mut app, 80, 20).contains("fetch failed: offline"));
+    app.handle(key('c'));
+    assert!(!draw(&mut app, 80, 20).contains("fetch failed"));
+    app.handle(offline());
+    assert!(!draw(&mut app, 80, 20).contains("fetch failed"));
+    app.handle(UiMsg::Fetch(FetchStatus::default()));
+    draw(&mut app, 80, 20);
+    app.handle(offline());
+    assert!(draw(&mut app, 80, 20).contains("fetch failed: offline"));
+}
+
+#[test]
+fn clicking_a_warning_clears_only_that_one() {
+    let mut s = fixture();
+    s.changes.insert(0, ch("conflict.rs", 'U', 'U', 3, 1));
+    let mut app = new_app(s);
+    app.config_warning = Some("config.toml: ignored colour".into());
+    app.handle(UiMsg::RefreshError("index file corrupt".into()));
+    let out = draw(&mut app, 80, 20);
+    let rows: Vec<&str> = out.lines().skip(2).take(2).collect();
+    assert!(rows[0].contains("index file corrupt"), "{out}");
+    assert!(rows[1].contains("1 conflict"), "{out}");
+    // The refresh error cannot be cleared.
+    app.handle(click(5, 2));
+    app.handle(click(5, 3));
+    let out = draw(&mut app, 80, 20);
+    assert!(
+        out.contains("index file corrupt") && !out.contains("1 conflict"),
+        "{out}"
+    );
+    assert!(out.contains("ignored colour"), "{out}");
 }
 
 /// How many cells of a `w`×`h` draw are dimmed.

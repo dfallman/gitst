@@ -17,10 +17,10 @@ expression: unversioned(&out)
    │ g G         top / bottom           │   
    │ w           wrap long lines        │   
    │ s           possible secrets       │   
+   │ c           clear warnings         │   
    │ f           fetch now              │   
    │ ?           close help             │   
    │ q           quit                   │   
    ╰────────────────────────────────────╯   
-                                            
                                             
  esc back  w wrap  q quit

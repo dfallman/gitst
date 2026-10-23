@@ -50,7 +50,13 @@ The dashboard has five sections:
 
 Warnings appear under the header for possible secrets, conflicts, an
 `index.lock` held for more than 10 seconds, failed fetches, and config errors.
-When there are more than fit, the last row lists the rest.
+A long warning wraps onto up to three rows when there is room. When there are
+more than fit, the last row lists the rest.
+
+Press `c`, or click a warning, to clear it. A cleared warning shows again if
+it changes, or goes away and comes back. The secrets band cannot be cleared,
+and neither can a failed refresh, which explains why the panes below are
+dimmed.
 
 ### Secret warnings
 
@@ -90,6 +96,7 @@ warning says so, and the last findings stay.
   right-click to return.
 - **Click** a section title to fold it. The **wheel** scrolls what is under the pointer.
 - **Click** `↻` (or press `f`) to fetch now.
+- **Click** a warning to clear it.
 
 ### Keys
 
@@ -105,6 +112,7 @@ warning says so, and the last findings stay.
 | `w` | | wrap long lines |
 | `f` | fetch now | fetch now |
 | `s` | possible secrets | possible secrets |
+| `c` | clear warnings | clear warnings |
 | `?` | help | help |
 | `q` / `Ctrl-C` | quit | quit |
 | `Ctrl-Z` | suspend (`fg` resumes; not on Windows) | suspend |

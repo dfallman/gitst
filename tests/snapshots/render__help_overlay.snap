@@ -16,11 +16,11 @@ expression: unversioned(&out)
 │ 0│ space       fold section           │h │
 │ 0│ g G         top / bottom           │h │
 │ 0│ s           possible secrets       │h │
-╰──│ f           fetch now              │──╯
-╭ ▼│ ?           close help             │2 ╮
-│ 4│ q           quit                   │m │
-│ +╰────────────────────────────────────╯  │
-╰──────────────────────────────────────────╯
+╰──│ c           clear warnings         │──╯
+╭ ▼│ f           fetch now              │2 ╮
+│ 4│ ?           close help             │m │
+│ +│ q           quit                   │  │
+╰──╰────────────────────────────────────╯──╯
   ▶ Branches (4)                            
   ▶ Stashes (1)                             
  ? help  f fetch  q quit

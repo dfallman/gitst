@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `c` clears the warnings under the header, and clicking a warning clears
+  that one. A cleared warning shows again if it changes, or goes away and
+  comes back. The secrets band and a failed refresh cannot be cleared.
+
+### Changed
+
+- A long warning wraps onto up to three rows, when there are rows to
+  spare, instead of being cut off at the end of one. A pane at least 12
+  rows tall has room for three warning rows, up from two.
+
 ## 0.1.15 (2026-10-15)
 
 ### Changed

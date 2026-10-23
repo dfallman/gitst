@@ -21,4 +21,4 @@ expression: "render(44, 20, s)"
 ╰──────────────────────────────────────────╯
   ▶ Branches (4)                            
   ▶ Stashes (1)                             
- ? help  f fetch  q quit
+ ? help  f fetch  c clear  q quit

@@ -14,11 +14,13 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, App, STALE_LOCK, Target};
 use crate::model::{Head, Leak, LeakSource, RepoOp, Snapshot};
-use fmt::{age_changes_in, rel_age, truncate_right, width};
+use fmt::{age_changes_in, rel_age, truncate_right, width, wrap_words};
 use layout::Density;
 use theme::Theme;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Most rows a long warning wraps onto.
+const WARNING_LINES: usize = 3;
 
 /// Draws the whole UI and records the hit map for the next input.
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
@@ -26,6 +28,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     app.nav.clear();
     app.row_targets.clear();
     app.detail_targets.clear();
+    app.clearable.clear();
     app.age_wake.set(None);
     let area = f.area();
     if area.width == 0 || area.height == 0 {
@@ -54,6 +57,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     let mut y = area.y;
     let mut left = area.height;
     let max_warnings = match area.height {
+        h if h >= 12 => 3,
         h if h >= 8 => 2,
         h if h >= 5 => 1,
         _ => 0,
@@ -83,19 +87,41 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     let mut band = None;
     let mut error_shown = false;
     let rows = max_warnings.min((left - hint_rows) as usize);
-    for w in fit_warnings(warnings(app, &snap, theme, area.width as usize), rows) {
-        let r = Rect::new(area.x, y, area.width, 1);
-        f.render_widget(
-            Paragraph::new(fit_line(w.line, area.width as usize)).style(w.fill),
-            r,
-        );
+    let mut all = warnings(app, &snap, theme, area.width as usize);
+    // A cleared warning that has gone shows again if it comes back.
+    app.cleared
+        .retain(|k| all.iter().any(|w| w.key.as_ref() == Some(k)));
+    all.retain(|w| !w.key.as_ref().is_some_and(|k| app.cleared.contains(k)));
+    app.clearable = all.iter().filter_map(|w| w.key.clone()).collect();
+    for w in &mut all {
+        if let Some(k) = &w.key {
+            w.action = Some(Action::Clear(vec![k.clone()]));
+        }
+    }
+    let shown = fit_warnings(all, rows);
+    // Rows the warnings leave free let a long one wrap.
+    let mut spare = rows - shown.len();
+    for w in shown {
+        let lines = match &w.text {
+            Some((text, style)) => {
+                let max = 1 + spare.min(WARNING_LINES - 1);
+                let lines = warning_lines(text, *style, area.width as usize, max);
+                spare -= lines.len() - 1;
+                lines
+            }
+            None => vec![fit_line(w.line, area.width as usize)],
+        };
+        let r = Rect::new(area.x, y, area.width, lines.len() as u16);
+        f.render_widget(Paragraph::new(lines).style(w.fill), r);
         if let Some(action) = w.action {
+            if matches!(action, Action::Open(_)) {
+                band = Some(r);
+            }
             app.hits.clicks.push((r, action));
-            band = Some(r);
         }
         error_shown |= w.error;
-        y += 1;
-        left -= 1;
+        y += r.height;
+        left -= r.height;
     }
 
     let body = Rect::new(area.x, y, area.width, left - hint_rows);
@@ -353,6 +379,9 @@ struct Warning {
     text: Option<(String, Style)>,
     /// The refresh error: the body below is stale.
     error: bool,
+    /// What clearing it remembers; `None` for the secrets band and the
+    /// refresh error, which cannot be cleared.
+    key: Option<String>,
 }
 
 /// Fits `warnings` into `rows`: when there are more, the last row carries
@@ -372,17 +401,35 @@ fn fit_warnings(mut warnings: Vec<Warning>, rows: usize) -> Vec<Warning> {
                 .iter()
                 .filter_map(|w| w.text.as_ref().map(|t| t.0.as_str()))
                 .collect();
+            let keys: Vec<String> = rest.iter().filter_map(|w| w.key.clone()).collect();
             warnings.push(Warning {
                 line: Line::from(Span::styled(format!(" ⚠ {}", joined.join(" · ")), style)),
                 fill: Style::new(),
-                action: None,
+                action: (!keys.is_empty()).then_some(Action::Clear(keys)),
                 text: None,
                 error: rest.iter().any(|w| w.error),
+                key: None,
             });
         }
         None => {}
     }
     warnings
+}
+
+/// `text` after the warning glyph, wrapped onto at most `max` rows of
+/// `cols` cells, the later rows lined up under the first.
+fn warning_lines(text: &str, style: Style, cols: usize, max: usize) -> Vec<Line<'static>> {
+    wrap_words(text, cols.saturating_sub(3), max)
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let lead = if i == 0 { " ⚠ " } else { "   " };
+            fit_line(
+                Line::from(Span::styled(format!("{lead}{part}"), style)),
+                cols,
+            )
+        })
+        .collect()
 }
 
 fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warning> {
@@ -392,6 +439,7 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
         line: Line::from(Span::styled(format!(" ⚠ {text}"), style)),
         fill: Style::new(),
         action: None,
+        key: Some(text.clone()),
         text: Some((text, style)),
         error: false,
     };
@@ -404,12 +452,14 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
             action: Some(Action::Open(Target::Leaks)),
             text: None,
             error: false,
+            key: None,
         });
     }
     // Next, so that it is never what a shared row cuts off.
     if let Some(e) = &app.error {
         out.push(Warning {
             error: true,
+            key: None,
             ..line(e.clone(), err)
         });
     }
@@ -425,7 +475,11 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
         out.push(line(format!("{conflicts} conflict{s}"), err));
     }
     if let Some(age) = app.lock_age().filter(|a| *a >= STALE_LOCK) {
-        out.push(line(format!("index.lock held {}", age_for(app, age)), warn));
+        // Keyed without the age, which changes each second.
+        out.push(Warning {
+            key: Some("index.lock".into()),
+            ..line(format!("index.lock held {}", age_for(app, age)), warn)
+        });
     }
     if let Some(e) = &app.fetch.last_error {
         out.push(line(format!("fetch failed: {}", e.label()), warn));
@@ -440,23 +494,26 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
 }
 
 fn hint_bar(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
-    let items: &[(&str, &str, Action)] = if app.stack.is_empty() {
-        &[
+    let mut items: Vec<(&str, &str, Action)> = if app.stack.is_empty() {
+        vec![
             ("?", "help", Action::Help),
             ("f", "fetch", Action::Fetch),
             ("q", "quit", Action::Quit),
         ]
     } else {
-        &[
+        vec![
             ("esc", "back", Action::Back),
             ("w", "wrap", Action::ToggleWrap),
             ("q", "quit", Action::Quit),
         ]
     };
+    if !app.clearable.is_empty() {
+        items.insert(2, ("c", "clear", Action::Clear(app.clearable.clone())));
+    }
     let key_style = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
     let mut x = 0usize;
-    for (key, label, action) in items {
+    for (key, label, action) in &items {
         let item_w = 1 + width(key) + 1 + width(label) + 1;
         if x + item_w > r.width as usize {
             break;
