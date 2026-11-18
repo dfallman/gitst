@@ -19,9 +19,8 @@ use crate::worker::{FetchStatus, UiMsg, WorkerMsg};
 use crate::write::ShownHunk;
 
 mod write_flow;
-
-pub(crate) use write_flow::staged_only;
 pub use write_flow::{InputPurpose, Prompt, WriteAction, WriteState};
+pub(crate) use write_flow::{count, staged_only};
 
 /// An `index.lock` older than this is reported.
 pub const STALE_LOCK: Duration = Duration::from_secs(10);
@@ -49,6 +48,17 @@ pub enum Target {
     Leaks,
     /// The last failed write action's output, drawn from the failure.
     Output,
+    /// What a push would send. Pinned: drawn from the push plan being
+    /// confirmed, and never reloaded.
+    Outgoing {
+        pinned: bool,
+    },
+    /// One file's diff across an outgoing range.
+    RangeFile {
+        base: String,
+        oid: String,
+        path: String,
+    },
 }
 
 impl Target {
@@ -76,6 +86,12 @@ impl Target {
             },
             Target::Leaks => DetailReq::Leaks,
             Target::Output => DetailReq::Output,
+            Target::Outgoing { .. } => DetailReq::Outgoing,
+            Target::RangeFile { base, oid, path } => DetailReq::RangeFile {
+                base: base.clone(),
+                oid: oid.clone(),
+                path: path.clone(),
+            },
         }
     }
 
@@ -90,6 +106,8 @@ impl Target {
             Target::Stash(i) => format!("stash@{{{i}}}"),
             Target::Leaks => "possible secrets".into(),
             Target::Output => "output".into(),
+            Target::Outgoing { .. } => "outgoing".into(),
+            Target::RangeFile { path, .. } => path.clone(),
         }
     }
 }
@@ -172,6 +190,12 @@ impl DetailView {
             Some(Ok(DetailData::File { blocks: b, .. } | DetailData::CommitFile(b))) => Some(b),
             _ => None,
         }
+    }
+
+    /// Whether the view shows a push plan's outgoing range: it keeps the
+    /// data it opened with.
+    pub fn pinned(&self) -> bool {
+        self.target == Target::Outgoing { pinned: true }
     }
 
     /// Whether the file has a `filter` attribute.
@@ -307,10 +331,14 @@ pub struct App {
 
 /// Whether an open view of `req` may be out of date once `next` replaces
 /// `prev`, with `changed` the paths whose status, counts, or contents moved.
-/// Commits, commit files, and stashes never change.
+/// Commits, commit files, stashes, and range diffs never change. A pinned
+/// Outgoing view is never reloaded, whatever this says.
 fn stale(req: &DetailReq, prev: Option<&Snapshot>, next: &Snapshot, changed: &[String]) -> bool {
     let Some(prev) = prev else {
-        return matches!(req, DetailReq::File { .. } | DetailReq::Branch { .. });
+        return matches!(
+            req,
+            DetailReq::File { .. } | DetailReq::Branch { .. } | DetailReq::Outgoing
+        );
     };
     match req {
         DetailReq::File { path } => {
@@ -319,6 +347,9 @@ fn stale(req: &DetailReq, prev: Option<&Snapshot>, next: &Snapshot, changed: &[S
         }
         DetailReq::Branch { .. } => {
             prev.oid != next.oid || prev.branches != next.branches || prev.reflog != next.reflog
+        }
+        DetailReq::Outgoing => {
+            prev.oid != next.oid || prev.head != next.head || prev.upstream != next.upstream
         }
         _ => false,
     }
@@ -411,6 +442,7 @@ impl App {
                 let reload = self
                     .stack
                     .last()
+                    .filter(|v| !v.pinned())
                     .filter(|v| stale(&v.req, self.snap.as_deref(), &snap, &changed))
                     .map(|v| v.req.clone());
                 self.snap = Some(snap);
@@ -445,7 +477,13 @@ impl App {
                 Vec::new()
             }
             UiMsg::Detail(req, data) => {
-                for v in self.stack.iter_mut().filter(|v| v.req == req) {
+                // A pinned view keeps the plan's data, even if a browse
+                // load of the same request lands while it is open.
+                for v in self
+                    .stack
+                    .iter_mut()
+                    .filter(|v| v.req == req && !v.pinned())
+                {
                     v.data = Some(data.clone());
                     v.place_cursor();
                 }
@@ -533,17 +571,7 @@ impl App {
                 let req = target.request();
                 // The leaks view draws from the snapshot; nothing to load.
                 let load = req != DetailReq::Leaks;
-                self.stack.push(DetailView {
-                    target,
-                    req: req.clone(),
-                    data: None,
-                    scroll: 0,
-                    selected: None,
-                    hunk: None,
-                    reselect: None,
-                });
-                self.detail_targets.clear();
-                self.hunk_lines.clear();
+                self.push_view(target, req.clone(), None);
                 if load {
                     vec![Cmd::Worker(WorkerMsg::Detail(req))]
                 } else {
@@ -577,6 +605,27 @@ impl App {
             Action::Write(action) => self.write_action(action),
             Action::ShowOutput => self.show_output(),
         }
+    }
+
+    /// Opens a detail view on top, with `data` when it needs no load. The
+    /// rows the last draw recorded belong to the view below.
+    fn push_view(
+        &mut self,
+        target: Target,
+        req: DetailReq,
+        data: Option<Result<DetailData, String>>,
+    ) {
+        self.stack.push(DetailView {
+            target,
+            req,
+            data,
+            scroll: 0,
+            selected: None,
+            hunk: None,
+            reselect: None,
+        });
+        self.detail_targets.clear();
+        self.hunk_lines.clear();
     }
 
     /// Opens the possible-secrets view, unless there are none or it is
@@ -786,9 +835,14 @@ impl App {
     fn mouse(&mut self, m: MouseEvent) -> Vec<Cmd> {
         let (x, y) = (m.column, m.row);
         if matches!(m.kind, MouseEventKind::Down(_)) && self.write.prompt.is_some() {
-            // A click on the prompt row is its own; elsewhere it cancels.
+            // A click on the prompt row is its own; elsewhere it cancels,
+            // but for the header's `‹ back` above the push confirm's view.
             if !self.in_prompt_row(x, y) {
-                self.cancel_prompt();
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    self.click_while_prompting(x, y);
+                } else {
+                    self.cancel_prompt();
+                }
             }
             return Vec::new();
         }
@@ -1425,5 +1479,52 @@ mod tests {
         assert_eq!(a.stack[0].target, Target::Leaks);
         a.handle(ch('s'));
         assert_eq!(a.stack.len(), 1, "not opened twice");
+    }
+
+    #[test]
+    fn browse_outgoing_works_read_only_and_never_confirms() {
+        let mut a = app();
+        assert!(!a.write.enabled);
+        let cmds = a.perform(Action::Open(Target::Outgoing { pinned: false }));
+        assert_eq!(detail_req(&cmds), Some(&DetailReq::Outgoing));
+        assert_eq!(
+            a.stack.last().unwrap().target,
+            Target::Outgoing { pinned: false }
+        );
+        assert!(a.write.prompt.is_none());
+        for k in [ch('y'), key(KeyCode::Enter), ch('P')] {
+            assert!(a.handle(k).is_empty());
+            assert!(a.write.prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn an_open_outgoing_view_reloads_when_head_branch_or_upstream_moves() {
+        let mut a = app();
+        let on = |branch: &str, oid: &str, ahead| UiMsg::Snapshot {
+            snap: Arc::new(Snapshot {
+                head: crate::model::Head::Branch(branch.into()),
+                oid: Some(oid.into()),
+                upstream: Some(crate::model::Upstream {
+                    name: "origin/main".into(),
+                    ahead,
+                    behind: 0,
+                }),
+                ..Snapshot::default()
+            }),
+            events: vec![],
+            changed: vec!["a.rs".into()],
+        };
+        a.handle(on("main", "c1", 1));
+        a.perform(Action::Open(Target::Outgoing { pinned: false }));
+        let edit = on("main", "c1", 1);
+        assert!(detail_req(&a.handle(edit)).is_none(), "an edit");
+        let commit = on("main", "c2", 2);
+        assert!(detail_req(&a.handle(commit)).is_some(), "a commit");
+        let push = on("main", "c2", 0);
+        assert!(detail_req(&a.handle(push)).is_some(), "a push");
+        // A branch at the same commit, with the same counts.
+        let switch = on("feat", "c2", 0);
+        assert!(detail_req(&a.handle(switch)).is_some(), "a switch");
     }
 }

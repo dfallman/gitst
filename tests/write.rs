@@ -477,7 +477,10 @@ fn amend_ignores_log_show_signature() {
 
 fn prepare_push(r: &TestRepo) -> Result<gitst::write::PushPlan, WriteError> {
     match run(r, WriteOp::PreparePush)? {
-        WriteOutcome::PushReady(p) => Ok(p),
+        WriteOutcome::PushReady(p) => {
+            assert_eq!(p.outgoing.commit_total, p.count);
+            Ok(p)
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -1256,4 +1259,216 @@ fn staging_a_hunk_leaves_the_mode_change() {
         "{cached}"
     );
     assert!(r.git(&["diff"]).contains("new mode 100755"));
+}
+
+fn empty_tree(r: &TestRepo) -> String {
+    // The object id of a tree with no entries, in this repository's hash.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(r.path())
+        .args(["hash-object", "-t", "tree", "/dev/null"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn push_plan_lists_outgoing_commits_and_files() {
+    let (r, _remote) = with_remote();
+    let base = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.commit_file("a.txt", "one\ntwo\n", "second");
+    r.write("b.bin", "\0\u{1}\0");
+    r.write("a.txt", "uno\ntwo\nthree\n");
+    r.git(&["add", "."]);
+    r.git(&["commit", "-q", "-m", "third"]);
+    let o = prepare_push(&r).unwrap().outgoing;
+    assert_eq!(o.target, "origin/main");
+    assert_eq!(o.base, base);
+    assert_eq!(o.oid, r.git(&["rev-parse", "HEAD"]).trim());
+    assert_eq!((o.commits.len(), o.commit_total), (2, 2));
+    assert_eq!(o.commits[0].subject, "third");
+    let files: Vec<_> = o
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.status, f.counts))
+        .collect();
+    assert_eq!(
+        files,
+        vec![
+            ("a.txt", 'M', gitst::model::Counts::lines(3, 1)),
+            ("b.bin", 'A', gitst::model::Counts::Binary),
+        ]
+    );
+    assert_eq!(o.file_total, 2);
+    assert_eq!((o.added, o.removed), (3, 1));
+}
+
+#[test]
+fn new_branch_base_is_parent_of_oldest() {
+    let (r, _remote) = with_remote();
+    let main_oid = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["checkout", "-q", "-b", "feat"]);
+    r.commit_file("f1.txt", "1\n", "f1");
+    r.commit_file("f2.txt", "2\n", "f2");
+    let o = prepare_push(&r).unwrap().outgoing;
+    assert_eq!(o.base, main_oid);
+    assert_eq!(o.target, "origin/feat");
+    assert_eq!(o.commit_total, 2);
+    let paths: Vec<_> = o.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["f1.txt", "f2.txt"]);
+}
+
+#[test]
+fn new_branch_from_root_uses_empty_tree() {
+    let r = writable();
+    r.commit_file("a.txt", "one\n", "first");
+    let remote = r.dir.path().join("remote.git");
+    r.git(&["init", "-q", "--bare", remote.to_str().unwrap()]);
+    r.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    let o = prepare_push(&r).unwrap().outgoing;
+    assert_eq!(o.base, empty_tree(&r));
+    assert_eq!(o.commit_total, 1);
+    assert_eq!(o.files.len(), 1);
+    assert_eq!(o.files[0].path, "a.txt");
+    assert_eq!(o.files[0].status, 'A');
+}
+
+#[test]
+fn oldest_outgoing_merge_uses_first_parent() {
+    let (r, _remote) = with_remote();
+    let main_oid = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["checkout", "-q", "-b", "side"]);
+    r.commit_file("s.txt", "s\n", "side");
+    r.git(&["push", "-q", "origin", "side"]);
+    r.git(&["checkout", "-q", "-b", "feat", "main"]);
+    r.git(&["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+    let o = prepare_push(&r).unwrap().outgoing;
+    assert_eq!(o.base, main_oid);
+    assert_eq!(o.commit_total, 1);
+    assert_eq!(o.files.len(), 1);
+}
+
+#[test]
+fn file_list_caps_at_500() {
+    let (r, _remote) = with_remote();
+    for i in 0..501 {
+        r.write(&format!("many/f{i:03}.txt"), "x\n");
+    }
+    r.git(&["add", "."]);
+    r.git(&["commit", "-q", "-m", "many"]);
+    let o = prepare_push(&r).unwrap().outgoing;
+    assert_eq!((o.files.len(), o.file_total), (500, 501));
+    assert_eq!(o.added, 501);
+}
+
+#[test]
+fn diverged_tracking_lists_only_local_changes() {
+    let (r, remote) = with_remote();
+    let other = TestRepo::clone_from(&remote);
+    identify(&other);
+    other.commit_file("r.txt", "r\n", "theirs");
+    other.commit_file("r2.txt", "r\n", "theirs 2");
+    other.git(&["push", "-q", "origin", "main"]);
+    r.git(&["fetch", "-q", "origin"]);
+    let fork = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.commit_file("m.txt", "m\n", "mine");
+    let plan = prepare_push(&r).unwrap();
+    assert_eq!(plan.count, 1);
+    assert_eq!(plan.outgoing.base, fork);
+    let o = plan.outgoing;
+    let paths: Vec<_> = o.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["m.txt"]);
+    assert_eq!((o.added, o.removed), (1, 0));
+}
+
+/// The browse view's data for `r`, as clicking `↑N` loads it.
+fn browsed(r: &TestRepo) -> gitst::model::Outgoing {
+    match backend(r).detail(&DetailReq::Outgoing).unwrap() {
+        DetailData::Outgoing(Some(o)) => o,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Signs commits in `r` with a fresh SSH key, so `log.showSignature`
+/// has a signature to report. `None` where `ssh-keygen` can't run.
+fn ssh_signing(r: &TestRepo) -> Option<()> {
+    let key = r.dir.path().join("key");
+    let made = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "t@t", "-f"])
+        .arg(&key)
+        .output()
+        .ok()?;
+    if !made.status.success() {
+        return None;
+    }
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    let signers = r.dir.path().join("allowed_signers");
+    std::fs::write(&signers, format!("t@t {public}")).unwrap();
+    r.git(&["config", "gpg.format", "ssh"]);
+    r.git(&["config", "user.signingkey", key.to_str().unwrap()]);
+    r.git(&[
+        "config",
+        "gpg.ssh.allowedSignersFile",
+        signers.to_str().unwrap(),
+    ]);
+    Some(())
+}
+
+#[test]
+fn push_plan_ignores_log_show_signature() {
+    let (r, _remote) = with_remote();
+    if ssh_signing(&r).is_none() {
+        eprintln!("skipped: ssh-keygen is not available");
+        return;
+    }
+    r.git(&["config", "log.showSignature", "true"]);
+    r.write("b.txt", "b\n");
+    r.git(&["add", "b.txt"]);
+    r.git(&["commit", "-q", "-S", "-m", "signed"]);
+    let head = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    let plan = prepare_push(&r).unwrap();
+    let c = &plan.outgoing.commits[0];
+    assert_eq!(c.oid, head);
+    assert_eq!(c.subject, "signed");
+}
+
+#[test]
+fn browse_and_push_agree_on_the_target() {
+    let (r, _remote) = with_remote();
+    r.git(&["checkout", "-q", "-b", "feat", "--track", "origin/main"]);
+    r.git(&["config", "push.default", "current"]);
+    r.commit_file("f.txt", "f\n", "feat");
+    let plan = prepare_push(&r).unwrap();
+    assert_eq!(plan.outgoing.target, "origin/feat");
+    let o = browsed(&r);
+    assert_eq!(o.target, plan.outgoing.target);
+    assert_eq!(o.base, plan.outgoing.base);
+    assert_eq!(o.commit_total, plan.count);
+}
+
+#[test]
+fn criss_cross_lists_as_many_commits_as_it_counts() {
+    let (r, _remote) = with_remote();
+    // Two merges that cross: the pushed tip and HEAD share two best
+    // merge bases, `x1` and `y1`.
+    r.git(&["checkout", "-q", "-b", "x"]);
+    r.commit_file("x.txt", "x\n", "x1");
+    r.git(&["checkout", "-q", "-b", "y", "main"]);
+    r.commit_file("y.txt", "y\n", "y1");
+    let y1 = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["merge", "-q", "--no-ff", "-m", "y merges x", "x"]);
+    r.git(&["push", "-q", "origin", "y:main"]);
+    r.git(&["checkout", "-q", "x"]);
+    r.git(&["merge", "-q", "--no-ff", "-m", "x merges y1", &y1]);
+    r.git(&["checkout", "-q", "main"]);
+    r.git(&["merge", "-q", "--ff-only", "x"]);
+    r.git(&["fetch", "-q", "origin"]);
+    r.commit_file("m.txt", "m\n", "mine");
+    let plan = prepare_push(&r).unwrap();
+    assert_eq!(plan.count, 2, "x merges y1, and mine");
+    let o = &plan.outgoing;
+    assert_eq!((o.commits.len(), o.commit_total), (2, 2));
+    let browse = browsed(&r);
+    assert_eq!(browse.commit_total, plan.count);
+    assert_eq!(browse.commits, o.commits);
 }

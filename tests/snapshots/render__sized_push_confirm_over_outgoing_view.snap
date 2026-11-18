@@ -1,0 +1,16 @@
+---
+source: tests/render.rs
+expression: out
+---
+ ‹ back  Outgoing → origin/main Commit · Push · Pull   ↻ 2m 
+── 1 commit ────────────────────────────────────────────────
+ 4de1e3c ↑ icons: jug on cream                           5m 
+── 2 files  +3 −1 ──────────────────────────────────────────
+ M src/a.rs                                           +2 −1 
+ A src/b.rs                                              +1 
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+ Push 1 commit, 2 files (+3 −1) to origin/main?       y / n

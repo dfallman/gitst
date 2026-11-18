@@ -5,7 +5,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::cli::{CliBackend, Run, plain_command, run_bounded};
+use super::GitError;
+use super::cli::{
+    CliBackend, Run, new_branch_base, outgoing, plain_command, run_bounded, tracking_base,
+};
 use super::hunk;
 use crate::write::{
     CommitPlan, PushPlan, REFUSE_DETACHED, REFUSE_NO_REMOTE, REFUSE_UNBORN, ShownHunk, WriteError,
@@ -435,6 +438,10 @@ impl CliBackend {
                 }
             })?;
         let (remote, branch, tracking) = self.push_target(&local, timeout, cancel)?;
+        let plain = |args: &[&str]| {
+            self.run_write(args, None, timeout, cancel)
+                .map_err(|e| GitError::new(e.summary))
+        };
         let upstream = self.text(
             &[
                 "for-each-ref",
@@ -448,14 +455,37 @@ impl CliBackend {
             .text(&["rev-parse", "--verify", "-q", &tracking], timeout, cancel)
             .is_ok_and(|t| !t.is_empty());
         let listed = if have_tracking {
-            self.text(&["rev-list", &oid, "--not", &tracking], timeout, cancel)?
+            self.text(
+                &["rev-list", "--topo-order", &oid, "--not", &tracking],
+                timeout,
+                cancel,
+            )?
         } else {
-            self.text(&["rev-list", &oid, "--not", "--remotes"], timeout, cancel)?
+            self.text(
+                &["rev-list", "--topo-order", &oid, "--not", "--remotes"],
+                timeout,
+                cancel,
+            )?
         };
         let oids: Vec<String> = listed.lines().map(str::to_string).collect();
-        if oids.is_empty() {
+        let Some(oldest) = oids.last() else {
             return Err(failure("nothing to push", ""));
+        };
+        let base = if have_tracking {
+            tracking_base(&plain, &tracking, &oid)
+        } else {
+            new_branch_base(&plain, oldest)
         }
+        .map_err(|e| failure(e.message, ""))?;
+        let target = format!("{remote}/{branch}");
+        let not = if have_tracking {
+            &tracking
+        } else {
+            "--remotes"
+        };
+        let outgoing = Box::new(
+            outgoing(&plain, &target, &base, &oid, not).map_err(|e| failure(e.message, ""))?,
+        );
         let (findings, coverage) = self.scan_range(&oids);
         Ok(WriteOutcome::PushReady(PushPlan {
             local,
@@ -466,6 +496,7 @@ impl CliBackend {
             set_upstream: upstream.is_empty(),
             findings,
             coverage,
+            outgoing,
         }))
     }
 
@@ -477,73 +508,7 @@ impl CliBackend {
         timeout: Duration,
         cancel: &AtomicBool,
     ) -> Result<(String, String, String), WriteError> {
-        let refs = self.text_raw(
-            &[
-                "for-each-ref",
-                "--format=%(push:remotename)%00%(push)%00%(push:remoteref)",
-                &format!("refs/heads/{local}"),
-            ],
-            timeout,
-            cancel,
-        )?;
-        let mut parts = refs.trim_end_matches('\n').splitn(3, '\0');
-        let remote = parts.next().unwrap_or("");
-        let tracking = parts.next().unwrap_or("");
-        let remote_ref = parts.next().unwrap_or("");
-        if !remote_ref.is_empty() && !remote_ref.starts_with("refs/heads/") {
-            return Err(failure(
-                "push target is not a branch, push from a shell",
-                "",
-            ));
-        }
-        // The remote ref, when set, is authoritative for the branch name.
-        let ref_branch = remote_ref
-            .strip_prefix("refs/heads/")
-            .filter(|b| !b.is_empty());
-        let counted = |remote: &str, branch: &str| {
-            if tracking.is_empty() {
-                format!("refs/remotes/{remote}/{branch}")
-            } else {
-                tracking.to_string()
-            }
-        };
-        if !remote.is_empty() {
-            if let Some(b) = ref_branch {
-                return Ok((remote.to_string(), b.to_string(), counted(remote, b)));
-            }
-            if let Some(b) = tracking
-                .strip_prefix(&format!("refs/remotes/{remote}/"))
-                .filter(|b| !b.is_empty())
-            {
-                return Ok((remote.to_string(), b.to_string(), tracking.to_string()));
-            }
-            // `%(push)` is empty whenever `simple` or `upstream` can't resolve
-            // without a matching upstream (a new branch, say), so the config
-            // decides instead.
-            let config = |key: &str| {
-                self.text(&["config", "--get", key], timeout, cancel)
-                    .unwrap_or_default()
-            };
-            let mode = config("push.default");
-            let merge = config(&format!("branch.{local}.merge"));
-            let differs = !merge.is_empty() && merge != format!("refs/heads/{local}");
-            if mode == "nothing" || mode == "upstream" || mode == "tracking" || differs {
-                return Err(failure("no push target configured, push from a shell", ""));
-            }
-            let tracking = format!("refs/remotes/{remote}/{local}");
-            return Ok((remote.to_string(), local.to_string(), tracking));
-        }
-        let remotes = self.text(&["remote"], timeout, cancel)?;
-        let names: Vec<&str> = remotes.lines().collect();
-        let remote = match names.as_slice() {
-            [] => return Err(failure(REFUSE_NO_REMOTE, "")),
-            [only] => (*only).to_string(),
-            many if many.contains(&"origin") => "origin".to_string(),
-            _ => return Err(failure("several remotes, push from a shell", "")),
-        };
-        let branch = ref_branch.unwrap_or(local);
-        let tracking = counted(&remote, branch);
-        Ok((remote, branch.to_string(), tracking))
+        push_target_with(local, &|args| self.text_raw(args, timeout, cancel))
     }
 
     /// Pushes the confirmed oid, never HEAD, with an explicit refspec.
@@ -772,4 +737,73 @@ impl CliBackend {
         let out = self.run_write(args, None, timeout, cancel)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
+}
+
+/// `push_target` over any runner of read-only git commands, which returns
+/// stdout untrimmed.
+pub(crate) fn push_target_with(
+    local: &str,
+    raw: &dyn Fn(&[&str]) -> Result<String, WriteError>,
+) -> Result<(String, String, String), WriteError> {
+    let text = |args: &[&str]| raw(args).map(|s| s.trim().to_string());
+    let refs = raw(&[
+        "for-each-ref",
+        "--format=%(push:remotename)%00%(push)%00%(push:remoteref)",
+        &format!("refs/heads/{local}"),
+    ])?;
+    let mut parts = refs.trim_end_matches('\n').splitn(3, '\0');
+    let remote = parts.next().unwrap_or("");
+    let tracking = parts.next().unwrap_or("");
+    let remote_ref = parts.next().unwrap_or("");
+    if !remote_ref.is_empty() && !remote_ref.starts_with("refs/heads/") {
+        return Err(failure(
+            "push target is not a branch, push from a shell",
+            "",
+        ));
+    }
+    // The remote ref, when set, is authoritative for the branch name.
+    let ref_branch = remote_ref
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty());
+    let counted = |remote: &str, branch: &str| {
+        if tracking.is_empty() {
+            format!("refs/remotes/{remote}/{branch}")
+        } else {
+            tracking.to_string()
+        }
+    };
+    if !remote.is_empty() {
+        if let Some(b) = ref_branch {
+            return Ok((remote.to_string(), b.to_string(), counted(remote, b)));
+        }
+        if let Some(b) = tracking
+            .strip_prefix(&format!("refs/remotes/{remote}/"))
+            .filter(|b| !b.is_empty())
+        {
+            return Ok((remote.to_string(), b.to_string(), tracking.to_string()));
+        }
+        // `%(push)` is empty whenever `simple` or `upstream` can't resolve
+        // without a matching upstream (a new branch, say), so the config
+        // decides instead.
+        let config = |key: &str| text(&["config", "--get", key]).unwrap_or_default();
+        let mode = config("push.default");
+        let merge = config(&format!("branch.{local}.merge"));
+        let differs = !merge.is_empty() && merge != format!("refs/heads/{local}");
+        if mode == "nothing" || mode == "upstream" || mode == "tracking" || differs {
+            return Err(failure("no push target configured, push from a shell", ""));
+        }
+        let tracking = format!("refs/remotes/{remote}/{local}");
+        return Ok((remote.to_string(), local.to_string(), tracking));
+    }
+    let remotes = text(&["remote"])?;
+    let names: Vec<&str> = remotes.lines().collect();
+    let remote = match names.as_slice() {
+        [] => return Err(failure(REFUSE_NO_REMOTE, "")),
+        [only] => (*only).to_string(),
+        many if many.contains(&"origin") => "origin".to_string(),
+        _ => return Err(failure("several remotes, push from a shell", "")),
+    };
+    let branch = ref_branch.unwrap_or(local);
+    let tracking = counted(&remote, branch);
+    Ok((remote, branch.to_string(), tracking))
 }

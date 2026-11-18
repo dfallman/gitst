@@ -1384,3 +1384,103 @@ fn a_remote_helper_from_the_work_tree_does_not_run_on_a_fetch() {
     );
     assert_eq!(take_log(&log), "");
 }
+
+fn outgoing_of(r: &TestRepo) -> Option<Outgoing> {
+    match backend(r).detail(&DetailReq::Outgoing).unwrap() {
+        DetailData::Outgoing(o) => o,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn remote_main(remote: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(remote)
+        .args(["rev-parse", "refs/heads/main"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn outgoing_detail_browses_without_pushing() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "one\n", "first");
+    let remote = r.with_bare_remote();
+    let before = remote_main(&remote);
+    r.commit_file("b.txt", "b\n", "second");
+    let o = outgoing_of(&r).unwrap();
+    assert_eq!(o.commit_total, 1);
+    assert_eq!(o.target, "origin/main");
+    assert_eq!(o.base, before);
+    assert_eq!(o.files.len(), 1);
+    assert_eq!(remote_main(&remote), before);
+}
+
+#[test]
+fn outgoing_detail_when_up_to_date() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "one\n", "first");
+    r.with_bare_remote();
+    let o = outgoing_of(&r).unwrap();
+    assert_eq!(o.commit_total, 0);
+    assert!(o.files.is_empty());
+}
+
+#[test]
+fn outgoing_detail_without_remote() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "one\n", "first");
+    assert_eq!(outgoing_of(&r), None);
+}
+
+#[test]
+fn range_file_diff_spans_the_push() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "one\n", "first");
+    r.with_bare_remote();
+    r.commit_file("a.txt", "one\ntwo\n", "second");
+    r.commit_file("a.txt", "one\ntwo\nthree\n", "third");
+    let o = outgoing_of(&r).unwrap();
+    let DetailData::RangeFile(blocks) = backend(&r)
+        .detail(&DetailReq::RangeFile {
+            base: o.base.clone(),
+            oid: o.oid.clone(),
+            path: "a.txt".into(),
+        })
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(blocks.len(), 1);
+    let added: Vec<_> = blocks[0]
+        .lines
+        .iter()
+        .filter(|l| l.kind == DiffKind::Add)
+        .map(|l| l.text.trim_start_matches('+').to_string())
+        .collect();
+    assert_eq!(added, ["two", "three"]);
+    assert_eq!(
+        blocks[0].title,
+        format!("{}..{}", &o.base[..7], &o.oid[..7])
+    );
+}
+
+#[test]
+fn outgoing_detail_when_diverged_lists_only_local_changes() {
+    let r = TestRepo::new();
+    r.commit_file("a.txt", "one\n", "first");
+    let remote = r.with_bare_remote();
+    let other = TestRepo::clone_from(&remote);
+    other.commit_file("r.txt", "r\n", "theirs");
+    other.git(&["push", "-q", "origin", "main"]);
+    r.git(&["fetch", "-q", "origin"]);
+    let fork = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.commit_file("m.txt", "m\n", "mine");
+    let o = outgoing_of(&r).unwrap();
+    assert_eq!(o.base, fork);
+    assert_eq!(o.commit_total, 1);
+    let paths: Vec<_> = o.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["m.txt"]);
+    assert_eq!((o.added, o.removed), (1, 0));
+}

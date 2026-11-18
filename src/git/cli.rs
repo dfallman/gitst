@@ -18,8 +18,9 @@ use super::parse::{
 };
 use super::{FetchError, GitBackend, GitError, Repo, SnapshotOpts, classify_fetch_stderr};
 use crate::model::{
-    CommitDetail, Counts, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, Leak, RepoOp,
-    Snapshot, Upstream,
+    CommitDetail, Counts, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, Leak,
+    NO_UPSTREAM, OUTGOING_COMMITS, OUTGOING_FILES, Outgoing, OutgoingFile, RepoOp, Snapshot,
+    Upstream,
 };
 use crate::write::{Coverage, WriteError, WriteOp, WriteOutcome};
 
@@ -156,6 +157,61 @@ impl CliBackend {
     /// stopped and fails with `GitError::too_large`.
     fn git_capped(&self, args: &[&str], cap: usize) -> Result<Vec<u8>, GitError> {
         self.run(self.command(), args, cap)
+    }
+
+    /// What a push of HEAD would send, read as the browse view needs it:
+    /// to the target `P` would push to, over the same range it counts.
+    /// `None` when there is nowhere to push.
+    fn outgoing_detail(&self) -> Result<Option<Outgoing>, GitError> {
+        let guarded = |args: &[&str]| self.git(args);
+        let line = |args: &[&str]| self.git(args).map(trimmed);
+        let Some(oid) = line(&["rev-parse", "--verify", "-q", "HEAD"])
+            .ok()
+            .filter(|o| !o.is_empty())
+        else {
+            return Ok(None);
+        };
+        let exists =
+            |rev: &str| line(&["rev-parse", "--verify", "-q", rev]).is_ok_and(|o| !o.is_empty());
+        let raw = |args: &[&str]| {
+            self.git(args)
+                .map(|o| String::from_utf8_lossy(&o).into_owned())
+                .map_err(|e| WriteError {
+                    summary: e.message,
+                    output: String::new(),
+                })
+        };
+        let pushed_to = line(&["symbolic-ref", "-q", "HEAD"]).ok().and_then(|full| {
+            let local = full.strip_prefix("refs/heads/")?;
+            super::write::push_target_with(local, &raw).ok()
+        });
+        // As `prepare_push` reads it; the upstream only where it refuses.
+        let tracked = match &pushed_to {
+            Some((remote, branch, tracking)) => {
+                exists(tracking).then(|| (format!("{remote}/{branch}"), tracking.clone()))
+            }
+            None => line(&["rev-parse", "--abbrev-ref", "@{upstream}"])
+                .ok()
+                .filter(|_| exists("@{upstream}"))
+                .map(|target| (target, "@{upstream}".to_string())),
+        };
+        if let Some((target, tracking)) = tracked {
+            let base = tracking_base(&guarded, &tracking, &oid)?;
+            return outgoing(&guarded, &target, &base, &oid, &tracking).map(Some);
+        }
+        if line(&["remote"])?.is_empty() {
+            return Ok(None);
+        }
+        let unpushed = line(&["rev-list", "--topo-order", &oid, "--not", "--remotes"])?;
+        let target = pushed_to.map_or_else(
+            || NO_UPSTREAM.to_string(),
+            |(remote, branch, _)| format!("{remote}/{branch}"),
+        );
+        let base = match unpushed.lines().last() {
+            Some(oldest) => new_branch_base(&guarded, oldest)?,
+            None => oid.clone(),
+        };
+        outgoing(&guarded, &target, &base, &oid, "--remotes").map(Some)
     }
 
     fn run(&self, mut cmd: Command, args: &[&str], cap: usize) -> Result<Vec<u8>, GitError> {
@@ -635,6 +691,134 @@ fn find_configs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Runs git and returns stdout: a guarded read for browsing, a plain one
+/// for a push plan.
+pub(crate) type Runner<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<u8>, GitError>;
+
+fn trimmed(raw: Vec<u8>) -> String {
+    String::from_utf8_lossy(&raw).trim().to_string()
+}
+
+/// The base of the range a new branch would send: the first parent of its
+/// oldest commit, or the empty tree for a root commit.
+pub(crate) fn new_branch_base(git: Runner, oldest: &str) -> Result<String, GitError> {
+    match git(&["rev-parse", "--verify", "-q", &format!("{oldest}^1")]) {
+        Ok(parent) => Ok(trimmed(parent)),
+        // A root commit has no parent: `-q` makes that a silent exit 1.
+        Err(e) if silent_exit(&e) => empty_tree(git),
+        Err(e) => Err(e),
+    }
+}
+
+/// `run`'s error for a git that exited non-zero without a word, which is
+/// how `-q` and `merge-base` say "no such thing".
+fn silent_exit(e: &GitError) -> bool {
+    e.message == "git failed"
+}
+
+/// The empty tree's id, hashed rather than hardcoded as the repository's
+/// hash may not be SHA-1. `/dev/null` is read as an empty file; Git for
+/// Windows maps it to `nul`.
+fn empty_tree(git: Runner) -> Result<String, GitError> {
+    git(&["hash-object", "-t", "tree", "/dev/null"]).map(trimmed)
+}
+
+/// The base of a push over an existing tracking ref: where the two sides
+/// part, so remote-only changes don't show up reversed. The empty tree
+/// when they share no history.
+pub(crate) fn tracking_base(git: Runner, tracking: &str, oid: &str) -> Result<String, GitError> {
+    match git(&["merge-base", tracking, oid]) {
+        Ok(out) => {
+            let base = trimmed(out);
+            if base.is_empty() {
+                empty_tree(git)
+            } else {
+                Ok(base)
+            }
+        }
+        // No common history is a silent exit 1; a timeout or a cancel is
+        // not that, and must not turn into "everything is outgoing".
+        Err(e) if silent_exit(&e) => empty_tree(git),
+        Err(e) => Err(e),
+    }
+}
+
+/// What a push of `oid` over `base` would send. `base` is a commit, or the
+/// empty tree when the whole history goes out; the files are its diff to
+/// `oid`. The commits are those of `oid` not reachable from `not` (the
+/// tracking ref, or `--remotes` for a new branch), exactly as
+/// `prepare_push` counts them: past a criss-cross merge, everything past
+/// one merge base would list more.
+pub(crate) fn outgoing(
+    git: Runner,
+    target: &str,
+    base: &str,
+    oid: &str,
+    not: &str,
+) -> Result<Outgoing, GitError> {
+    let with = |head: &[&str]| {
+        let mut args: Vec<&str> = head.to_vec();
+        args.extend([oid, "--not", not, "--"]);
+        git(&args)
+    };
+    let fmt = format!("--format={LOG_FORMAT}");
+    let n = format!("-n{OUTGOING_COMMITS}");
+    // The push path's git is plain: `log.showSignature` would put text
+    // ahead of each commit's fields.
+    let commits = parse::parse_log(&with(&["log", "--no-show-signature", &n, &fmt])?);
+    let commit_total = trimmed(with(&["rev-list", "--count"])?)
+        .parse()
+        .unwrap_or(commits.len());
+    let diff = |mode: &str| {
+        git(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            mode,
+            "-z",
+            base,
+            oid,
+            "--",
+        ])
+    };
+    let stats = parse::parse_numstat(&diff("--numstat")?);
+    let names = diff("--name-status")?;
+    let mut fields = names.split(|b| *b == 0).map(String::from_utf8_lossy);
+    let mut status = HashMap::new();
+    while let (Some(code), Some(path)) = (fields.next(), fields.next()) {
+        status.insert(path.into_owned(), code.chars().next().unwrap_or('M'));
+    }
+    let (mut added, mut removed) = (0, 0);
+    for (_, counts) in &stats {
+        if let Some((a, r)) = counts.known() {
+            added += u64::from(a);
+            removed += u64::from(r);
+        }
+    }
+    let file_total = stats.len();
+    let files = stats
+        .into_iter()
+        .take(OUTGOING_FILES)
+        .map(|(path, counts)| OutgoingFile {
+            status: status.get(&path).copied().unwrap_or('M'),
+            path,
+            counts,
+        })
+        .collect();
+    Ok(Outgoing {
+        target: target.to_string(),
+        base: base.to_string(),
+        oid: oid.to_string(),
+        commits,
+        commit_total,
+        files,
+        file_total,
+        added,
+        removed,
+    })
+}
+
 /// A diff for a detail view, or a line saying it is too large to show.
 fn shown_diff(out: Result<Vec<u8>, GitError>) -> Result<Vec<DiffLine>, GitError> {
     match out {
@@ -956,6 +1140,28 @@ impl GitBackend for CliBackend {
                     ahead_total,
                     behind_total,
                 })
+            }
+            DetailReq::Outgoing => self.outgoing_detail().map(DetailData::Outgoing),
+            DetailReq::RangeFile { base, oid, path } => {
+                let out = self.git_capped(
+                    &[
+                        "diff",
+                        "--no-color",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        base,
+                        oid,
+                        "--",
+                        path,
+                    ],
+                    MAX_SHOWN_DIFF,
+                );
+                let short = |s: &str| s.chars().take(7).collect::<String>();
+                let title = format!("{}..{}", short(base), short(oid));
+                Ok(DetailData::RangeFile(nonempty_block(
+                    title,
+                    shown_diff(out)?,
+                )))
             }
             DetailReq::Leaks => Err(GitError::new("possible secrets come with the snapshot")),
             DetailReq::Output => Err(GitError::new("output comes with the failure")),
@@ -1439,6 +1645,22 @@ fn wait_grace(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_silent_merge_base_failure_means_no_common_history() {
+        use super::{GitError, tracking_base};
+        let run = |merge_base: GitError| {
+            move |args: &[&str]| match args[0] {
+                "merge-base" => Err(merge_base.clone()),
+                _ => Ok(b"empty-tree\n".to_vec()),
+            }
+        };
+        let silent = run(GitError::new("git failed"));
+        assert_eq!(tracking_base(&silent, "t", "o").unwrap(), "empty-tree");
+        let timed_out = run(GitError::new("git merge-base timed out"));
+        let e = tracking_base(&timed_out, "t", "o").unwrap_err();
+        assert_eq!(e.message, "git merge-base timed out");
+    }
+
     #[test]
     fn verbatim_prefixes_are_taken_off_for_git() {
         use super::without_verbatim_prefix as plain;

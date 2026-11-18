@@ -96,6 +96,8 @@ warning says so, and the last findings stay.
 - **Click** a file, commit, branch, stash, or activity row to open it full-pane
   (diffs, commit details, ahead/behind lists). Click `‹ back`, press `Esc`, or
   right-click to return.
+- **Click** `↑N` (in the header or on the Commits border) to list the commits
+  and files a push would send. This works in read-only mode too.
 - **Click** a section title to fold it. The **wheel** scrolls what is under the pointer.
 - **Click** `↻` (or press `f`) to fetch now.
 - **Click** a warning to clear it.
@@ -130,7 +132,7 @@ Off by default. Turn it on with `gitst -w` (or `--write`), or `write = true` in 
 | `]` / `[` | a file's diff | next / previous hunk |
 | `A` | dashboard | stage all, or unstage all when everything is staged |
 | `C` | anywhere | commit what is staged |
-| `P` | anywhere | push HEAD |
+| `P` | anywhere | open the Outgoing view, then confirm the push |
 | `U` | anywhere | pull, fast-forward only |
 | `S` | anywhere | stash, including untracked files |
 | `p` / `o` / `D` | a stash, or its view | pop / apply / drop |
@@ -144,6 +146,13 @@ amends a pushed commit, or pushes. A confirm that names a possible secret, and
 stash drop, accept `y` only. `n` or `Esc` declines. Commit and push re-scan
 what they are about to change, so the secret check covers exactly that, not the
 last snapshot.
+
+The push confirm shows the Outgoing view, which lists exactly the commits and
+files that are pushed. You can browse it while the question waits: `Enter`
+opens a commit or file, and `Esc` goes back, cancelling the push at the
+Outgoing view itself. `n` cancels from anywhere. `y` is the only key that
+pushes, at every step of the confirm. Clicking `‹ back` goes back as `Esc`
+does, and a click anywhere else cancels the push.
 
 `Ctrl-E` suspends Gitst, runs `git commit -e` in your terminal with the text
 typed so far, and resumes when git exits. It suits long messages, and hooks or

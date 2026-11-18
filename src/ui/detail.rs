@@ -13,9 +13,10 @@ use super::fmt::{clock, clusters, truncate_left, truncate_right, width};
 use super::layout::Density;
 use super::theme::Theme;
 use super::{age_of, spans_width};
-use crate::app::{Action, App, ScrollTarget, Target, WriteAction};
+use crate::app::{Action, App, ScrollTarget, Target, WriteAction, count};
 use crate::model::{
-    Commit, CommitDetail, DetailData, DiffBlock, DiffKind, Leak, LeakSource, Snapshot,
+    Commit, CommitDetail, DetailData, DiffBlock, DiffKind, Leak, LeakSource, NO_UPSTREAM, Outgoing,
+    Snapshot,
 };
 
 type DetailLine = (Line<'static>, Option<Target>);
@@ -161,7 +162,11 @@ fn view_lines(app: &App, theme: &Theme, w: usize, d: Density) -> Option<Laid> {
                 Line::from(Span::styled(format!(" ⚠ {e}"), Style::new().fg(theme.err))),
                 None,
             )],
-            Some(Ok(DetailData::File { blocks, .. } | DetailData::CommitFile(blocks))) => {
+            Some(Ok(
+                DetailData::File { blocks, .. }
+                | DetailData::CommitFile(blocks)
+                | DetailData::RangeFile(blocks),
+            )) => {
                 let labels = app.write.enabled
                     && matches!(view.target, Target::File(_))
                     && !app.whole_file_only(view);
@@ -191,6 +196,11 @@ fn view_lines(app: &App, theme: &Theme, w: usize, d: Density) -> Option<Laid> {
                 branch_lines(sides, &upstream, app, theme, w, d)
             }
             Some(Ok(DetailData::Output(out))) => output_lines(out, theme, w, app.wrap),
+            Some(Ok(DetailData::Outgoing(None))) => vec![(
+                Line::from(Span::styled(" no remote to push to", theme.dim)),
+                None,
+            )],
+            Some(Ok(DetailData::Outgoing(Some(o)))) => outgoing_lines(o, app, theme, w, d),
         }
     };
     Some(lines.into())
@@ -434,6 +444,75 @@ fn branch_lines(
     out
 }
 
+/// What a push would send: the commits, then the files that change. Each
+/// commit opens, and each file opens its diff over the range.
+fn outgoing_lines(o: &Outgoing, app: &App, theme: &Theme, w: usize, d: Density) -> Vec<DetailLine> {
+    if o.commit_total == 0 {
+        let text = if o.target == NO_UPSTREAM {
+            " ✓ nothing to push".to_string()
+        } else {
+            format!(" ✓ nothing to push to {}", o.target)
+        };
+        return vec![(
+            Line::from(Span::styled(text, Style::new().fg(theme.add))),
+            None,
+        )];
+    }
+    let row_w = w.saturating_sub(2);
+    let more = |n: usize| {
+        (
+            Line::from(Span::styled(format!(" … {n} more"), theme.dim)),
+            None,
+        )
+    };
+    let mut out = vec![(rule(&count(o.commit_total, "commit"), w, theme), None)];
+    for c in &o.commits {
+        out.push((
+            commit_row(c, app, theme, row_w, d),
+            Some(Target::Commit(c.oid.clone())),
+        ));
+    }
+    if o.commit_total > o.commits.len() {
+        out.push(more(o.commit_total - o.commits.len()));
+    }
+    let mut title = count(o.file_total, "file");
+    if o.file_total > 0 {
+        title.push_str(&format!("  +{} −{}", o.added, o.removed));
+    }
+    out.push((rule(&title, w, theme), None));
+    let stats_w = o
+        .files
+        .iter()
+        .map(|f| spans_width(&stats_spans(f.counts, theme)))
+        .max()
+        .unwrap_or(0);
+    for f in &o.files {
+        let style = match f.status {
+            'A' => Style::new().fg(theme.add),
+            'D' => Style::new().fg(theme.del),
+            _ => Style::new(),
+        };
+        let left = vec![Span::styled(f.status.to_string(), style), Span::raw(" ")];
+        let stats = stats_spans(f.counts, theme);
+        let mut right = vec![Span::raw(" ".repeat(stats_w - spans_width(&stats)))];
+        right.extend(stats);
+        let path_w = row_w.saturating_sub(spans_width(&left) + spans_width(&right) + 1);
+        let middle = vec![Span::raw(truncate_left(&f.path, path_w))];
+        out.push((
+            row(left, middle, right, row_w),
+            Some(Target::RangeFile {
+                base: o.base.clone(),
+                oid: o.oid.clone(),
+                path: f.path.clone(),
+            }),
+        ));
+    }
+    if o.file_total > o.files.len() {
+        out.push(more(o.file_total - o.files.len()));
+    }
+    out
+}
+
 /// Possible secrets, grouped by where they are; each opens its diff.
 fn leak_lines(app: &App, theme: &Theme, w: usize) -> Vec<DetailLine> {
     let Some(snap) = app.snap.as_ref() else {
@@ -549,6 +628,7 @@ fn group_title(s: &LeakSource, snap: &Snapshot) -> String {
 
 const DASHBOARD_HELP: &[(&str, &str)] = &[
     ("click", "open · fold · button"),
+    ("click ↑N", "outgoing commits"),
     ("wheel", "scroll"),
     ("", ""),
     ("j k ↑ ↓", "move"),
@@ -589,7 +669,7 @@ const WRITE_HELP_DASHBOARD: &[(&str, &str)] = &[
     ("a", "stage · unstage file"),
     ("A", "stage all"),
     ("C", "commit"),
-    ("P", "push"),
+    ("P", "review and push"),
     ("U", "pull"),
     ("S", "stash"),
     ("p o D", "pop · apply · drop"),
@@ -601,7 +681,7 @@ const WRITE_HELP_DASHBOARD: &[(&str, &str)] = &[
 const WRITE_HELP_DETAIL: &[(&str, &str)] = &[
     ("a", "stage · unstage hunk"),
     ("C", "commit"),
-    ("P", "push"),
+    ("P", "review and push"),
     ("U", "pull"),
     ("S", "stash"),
     ("p o D", "pop · apply · drop"),

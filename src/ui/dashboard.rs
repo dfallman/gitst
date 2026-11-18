@@ -93,8 +93,10 @@ pub fn draw(
             let lead = if d.borders { "  " } else { " " };
             let mut left = vec![Span::raw(lead)];
             left.extend(title_spans(&section, false, theme));
+            let summary_click = summary_click(&section, r, 1);
             let line = line_lr(left, pad_right(section.summary), area.width as usize);
             f.render_widget(Paragraph::new(line), r);
+            app.hits.clicks.extend(summary_click);
             app.hits.clicks.push((r, Action::Toggle(id)));
             if app.selected == Some(title_item) {
                 f.buffer_mut().set_style(r, theme.select);
@@ -104,7 +106,7 @@ pub fn draw(
             continue;
         };
 
-        let (title_rect, body) = if d.borders {
+        let (title_rect, summary_click, body) = if d.borders {
             let outer = Rect::new(area.x, y, area.width, rows as u16 + 2);
             let mut title = vec![Span::raw(" ")];
             title.extend(title_spans(&section, true, theme));
@@ -122,7 +124,9 @@ pub fn draw(
             let body = block.inner(outer);
             f.render_widget(block, outer);
             y += rows as u16 + 2;
-            (Rect::new(area.x, outer.y, area.width, 1), body)
+            let title_rect = Rect::new(area.x, outer.y, area.width, 1);
+            // The title sits inside the corner, after its own space.
+            (title_rect, summary_click(&section, title_rect, 2), body)
         } else {
             let r = Rect::new(area.x, y, area.width, 1);
             let mut left = vec![Span::raw(" ")];
@@ -138,8 +142,13 @@ pub fn draw(
                 r,
             );
             y += 1 + rows as u16;
-            (r, Rect::new(area.x, r.y + 1, area.width, rows as u16))
+            (
+                r,
+                summary_click(&section, r, 1),
+                Rect::new(area.x, r.y + 1, area.width, rows as u16),
+            )
         };
+        app.hits.clicks.extend(summary_click);
         app.hits.clicks.push((title_rect, Action::Toggle(id)));
         if app.selected == Some(title_item) {
             f.buffer_mut().set_style(title_rect, theme.select);
@@ -246,6 +255,19 @@ fn visible_window(
     }
     let shown = capacity(*scroll);
     (*scroll, shown, total - *scroll - shown)
+}
+
+/// The click on a section's `↑N` summary, which opens the outgoing
+/// commits: its words, `gap` cells in from the right edge of `title`.
+/// Pushed before the title's own click, which would otherwise take it.
+fn summary_click(s: &Section, title: Rect, gap: u16) -> Option<(Rect, Action)> {
+    if s.id != SectionId::Commits || s.summary.is_empty() {
+        return None;
+    }
+    let w = spans_width(&s.summary) as u16;
+    let x = title.right().checked_sub(gap + w)?;
+    let open = Action::Open(Target::Outgoing { pinned: false });
+    Some((Rect::new(x, title.y, w, 1), open))
 }
 
 fn pad_right(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {

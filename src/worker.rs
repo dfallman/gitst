@@ -712,6 +712,7 @@ mod tests {
             set_upstream: false,
             findings: Vec::new(),
             coverage: crate::write::Coverage::Full,
+            outgoing: Default::default(),
         };
         let long = Duration::from_secs(120);
         assert_eq!(write_timeout(&WriteOp::PreparePush), long);

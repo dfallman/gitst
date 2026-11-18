@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::{Action, App, STALE_LOCK, Target};
-use crate::model::{Head, Leak, LeakSource, RepoOp, Snapshot};
+use crate::model::{DetailData, Head, Leak, LeakSource, NO_UPSTREAM, RepoOp, Snapshot};
 use fmt::{age_changes_in, rel_age, truncate_right, width, wrap_words};
 use layout::Density;
 use theme::Theme;
@@ -246,7 +246,9 @@ fn leak_band_text(leaks: &[Leak], icon: &str, w: usize) -> String {
     }
 }
 
-fn branch_spans(snap: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
+/// The branch, its op, and its upstream counts; with where the `↑N` sits
+/// as `(offset, width)`, when there is something to push.
+fn branch_spans(snap: &Snapshot, theme: &Theme) -> (Vec<Span<'static>>, Option<(usize, usize)>) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let icon = if theme.nerd { "\u{e0a0} " } else { "" };
     let mut spans = match &snap.head {
@@ -272,6 +274,7 @@ fn branch_spans(snap: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(label, bold.fg(theme.warn)));
     }
+    let mut ahead = None;
     if let Some(u) = &snap.upstream {
         let count = |glyph: &str, n: u32, color| {
             let style = if n == 0 {
@@ -282,14 +285,18 @@ fn branch_spans(snap: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
             Span::styled(format!("{glyph}{n}"), style)
         };
         spans.push(Span::raw(" "));
-        spans.push(count("↑", u.ahead, theme.accent));
+        let up = count("↑", u.ahead, theme.accent);
+        if u.ahead > 0 {
+            ahead = Some((spans_width(&spans), width(&up.content)));
+        }
+        spans.push(up);
         spans.push(Span::raw(" "));
         spans.push(count("↓", u.behind, theme.warn));
     }
     if snap.is_dirty() {
         spans.push(Span::styled(" ●", Style::new().fg(theme.modified)));
     }
-    spans
+    (spans, ahead)
 }
 
 /// Draws the bottom row over the header row `r`, which then takes no
@@ -339,6 +346,7 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
         left.push(Span::styled(
             match view.target {
                 Target::Leaks => secrets_label(snap.leaks.len()),
+                Target::Outgoing { .. } => outgoing_title(view),
                 _ => view.target.title(),
             },
             Style::new().add_modifier(Modifier::BOLD),
@@ -360,7 +368,7 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
         }
     }
     if !in_detail {
-        let branch = branch_spans(snap, theme);
+        let (branch, ahead) = branch_spans(snap, theme);
         // The branch matters more, so the name goes first when room is short.
         if let Some(name) = &app.repo_name {
             let needed = 1 + width(name) + 3 + spans_width(&branch) + 1 + fetch_w;
@@ -371,6 +379,11 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
                 ));
                 left.push(Span::styled(" · ", theme.dim));
             }
+        }
+        if let Some((x, len)) = ahead {
+            let at = spans_width(&left) + x;
+            let open = Action::Open(Target::Outgoing { pinned: false });
+            left_hits.push((at, len, open));
         }
         left.extend(branch);
     }
@@ -423,6 +436,18 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
             .push((Rect::new(r.x + off as u16, r.y, len as u16, 1), action));
     }
     f.render_widget(Paragraph::new(line_lr(left, right, w)).style(theme.band), r);
+}
+
+/// `Outgoing → origin/main`, once the view knows where a push goes.
+fn outgoing_title(view: &crate::app::DetailView) -> String {
+    match &view.data {
+        Some(Ok(DetailData::Outgoing(Some(o))))
+            if o.target != NO_UPSTREAM || o.commit_total > 0 =>
+        {
+            format!("Outgoing → {}", o.target)
+        }
+        _ => "Outgoing".into(),
+    }
 }
 
 /// Upstream, nearest tag and stash count: ` origin/main · v0.1.9+4 · stash 1`.

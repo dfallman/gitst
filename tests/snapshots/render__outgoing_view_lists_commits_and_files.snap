@@ -1,0 +1,18 @@
+---
+source: tests/render.rs
+expression: "draw(&mut app, 44, 14)"
+---
+ ‹ back  Outgoing → origin/main        ↻ 2m 
+── 4 commits ───────────────────────────────
+ 4de1e3c ↑ icons: jug on cream           5m 
+ ebf9d60 ↑ pin engine to v0.1.9          5m 
+ … 2 more                                   
+── 5 files  +33 −11 ────────────────────────
+ A Assets/icon.png                      bin 
+ D old.rs                               −11 
+ M src/app.rs                           +30 
+ M src/some/very/deep/folder/watch.rs    +3 
+ … 1 more                                   
+                                            
+                                            
+ esc back  w wrap  q quit

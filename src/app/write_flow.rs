@@ -11,7 +11,7 @@ use crate::model::{Change, DetailData, DetailReq, DiffKind, Head, Snapshot};
 use crate::prompt::{Edit, LineInput};
 use crate::ui::layout::SectionId;
 use crate::worker::WorkerMsg;
-use crate::write::{Coverage, Verb, WriteError, WriteOp, WriteOutcome, refusal};
+use crate::write::{Coverage, PushPlan, Verb, WriteError, WriteOp, WriteOutcome, refusal};
 
 /// How long the bottom row shows a result.
 pub const RESULT_TTL: Duration = Duration::from_secs(3);
@@ -141,7 +141,7 @@ fn verb(op: &WriteOp) -> Option<Verb> {
 }
 
 /// `1 file`, `2 files`.
-fn count(n: usize, word: &str) -> String {
+pub(crate) fn count(n: usize, word: &str) -> String {
     if n == 1 {
         format!("1 {word}")
     } else {
@@ -524,6 +524,11 @@ impl App {
                 question,
                 y_only,
                 on_yes,
+            } if self.pinned_at().is_some() => self.pinned_confirm_key(k, question, y_only, on_yes),
+            Prompt::Confirm {
+                question,
+                y_only,
+                on_yes,
             } => match k.code {
                 KeyCode::Char('y') => self.accept(on_yes),
                 KeyCode::Enter if !y_only => self.accept(on_yes),
@@ -573,6 +578,69 @@ impl App {
                 });
                 Vec::new()
             }
+        }
+    }
+
+    /// A key while the push confirm sits over its Outgoing view: `y`
+    /// answers every step of it, and `n`, or leaving the Outgoing view,
+    /// cancels it. Every other key, `Enter` included, browses the views
+    /// from it upward, and the confirm stays open: paging drops the
+    /// selection, so an `Enter` meant to open a row could otherwise push.
+    fn pinned_confirm_key(
+        &mut self,
+        k: KeyEvent,
+        question: String,
+        y_only: bool,
+        on_yes: WriteOp,
+    ) -> Vec<Cmd> {
+        let at_outgoing = self.stack.last().is_some_and(DetailView::pinned);
+        let cmds = match k.code {
+            KeyCode::Char('y') => return self.accept_push(on_yes),
+            KeyCode::Char('n') => {
+                self.cancel_push();
+                return Vec::new();
+            }
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                if at_outgoing {
+                    self.cancel_push();
+                    return Vec::new();
+                }
+                self.perform(Action::Back)
+            }
+            // The detail keys only move, open, and wrap: none writes.
+            code => self.detail_key(code),
+        };
+        self.ask(question, y_only, on_yes);
+        cmds
+    }
+
+    /// Accepts a step of the push confirm. A push refused as it is sent
+    /// closes its Outgoing view, as one that reports does.
+    fn accept_push(&mut self, on_yes: WriteOp) -> Vec<Cmd> {
+        let cmds = self.accept(on_yes);
+        if self.write.prompt.is_none() && !self.write.busy {
+            self.close_outgoing();
+        }
+        cmds
+    }
+
+    /// Drops the rest of the push confirm, with its Outgoing view.
+    fn cancel_push(&mut self) {
+        self.write.pending = None;
+        self.close_outgoing();
+    }
+
+    /// Where the push plan's Outgoing view is in the stack, if it is open.
+    fn pinned_at(&self) -> Option<usize> {
+        self.stack.iter().position(DetailView::pinned)
+    }
+
+    /// Closes the push plan's Outgoing view and every view above it.
+    fn close_outgoing(&mut self) {
+        if let Some(at) = self.pinned_at() {
+            self.stack.truncate(at);
+            self.detail_targets.clear();
+            self.hunk_lines.clear();
         }
     }
 
@@ -687,6 +755,10 @@ impl App {
         // the next snapshot would notice. Staging a whole file always moves
         // its status, so the snapshot reloads the view then.
         self.mark_applied(op);
+        // Pushed or not, the range it showed is done with.
+        if matches!(op, WriteOp::Push(_)) {
+            self.close_outgoing();
+        }
         let hunk = matches!(op, WriteOp::ApplyHunk { .. });
         let reload = self
             .stack
@@ -768,6 +840,7 @@ impl App {
                 self.confirm_steps(steps, op)
             }
             Ok(WriteOutcome::PushReady(plan)) => {
+                self.open_pinned_outgoing(&plan);
                 let target = format!("{}/{}", plan.remote, plan.branch);
                 let track = if plan.set_upstream {
                     " and track it"
@@ -775,7 +848,11 @@ impl App {
                     ""
                 };
                 let commits = count(plan.count, "commit");
-                let mut steps = vec![(format!("Push {commits} to {target}{track}?"), false)];
+                let o = &plan.outgoing;
+                let files = count(o.file_total, "file");
+                let size = format!("{files} (+{} −{})", o.added, o.removed);
+                let question = format!("Push {commits}, {size} to {target}{track}?");
+                let mut steps = vec![(question, false)];
                 if !plan.findings.is_empty() {
                     let secrets = count(plan.findings.len(), "possible secret");
                     let question =
@@ -792,6 +869,17 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    /// Opens the Outgoing view of `plan`, drawn from the plan itself: what
+    /// it shows is what is counted, scanned, and pushed.
+    fn open_pinned_outgoing(&mut self, plan: &PushPlan) {
+        let data = DetailData::Outgoing(Some((*plan.outgoing).clone()));
+        self.push_view(
+            Target::Outgoing { pinned: true },
+            DetailReq::Outgoing,
+            Some(Ok(data)),
+        );
     }
 
     fn show_done(&mut self, summary: String, warning: Option<String>) {
@@ -853,19 +941,7 @@ impl App {
         let data = Some(Ok(DetailData::Output(failure.output.clone())));
         match self.stack.last_mut() {
             Some(view) if view.target == Target::Output => view.data = data,
-            _ => {
-                self.stack.push(DetailView {
-                    target: Target::Output,
-                    req: DetailReq::Output,
-                    data,
-                    scroll: 0,
-                    selected: None,
-                    hunk: None,
-                    reselect: None,
-                });
-                self.detail_targets.clear();
-                self.hunk_lines.clear();
-            }
+            _ => self.push_view(Target::Output, DetailReq::Output, data),
         }
         Vec::new()
     }
@@ -878,11 +954,27 @@ impl App {
         Vec::new()
     }
 
+    /// A click at `(x, y)`, outside the prompt row, while a prompt is
+    /// open. The header's `‹ back` above the push confirm's Outgoing view
+    /// goes back and keeps the confirm; any other click cancels the
+    /// prompt (with that view), as `‹ back` at the view itself does.
+    pub(super) fn click_while_prompting(&mut self, x: u16, y: u16) {
+        let back = self.hits.click_at(x, y) == Some(&Action::Back);
+        let above_outgoing = self.pinned_at().is_some_and(|at| at + 1 < self.stack.len());
+        if back && above_outgoing {
+            self.perform(Action::Back);
+        } else {
+            self.cancel_prompt();
+        }
+    }
+
     /// A click while a prompt is open cancels it, and does nothing else.
+    /// A cancelled push confirm closes its Outgoing view.
     pub(super) fn cancel_prompt(&mut self) -> bool {
         let open = self.write.prompt.take().is_some();
         if open {
             self.write.pending = None;
+            self.close_outgoing();
         }
         open
     }
@@ -899,8 +991,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::model::{
-        Commit, CommitDetail, Counts, DiffBlock, DiffKind, DiffLine, Leak, LeakSource, RepoOp,
-        Stash, Upstream,
+        Commit, CommitDetail, Counts, DiffBlock, DiffKind, DiffLine, Leak, LeakSource, Outgoing,
+        OutgoingFile, RepoOp, Stash, Upstream,
     };
     use crate::worker::{FetchStatus, UiMsg};
     use crate::write::{CommitPlan, PushPlan, ShownHunk};
@@ -1048,6 +1140,7 @@ mod tests {
             set_upstream: false,
             findings: vec![],
             coverage: Coverage::Full,
+            outgoing: Default::default(),
         }
     }
 
@@ -1278,9 +1371,12 @@ mod tests {
             WriteOp::PreparePush,
             Ok(WriteOutcome::PushReady(plan())),
         );
-        assert_eq!(confirm(&a), Some(("Push 3 commits to origin/main?", false)));
+        assert_eq!(
+            confirm(&a),
+            Some(("Push 3 commits, 0 files (+0 −0) to origin/main?", false))
+        );
         assert!(a.handle(ch('U')).is_empty(), "confirm takes the key");
-        let cmds = a.handle(key(KeyCode::Enter));
+        let cmds = a.handle(ch('y'));
         assert_eq!(sent(&cmds), Some(&WriteOp::Push(plan())));
         assert_eq!(a.write.running, Some(Verb::Push));
     }
@@ -1302,7 +1398,10 @@ mod tests {
         );
         assert_eq!(
             confirm(&a),
-            Some(("Push 3 commits to origin/main and track it?", false))
+            Some((
+                "Push 3 commits, 0 files (+0 −0) to origin/main and track it?",
+                false
+            ))
         );
         assert!(a.handle(ch('y')).is_empty());
         assert_eq!(
@@ -2291,5 +2390,407 @@ mod tests {
         a.write.result = None;
         a.write.running = Some(Verb::Push);
         assert!(a.next_wakeup() <= Duration::from_millis(100));
+    }
+
+    fn commit(oid: &str) -> Commit {
+        Commit {
+            oid: oid.into(),
+            short: oid.into(),
+            parents: 1,
+            time: 0,
+            author: "a".into(),
+            refs: vec![],
+            subject: format!("commit {oid}"),
+            unpushed: true,
+        }
+    }
+
+    fn outgoing_file(path: &str, added: u32, removed: u32) -> OutgoingFile {
+        OutgoingFile {
+            path: path.into(),
+            status: 'M',
+            counts: Counts::lines(added, removed),
+        }
+    }
+
+    /// Two commits and three files, +10 −2, from `b0` to `c1`.
+    fn sized_plan() -> PushPlan {
+        PushPlan {
+            count: 2,
+            outgoing: Box::new(Outgoing {
+                target: "origin/main".into(),
+                base: "b0".into(),
+                oid: "c1".into(),
+                commits: vec![commit("c1"), commit("c0")],
+                commit_total: 2,
+                files: vec![
+                    outgoing_file("src/a.rs", 6, 1),
+                    outgoing_file("src/b.rs", 3, 1),
+                    outgoing_file("src/c.rs", 1, 0),
+                ],
+                file_total: 3,
+                added: 10,
+                removed: 2,
+            }),
+            ..plan()
+        }
+    }
+
+    /// Presses `P` and answers with `p`, as the worker would.
+    fn push_ready(a: &mut App, p: &PushPlan) -> Vec<Cmd> {
+        a.handle(ch('P'));
+        reply(
+            a,
+            WriteOp::PreparePush,
+            Ok(WriteOutcome::PushReady(p.clone())),
+        )
+    }
+
+    /// The row targets drawing the Outgoing view registers: a rule, the
+    /// commits, a rule, and the files.
+    fn draw_outgoing(a: &mut App, o: &Outgoing) {
+        let mut rows = vec![None];
+        rows.extend(
+            o.commits
+                .iter()
+                .map(|c| Some(Target::Commit(c.oid.clone()))),
+        );
+        rows.push(None);
+        rows.extend(o.files.iter().map(|f| {
+            Some(Target::RangeFile {
+                base: o.base.clone(),
+                oid: o.oid.clone(),
+                path: f.path.clone(),
+            })
+        }));
+        a.detail_targets = rows;
+    }
+
+    fn pinned(a: &App) -> bool {
+        a.stack
+            .iter()
+            .any(|v| v.target == Target::Outgoing { pinned: true })
+    }
+
+    #[test]
+    fn push_ready_opens_pinned_outgoing_view_and_sized_confirm() {
+        let mut a = wapp(snap());
+        let p = sized_plan();
+        let cmds = push_ready(&mut a, &p);
+        assert!(
+            detail_req(&cmds).is_none(),
+            "drawn from the plan, not loaded"
+        );
+        let top = a.stack.last().unwrap();
+        assert_eq!(top.target, Target::Outgoing { pinned: true });
+        assert_eq!(
+            top.data,
+            Some(Ok(DetailData::Outgoing(Some((*p.outgoing).clone()))))
+        );
+        assert_eq!(
+            confirm(&a),
+            Some(("Push 2 commits, 3 files (+10 −2) to origin/main?", false))
+        );
+
+        let mut one = sized_plan();
+        one.count = 1;
+        one.set_upstream = true;
+        one.outgoing.file_total = 1;
+        let mut a = wapp(snap());
+        push_ready(&mut a, &one);
+        assert_eq!(
+            confirm(&a),
+            Some((
+                "Push 1 commit, 1 file (+10 −2) to origin/main and track it?",
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn navigation_keys_pass_through_while_confirming() {
+        let mut a = wapp(snap());
+        let p = sized_plan();
+        push_ready(&mut a, &p);
+        draw_outgoing(&mut a, &p.outgoing);
+        let question = confirm(&a).unwrap().0.to_string();
+        let selected = |a: &App| a.stack.last().unwrap().selected;
+        for (code, want) in [
+            (KeyCode::Char('j'), Some(1)),
+            (KeyCode::Down, Some(2)),
+            (KeyCode::Char('k'), Some(1)),
+            (KeyCode::Up, Some(1)),
+        ] {
+            assert!(a.handle(key(code)).is_empty(), "{code:?}");
+            assert_eq!(selected(&a), want, "{code:?}");
+            assert_eq!(confirm(&a).map(|c| c.0), Some(question.as_str()));
+        }
+        a.page = 5;
+        a.handle(key(KeyCode::PageDown));
+        assert_eq!(a.stack.last().unwrap().scroll, 5);
+        a.handle(key(KeyCode::PageUp));
+        a.handle(ch('G'));
+        assert!(a.stack.last().unwrap().scroll > 5);
+        a.handle(ch('g'));
+        assert_eq!(a.stack.last().unwrap().scroll, 0);
+        a.handle(key(KeyCode::End));
+        assert!(a.stack.last().unwrap().scroll > 5, "End as G");
+        assert!(a.handle(ch('U')).is_empty(), "write keys are not");
+        assert!(a.write.prompt.is_some() && a.stack.len() == 1);
+        a.handle(ch('j'));
+        let cmds = a.handle(key(KeyCode::Right));
+        assert_eq!(
+            detail_req(&cmds),
+            Some(&DetailReq::Commit { rev: "c1".into() }),
+            "→ as l"
+        );
+        assert_eq!(confirm(&a).map(|c| c.0), Some(question.as_str()));
+    }
+
+    #[test]
+    fn enter_after_esc_before_a_redraw_does_not_push() {
+        let mut a = wapp(snap());
+        let p = sized_plan();
+        push_ready(&mut a, &p);
+        draw_outgoing(&mut a, &p.outgoing);
+        a.handle(ch('j'));
+        a.handle(key(KeyCode::Enter));
+        a.handle(key(KeyCode::Esc));
+        assert!(a.detail_targets.is_empty(), "not drawn yet");
+        let cmds = a.handle(key(KeyCode::Enter));
+        assert!(sent(&cmds).is_none(), "a row is selected");
+        assert!(a.write.prompt.is_some());
+        assert_eq!(
+            a.stack.last().unwrap().target,
+            Target::Outgoing { pinned: true }
+        );
+    }
+
+    #[test]
+    fn back_keys_pop_above_the_outgoing_view_and_cancel_at_it() {
+        for code in [KeyCode::Char('h'), KeyCode::Left, KeyCode::Backspace] {
+            let mut a = wapp(snap());
+            push_ready(&mut a, &sized_plan());
+            a.perform(Action::Open(Target::Commit("c1".into())));
+            assert!(a.handle(key(code)).is_empty(), "{code:?}");
+            assert!(a.write.prompt.is_some(), "{code:?}");
+            assert_eq!(a.stack.len(), 1, "{code:?}");
+            assert!(a.handle(key(code)).is_empty(), "{code:?}");
+            assert!(a.write.prompt.is_none(), "{code:?}");
+            assert!(a.stack.is_empty(), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn esc_from_commit_inside_outgoing_keeps_the_confirm() {
+        let mut a = wapp(snap());
+        let p = sized_plan();
+        push_ready(&mut a, &p);
+        draw_outgoing(&mut a, &p.outgoing);
+        a.handle(ch('j'));
+        let cmds = a.handle(key(KeyCode::Enter));
+        assert_eq!(
+            detail_req(&cmds),
+            Some(&DetailReq::Commit { rev: "c1".into() })
+        );
+        assert_eq!(a.stack.last().unwrap().target, Target::Commit("c1".into()));
+        assert!(a.write.prompt.is_some());
+        a.handle(key(KeyCode::Esc));
+        assert_eq!(
+            a.stack.last().unwrap().target,
+            Target::Outgoing { pinned: true }
+        );
+        assert!(a.write.prompt.is_some());
+        assert!(a.handle(key(KeyCode::Esc)).is_empty());
+        assert!(a.write.prompt.is_none());
+        assert!(a.stack.is_empty());
+
+        // `n`, or a click outside the prompt row, cancels from any depth.
+        let mut a = wapp(snap());
+        push_ready(&mut a, &p);
+        a.perform(Action::Open(Target::Commit("c1".into())));
+        assert!(a.handle(ch('n')).is_empty());
+        assert!(a.write.prompt.is_none() && a.stack.is_empty());
+        let mut a = wapp(snap());
+        push_ready(&mut a, &p);
+        let click = UiMsg::Input(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        a.handle(click);
+        assert!(a.write.prompt.is_none() && a.stack.is_empty());
+    }
+
+    #[test]
+    fn enter_on_the_outgoing_view_opens_a_row_and_never_accepts() {
+        let mut a = wapp(snap());
+        let p = PushPlan {
+            findings: vec![leak("a")],
+            ..sized_plan()
+        };
+        push_ready(&mut a, &p);
+        let size = confirm(&a).unwrap().0.to_string();
+        assert!(a.handle(key(KeyCode::Enter)).is_empty(), "no selection");
+        assert_eq!(
+            confirm(&a).map(|c| c.0),
+            Some(size.as_str()),
+            "not accepted"
+        );
+        assert!(a.handle(ch('y')).is_empty(), "y accepts the size step");
+        assert_eq!(confirm(&a).map(|c| c.1), Some(true), "the secret step");
+        assert!(a.handle(key(KeyCode::Enter)).is_empty(), "y only");
+        assert_eq!(confirm(&a).map(|c| c.1), Some(true));
+        // A view above the Outgoing view takes Enter as usual.
+        a.perform(Action::Open(Target::Commit("c1".into())));
+        a.detail_targets = vec![Some(Target::CommitFile {
+            rev: "c1".into(),
+            path: "src/a.rs".into(),
+        })];
+        a.handle(ch('j'));
+        let cmds = a.handle(key(KeyCode::Enter));
+        assert!(matches!(
+            detail_req(&cmds),
+            Some(DetailReq::CommitFile { .. })
+        ));
+        assert_eq!(a.stack.len(), 3);
+        let cmds = a.handle(ch('y'));
+        assert_eq!(sent(&cmds), Some(&WriteOp::Push(p)), "y from any view");
+    }
+
+    #[test]
+    fn enter_after_paging_the_outgoing_view_does_not_push() {
+        let mut a = wapp(snap());
+        let p = sized_plan();
+        push_ready(&mut a, &p);
+        draw_outgoing(&mut a, &p.outgoing);
+        a.page = 5;
+        let question = confirm(&a).unwrap().0.to_string();
+        // Paging drops the selection, so Enter has no row to open.
+        for code in [KeyCode::Char('j'), KeyCode::Char(' '), KeyCode::Enter] {
+            assert!(sent(&a.handle(key(code))).is_none(), "{code:?}");
+        }
+        assert_eq!(confirm(&a).map(|c| c.0), Some(question.as_str()));
+        assert_eq!(a.stack.len(), 1);
+        assert!(pinned(&a));
+    }
+
+    #[test]
+    fn back_click_pops_above_the_outgoing_view_and_cancels_at_it() {
+        let click = |column: u16, row: u16| {
+            UiMsg::Input(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        let mut a = wapp(snap());
+        push_ready(&mut a, &sized_plan());
+        a.perform(Action::Open(Target::Commit("c1".into())));
+        // The header's `‹ back`, as drawing registers it.
+        a.hits.clicks.push((Rect::new(0, 0, 7, 1), Action::Back));
+        assert!(a.handle(click(1, 0)).is_empty());
+        assert!(a.write.prompt.is_some(), "the confirm stays");
+        assert_eq!(a.stack.len(), 1);
+        assert!(pinned(&a));
+        assert!(a.handle(click(1, 0)).is_empty());
+        assert!(a.write.prompt.is_none(), "at the Outgoing view: cancels");
+        assert!(a.stack.is_empty());
+
+        // Any other click cancels, from any depth.
+        let mut a = wapp(snap());
+        push_ready(&mut a, &sized_plan());
+        a.perform(Action::Open(Target::Commit("c1".into())));
+        a.hits.clicks.push((Rect::new(0, 0, 7, 1), Action::Back));
+        a.hits.clicks.push((Rect::new(10, 0, 5, 1), Action::Quit));
+        assert!(a.handle(click(11, 0)).is_empty());
+        assert!(a.write.prompt.is_none() && a.stack.is_empty());
+    }
+
+    #[test]
+    fn y_pushes_and_closes_outgoing_after_result() {
+        for result in [
+            done("pushed to origin/main"),
+            fail("push failed", "rejected"),
+        ] {
+            let mut a = wapp(snap());
+            a.perform(Action::Open(Target::File("a.rs".into())));
+            let p = sized_plan();
+            push_ready(&mut a, &p);
+            a.perform(Action::Open(Target::Commit("c1".into())));
+            let cmds = a.handle(ch('y'));
+            assert_eq!(sent(&cmds), Some(&WriteOp::Push(p.clone())));
+            assert!(pinned(&a), "open while the push runs");
+            reply(&mut a, WriteOp::Push(p), result);
+            assert!(!pinned(&a));
+            assert_eq!(a.stack.len(), 1, "views below it stay");
+            assert_eq!(a.stack[0].target, Target::File("a.rs".into()));
+        }
+
+        // A push refused when it is sent closes the view at once.
+        let mut a = wapp(snap());
+        push_ready(&mut a, &sized_plan());
+        let mut s = snap();
+        s.head = Head::Detached("c1".into());
+        a.snap = Some(Arc::new(s));
+        assert!(a.handle(ch('y')).is_empty());
+        assert!(!pinned(&a));
+    }
+
+    #[test]
+    fn pinned_outgoing_is_not_reloaded_by_snapshots() {
+        let mut a = wapp(snap());
+        let p = sized_plan();
+        push_ready(&mut a, &p);
+        let moved = Snapshot {
+            oid: Some("c9".into()),
+            upstream: None,
+            ..snap()
+        };
+        let cmds = a.handle(UiMsg::Snapshot {
+            snap: Arc::new(moved),
+            events: vec![],
+            changed: vec![],
+        });
+        assert!(detail_req(&cmds).is_none());
+        // A browse load arriving late doesn't replace the pinned data.
+        a.handle(UiMsg::Detail(
+            DetailReq::Outgoing,
+            Ok(DetailData::Outgoing(None)),
+        ));
+        assert_eq!(
+            a.stack.last().unwrap().data,
+            Some(Ok(DetailData::Outgoing(Some((*p.outgoing).clone()))))
+        );
+    }
+
+    #[test]
+    fn file_row_opens_range_diff() {
+        let mut a = wapp(snap());
+        let p = sized_plan();
+        push_ready(&mut a, &p);
+        draw_outgoing(&mut a, &p.outgoing);
+        for _ in 0..4 {
+            a.handle(ch('j'));
+        }
+        let cmds = a.handle(key(KeyCode::Enter));
+        let want = DetailReq::RangeFile {
+            base: "b0".into(),
+            oid: "c1".into(),
+            path: "src/b.rs".into(),
+        };
+        assert_eq!(detail_req(&cmds), Some(&want));
+        assert!(a.write.prompt.is_some());
+        let cmds = a.handle(UiMsg::Snapshot {
+            snap: Arc::new(Snapshot {
+                oid: Some("c9".into()),
+                ..snap()
+            }),
+            events: vec![],
+            changed: vec!["src/b.rs".into()],
+        });
+        assert!(detail_req(&cmds).is_none(), "a range diff never changes");
     }
 }

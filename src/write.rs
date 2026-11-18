@@ -2,7 +2,7 @@
 //! refused, and how git's stderr is turned into a short message.
 
 use crate::git::{FetchError, classify_fetch_stderr};
-use crate::model::{DiffLine, Head, Leak, RepoOp, Snapshot};
+use crate::model::{DiffLine, Head, Leak, Outgoing, RepoOp, Snapshot};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteOp {
@@ -88,6 +88,9 @@ pub struct PushPlan {
     pub set_upstream: bool,
     pub findings: Vec<Leak>,
     pub coverage: Coverage,
+    /// What goes out, from the same pinned range as `oid` and `count`.
+    /// Boxed: it would make every `WriteOp` and `WriteOutcome` large.
+    pub outgoing: Box<Outgoing>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

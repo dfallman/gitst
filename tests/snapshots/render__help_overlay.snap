@@ -4,9 +4,9 @@ expression: unversioned(&out)
 ---
  spritz · main ↑2 ↓0 ●                 ↻ 2m 
  origin/main · v0.1.9+4 · stash 1           
-╭ ▼ Changes (5) ────────────────── +64 −12 ╮
-│ ?╭─────────── gitst xxxxxx ───────────╮  │
-│  │ click       open · fold · button   │  │
+╭ ▼╭─────────── gitst xxxxxx ───────────╮2 ╮
+│ ?│ click       open · fold · button   │  │
+│  │ click ↑N    outgoing commits       │  │
 │  │ wheel       scroll                 │  │
 │  │                                    │  │
 │ A│ j k ↑ ↓     move                   │  │

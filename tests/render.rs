@@ -1795,3 +1795,291 @@ fn filtered_files_have_no_hunk_labels() {
     assert!(!out.contains("− unstage"), "{out}");
     assert!(first_line(&out).contains("+ stage file"), "{out}");
 }
+
+// ---- outgoing view ----
+
+fn outgoing_commit(short: &str, subject: &str) -> Commit {
+    commit(short, subject, 300, true, &[])
+}
+
+fn outgoing_file(path: &str, status: char, counts: Counts) -> OutgoingFile {
+    OutgoingFile {
+        path: path.into(),
+        status,
+        counts,
+    }
+}
+
+/// Four commits, two shown; five files, four shown; +33 −11.
+fn outgoing_fixture() -> Outgoing {
+    Outgoing {
+        target: "origin/main".into(),
+        base: "b".repeat(40),
+        oid: "c".repeat(40),
+        commits: vec![
+            outgoing_commit("4de1e3c", "icons: jug on cream"),
+            outgoing_commit("ebf9d60", "pin engine to v0.1.9"),
+        ],
+        commit_total: 4,
+        files: vec![
+            outgoing_file("Assets/icon.png", 'A', Counts::Binary),
+            outgoing_file("old.rs", 'D', Counts::lines(0, 11)),
+            outgoing_file("src/app.rs", 'M', Counts::lines(30, 0)),
+            outgoing_file(
+                "src/some/very/deep/folder/watch.rs",
+                'M',
+                Counts::lines(3, 0),
+            ),
+        ],
+        file_total: 5,
+        added: 33,
+        removed: 11,
+    }
+}
+
+fn open_outgoing(app: &mut App, o: Option<Outgoing>) {
+    open(app, Target::Outgoing { pinned: false });
+    app.handle(UiMsg::Detail(
+        DetailReq::Outgoing,
+        Ok(DetailData::Outgoing(o)),
+    ));
+}
+
+#[test]
+fn outgoing_view_lists_commits_and_files() {
+    let mut app = new_app(fixture());
+    open_outgoing(&mut app, Some(outgoing_fixture()));
+    insta::assert_snapshot!(draw(&mut app, 44, 14));
+}
+
+#[test]
+fn outgoing_view_rows_open_what_they_show() {
+    let o = outgoing_fixture();
+    let mut app = new_app(fixture());
+    open_outgoing(&mut app, Some(o.clone()));
+    let out = draw(&mut app, 44, 14);
+    let targets: Vec<Option<Target>> = app.detail_targets.clone();
+    let range = |path: &str| Target::RangeFile {
+        base: o.base.clone(),
+        oid: o.oid.clone(),
+        path: path.into(),
+    };
+    for (i, line) in out.lines().skip(1).enumerate() {
+        let expected = if line.contains("icons: jug") {
+            Some(Target::Commit(o.commits[0].oid.clone()))
+        } else if line.contains("pin engine") {
+            Some(Target::Commit(o.commits[1].oid.clone()))
+        } else if line.contains("Assets/icon.png") {
+            Some(range("Assets/icon.png"))
+        } else if line.contains("old.rs") {
+            Some(range("old.rs"))
+        } else if line.contains("src/app.rs") {
+            Some(range("src/app.rs"))
+        } else if line.contains("watch.rs") {
+            Some(range("src/some/very/deep/folder/watch.rs"))
+        } else {
+            // Rules, "… N more", and empty rows have no target.
+            None
+        };
+        assert_eq!(
+            targets.get(i).cloned().flatten(),
+            expected,
+            "row {i}: {line}\n{out}"
+        );
+    }
+    // A file row opens its range diff on click.
+    let y = out.lines().position(|l| l.contains("src/app.rs")).unwrap() as u16;
+    app.handle(click(5, y));
+    assert_eq!(app.stack.last().unwrap().target, range("src/app.rs"));
+}
+
+#[test]
+fn range_file_view_shows_its_diff() {
+    let mut app = new_app(fixture());
+    let o = outgoing_fixture();
+    let target = Target::RangeFile {
+        base: o.base,
+        oid: o.oid,
+        path: "src/app.rs".into(),
+    };
+    open(&mut app, target.clone());
+    let DetailData::File { blocks, .. } = file_data() else {
+        unreachable!()
+    };
+    app.handle(UiMsg::Detail(
+        DetailReq::RangeFile {
+            base: "b".repeat(40),
+            oid: "c".repeat(40),
+            path: "src/app.rs".into(),
+        },
+        Ok(DetailData::RangeFile(blocks)),
+    ));
+    let out = draw(&mut app, 44, 14);
+    assert!(first_line(&out).contains("src/app.rs"), "{out}");
+    assert!(out.contains("@@"), "{out}");
+}
+
+#[test]
+fn outgoing_view_when_nothing_to_push() {
+    let mut app = new_app(fixture());
+    let o = Outgoing {
+        commit_total: 0,
+        file_total: 0,
+        commits: vec![],
+        files: vec![],
+        ..outgoing_fixture()
+    };
+    open_outgoing(&mut app, Some(o.clone()));
+    let out = draw(&mut app, 44, 8);
+    assert!(out.contains(" ✓ nothing to push to origin/main"), "{out}");
+    let mut app = new_app(fixture());
+    open_outgoing(
+        &mut app,
+        Some(Outgoing {
+            target: NO_UPSTREAM.into(),
+            ..o
+        }),
+    );
+    let out = draw(&mut app, 44, 8);
+    assert!(
+        out.contains(" ✓ nothing to push\n") || out.contains(" ✓ nothing to push "),
+        "{out}"
+    );
+    assert!(!out.contains("(no upstream)"), "{out}");
+}
+
+#[test]
+fn outgoing_view_without_a_remote() {
+    let mut app = new_app(fixture());
+    open_outgoing(&mut app, None);
+    assert!(draw(&mut app, 44, 8).contains(" no remote to push to"));
+}
+
+#[test]
+fn outgoing_title_names_the_target() {
+    let mut app = new_app(fixture());
+    open_outgoing(&mut app, Some(outgoing_fixture()));
+    assert!(first_line(&draw(&mut app, 60, 8)).contains("Outgoing → origin/main"));
+    let mut app = new_app(fixture());
+    open_outgoing(
+        &mut app,
+        Some(Outgoing {
+            target: NO_UPSTREAM.into(),
+            ..outgoing_fixture()
+        }),
+    );
+    assert!(first_line(&draw(&mut app, 60, 8)).contains("Outgoing → (no upstream)"));
+}
+
+fn outgoing_on_top(app: &App) -> bool {
+    app.stack.last().map(|v| v.target.clone()) == Some(Target::Outgoing { pinned: false })
+}
+
+#[test]
+fn header_ahead_count_opens_outgoing() {
+    // Read-only, with the count at 2.
+    let mut app = new_app(fixture());
+    let out = draw(&mut app, 60, 20);
+    let x = column(first_line(&out), "↑2");
+    app.handle(click(x, 0));
+    assert!(outgoing_on_top(&app));
+    // The same in write mode.
+    let mut app = write_app(fixture());
+    let out = draw(&mut app, 80, 20);
+    app.handle(click(column(first_line(&out), "↑2"), 0));
+    assert!(outgoing_on_top(&app));
+}
+
+#[test]
+fn header_ahead_count_is_not_a_link_at_zero() {
+    let mut snap = fixture();
+    snap.upstream.as_mut().unwrap().ahead = 0;
+    let mut app = new_app(snap);
+    let out = draw(&mut app, 60, 20);
+    app.handle(click(column(first_line(&out), "↑0"), 0));
+    assert!(app.stack.is_empty());
+}
+
+#[test]
+fn commits_border_ahead_opens_outgoing() {
+    let mut app = new_app(fixture());
+    let out = draw(&mut app, 60, 28);
+    let (y, line) = out
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("Commits") && l.contains("↑2"))
+        .expect("commits border");
+    app.handle(click(column(line, "↑2"), y as u16));
+    assert!(outgoing_on_top(&app), "{out}");
+    // A click elsewhere on the border still folds the section.
+    let mut app = new_app(fixture());
+    draw(&mut app, 60, 28);
+    app.handle(click(column(line, "Commits"), y as u16));
+    let out = draw(&mut app, 60, 28);
+    assert!(out.contains("▶ Commits"), "{out}");
+}
+
+#[test]
+fn a_folded_commits_title_ahead_opens_outgoing() {
+    let mut app = new_app(fixture());
+    let out = draw(&mut app, 60, 28);
+    let y = out.lines().position(|l| l.contains("Commits")).unwrap() as u16;
+    app.handle(click(5, y));
+    let out = draw(&mut app, 60, 28);
+    let (y, line) = out
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("▶ Commits"))
+        .unwrap();
+    app.handle(click(column(line, "↑2"), y as u16));
+    assert!(outgoing_on_top(&app), "{out}");
+}
+
+#[test]
+fn sized_push_confirm_over_outgoing_view() {
+    use gitst::write::{Coverage, PushPlan, WriteOp, WriteOutcome};
+    let mut o = outgoing_fixture();
+    o.commits.truncate(1);
+    o.commit_total = 1;
+    o.files = vec![
+        outgoing_file("src/a.rs", 'M', Counts::lines(2, 1)),
+        outgoing_file("src/b.rs", 'A', Counts::lines(1, 0)),
+    ];
+    o.file_total = 2;
+    o.added = 3;
+    o.removed = 1;
+    let plan = PushPlan {
+        local: "main".into(),
+        remote: "origin".into(),
+        branch: "main".into(),
+        oid: o.oid.clone(),
+        count: 1,
+        set_upstream: false,
+        findings: Vec::new(),
+        coverage: Coverage::Full,
+        outgoing: Box::new(o),
+    };
+    let mut app = write_app(fixture());
+    app.handle(key('P'));
+    app.handle(UiMsg::Write(
+        WriteOp::PreparePush,
+        Ok(WriteOutcome::PushReady(plan)),
+    ));
+    let out = draw(&mut app, 60, 12);
+    let last = last_line(&out);
+    assert!(
+        last.contains("Push 1 commit, 2 files (+3 −1) to origin/main?"),
+        "{out}"
+    );
+    assert!(last.trim_end().ends_with("y / n"), "{out}");
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn help_mentions_outgoing_clicks_and_review() {
+    let mut app = write_app(fixture());
+    app.handle(key('?'));
+    let out = draw(&mut app, 80, 40);
+    assert!(out.contains("click ↑N"), "{out}");
+    assert!(out.contains("review and push"), "{out}");
+}

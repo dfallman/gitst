@@ -282,6 +282,14 @@ pub enum DetailReq {
     /// A failed write action's output: held by the app, never sent to the
     /// worker.
     Output,
+    /// What a push would send: loaded by the worker with guarded reads.
+    Outgoing,
+    /// One file's diff across the whole outgoing range.
+    RangeFile {
+        base: String,
+        oid: String,
+        path: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,4 +354,42 @@ pub enum DetailData {
     },
     /// Git's stdout and stderr from a failed write action.
     Output(String),
+    /// `None`: there is no push target.
+    Outgoing(Option<Outgoing>),
+    RangeFile(Vec<DiffBlock>),
 }
+
+/// A file a push would change, with the status git gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingFile {
+    pub path: String,
+    /// A, M, D, T and so on, from `--name-status`.
+    pub status: char,
+    pub counts: Counts,
+}
+
+/// What a push would send: the newest commits and the files that change
+/// between the range base and the tip.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outgoing {
+    /// `origin/main`.
+    pub target: String,
+    /// Full oid of the range base, or the empty tree's.
+    pub base: String,
+    /// Full oid of the tip.
+    pub oid: String,
+    /// Newest first, at most `OUTGOING_COMMITS`.
+    pub commits: Vec<Commit>,
+    pub commit_total: usize,
+    /// In path order, at most `OUTGOING_FILES`.
+    pub files: Vec<OutgoingFile>,
+    pub file_total: usize,
+    /// Sums over all files, binary ones counting 0.
+    pub added: u64,
+    pub removed: u64,
+}
+
+/// The target of a push that has no upstream to name.
+pub const NO_UPSTREAM: &str = "(no upstream)";
+pub const OUTGOING_COMMITS: usize = 50;
+pub const OUTGOING_FILES: usize = 500;
