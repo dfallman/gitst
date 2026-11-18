@@ -597,9 +597,16 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
         out.push(line(w.clone(), warn));
     }
     if let Some(e) = &app.write.failure {
-        out.push(Warning {
-            action: Some(Action::ShowOutput),
-            ..line(e.warning(), err)
+        let warning = line(e.warning(), err);
+        // Without output there is nothing to open: the warning clears on
+        // a click, like the others.
+        out.push(if e.has_output() {
+            Warning {
+                action: Some(Action::ShowOutput),
+                ..warning
+            }
+        } else {
+            warning
         });
     }
     if let Some(n) = snap.leak_scan_skipped {

@@ -889,10 +889,12 @@ impl App {
         });
     }
 
-    /// A failure with no output, such as a refusal from the worker, has
-    /// nothing for `!` to open, so it goes to the bottom row too.
+    /// A refusal, or an outcome that answers the action, goes to the bottom
+    /// row. Anything else failed, and stays in the warning band until it is
+    /// cleared, whether or not git said anything (a timeout, or a hook that
+    /// failed silently, says nothing).
     fn show_error(&mut self, e: WriteError) {
-        if e.output.is_empty() || SOFT.contains(&e.summary.as_str()) {
+        if e.is_refusal() || SOFT.contains(&e.summary.as_str()) {
             self.show_result(e.summary);
         } else {
             // A failure is news even when an earlier one with the same
@@ -935,7 +937,7 @@ impl App {
         if !self.write.enabled {
             return Vec::new();
         }
-        let Some(failure) = &self.write.failure else {
+        let Some(failure) = self.write.failure.as_ref().filter(|f| f.has_output()) else {
             return Vec::new();
         };
         let data = Some(Ok(DetailData::Output(failure.output.clone())));
@@ -1662,6 +1664,57 @@ mod tests {
             fail("push failed: offline", "fatal: unable to access"),
         );
         assert!(a.write.failure.is_some());
+    }
+
+    #[test]
+    fn failures_without_output_stay_in_the_band() {
+        for summary in [
+            "push failed: timeout",
+            "pull failed: timeout",
+            "commit failed: timeout",
+            "timed out",
+            "cancelled",
+            "too much output",
+            "git: No such file or directory (os error 2)",
+            "git failed",
+            "commit from editor did not complete",
+        ] {
+            let mut a = wapp(snap());
+            a.handle(ch('P'));
+            reply(&mut a, WriteOp::PreparePush, fail(summary, ""));
+            let failure = a
+                .write
+                .failure
+                .as_ref()
+                .unwrap_or_else(|| panic!("{summary}"));
+            assert_eq!(
+                failure.warning(),
+                summary,
+                "no `! for output` without output"
+            );
+            assert!(a.write.result.is_none(), "{summary}");
+            // `!` has nothing to open.
+            let cmds = a.handle(ch('!'));
+            assert!(cmds.is_empty());
+            assert!(a.stack.is_empty(), "{summary}");
+        }
+    }
+
+    #[test]
+    fn a_failure_with_output_offers_it() {
+        let mut a = wapp(snap());
+        a.handle(ch('P'));
+        reply(
+            &mut a,
+            WriteOp::PreparePush,
+            fail("push failed: offline", "fatal: unable to access"),
+        );
+        assert_eq!(
+            a.write.failure.as_ref().unwrap().warning(),
+            "push failed: offline · ! for output"
+        );
+        a.handle(ch('!'));
+        assert_eq!(a.stack.last().unwrap().target, Target::Output);
     }
 
     #[test]

@@ -114,7 +114,22 @@ impl WriteError {
     /// The warning band's text for this failure, which is also the key
     /// clearing it remembers.
     pub fn warning(&self) -> String {
-        format!("{} · ! for output", self.summary)
+        if self.has_output() {
+            format!("{} · ! for output", self.summary)
+        } else {
+            self.summary.clone()
+        }
+    }
+
+    /// Whether git said anything that `!` can show.
+    pub fn has_output(&self) -> bool {
+        !self.output.trim().is_empty()
+    }
+
+    /// A refusal: the action was declined before or instead of running,
+    /// rather than failing. It answers in the bottom row.
+    pub fn is_refusal(&self) -> bool {
+        REFUSALS.contains(&self.summary.as_str())
     }
 }
 
@@ -130,6 +145,24 @@ pub enum Verb {
 pub const REFUSE_NO_REMOTE: &str = "no remote to push to";
 pub const REFUSE_DETACHED: &str = "detached HEAD, push from a shell";
 pub const REFUSE_UNBORN: &str = "no commits to push";
+pub const REFUSE_SEVERAL_REMOTES: &str = "several remotes, push from a shell";
+pub const REFUSE_NO_PUSH_TARGET: &str = "no push target configured, push from a shell";
+pub const REFUSE_NOT_A_BRANCH: &str = "push target is not a branch, push from a shell";
+pub const STAGED_MOVED: &str = "staged changes moved, review again";
+pub const HEAD_MOVED: &str = "HEAD moved, review again";
+
+/// The refusals the worker can answer with. Everything else it returns is
+/// a failure, and stays in the warning band until cleared.
+pub const REFUSALS: &[&str] = &[
+    REFUSE_NO_REMOTE,
+    REFUSE_DETACHED,
+    REFUSE_UNBORN,
+    REFUSE_SEVERAL_REMOTES,
+    REFUSE_NO_PUSH_TARGET,
+    REFUSE_NOT_A_BRANCH,
+    STAGED_MOVED,
+    HEAD_MOVED,
+];
 
 /// Why `verb` can't run now, or `None`.
 pub fn refusal(verb: Verb, snap: &Snapshot) -> Option<String> {

@@ -11,8 +11,10 @@ use super::cli::{
 };
 use super::hunk;
 use crate::write::{
-    CommitPlan, PushPlan, REFUSE_DETACHED, REFUSE_NO_REMOTE, REFUSE_UNBORN, ShownHunk, WriteError,
-    WriteOp, WriteOutcome, amend_message, classify_commit, classify_pull, classify_push, lock_held,
+    CommitPlan, HEAD_MOVED, PushPlan, REFUSE_DETACHED, REFUSE_NO_PUSH_TARGET, REFUSE_NO_REMOTE,
+    REFUSE_NOT_A_BRANCH, REFUSE_SEVERAL_REMOTES, REFUSE_UNBORN, STAGED_MOVED, ShownHunk,
+    WriteError, WriteOp, WriteOutcome, amend_message, classify_commit, classify_pull,
+    classify_push, lock_held,
 };
 
 /// The tree of an empty index.
@@ -24,8 +26,6 @@ const MAX_WRITE_OUTPUT: usize = 64 << 20;
 const LOCK_RETRIES: usize = 3;
 const LOCK_WAIT: Duration = Duration::from_millis(500);
 const BUSY: &str = "repository is busy (index.lock held), try again";
-const STAGED_MOVED: &str = "staged changes moved, review again";
-const HEAD_MOVED: &str = "HEAD moved, review again";
 /// The time limit of the editor path's checks, as for other write ops.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// `run_write`'s summary when the time limit stopped git.
@@ -756,10 +756,7 @@ pub(crate) fn push_target_with(
     let tracking = parts.next().unwrap_or("");
     let remote_ref = parts.next().unwrap_or("");
     if !remote_ref.is_empty() && !remote_ref.starts_with("refs/heads/") {
-        return Err(failure(
-            "push target is not a branch, push from a shell",
-            "",
-        ));
+        return Err(failure(REFUSE_NOT_A_BRANCH, ""));
     }
     // The remote ref, when set, is authoritative for the branch name.
     let ref_branch = remote_ref
@@ -790,7 +787,7 @@ pub(crate) fn push_target_with(
         let merge = config(&format!("branch.{local}.merge"));
         let differs = !merge.is_empty() && merge != format!("refs/heads/{local}");
         if mode == "nothing" || mode == "upstream" || mode == "tracking" || differs {
-            return Err(failure("no push target configured, push from a shell", ""));
+            return Err(failure(REFUSE_NO_PUSH_TARGET, ""));
         }
         let tracking = format!("refs/remotes/{remote}/{local}");
         return Ok((remote.to_string(), local.to_string(), tracking));
@@ -801,7 +798,7 @@ pub(crate) fn push_target_with(
         [] => return Err(failure(REFUSE_NO_REMOTE, "")),
         [only] => (*only).to_string(),
         many if many.contains(&"origin") => "origin".to_string(),
-        _ => return Err(failure("several remotes, push from a shell", "")),
+        _ => return Err(failure(REFUSE_SEVERAL_REMOTES, "")),
     };
     let branch = ref_branch.unwrap_or(local);
     let tracking = counted(&remote, branch);
