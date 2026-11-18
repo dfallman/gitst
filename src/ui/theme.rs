@@ -23,6 +23,8 @@ pub struct Theme {
     pub band: Style,
     pub select: Style,
     pub hover: Style,
+    /// Hover on the header band, which `hover` would not show on.
+    pub band_hover: Style,
     pub dim: Style,
     pub border: Style,
     pub nerd: bool,
@@ -54,6 +56,7 @@ impl Theme {
             band: Style::new().add_modifier(Modifier::BOLD),
             select: Style::new().add_modifier(Modifier::REVERSED),
             hover: Style::new().add_modifier(Modifier::UNDERLINED),
+            band_hover: Style::new().add_modifier(Modifier::REVERSED),
             dim: Style::new().add_modifier(Modifier::DIM),
             border: Style::new().add_modifier(Modifier::DIM),
             nerd: false,
@@ -67,6 +70,7 @@ impl Theme {
             band: Style::new().bg(mix(bg, fg, 0.10)),
             select: Style::new().bg(mix(bg, fg, 0.20)),
             hover: Style::new().bg(mix(bg, fg, 0.08)),
+            band_hover: Style::new().bg(mix(bg, fg, 0.28)),
             ..Theme::ansi()
         }
     }
@@ -114,6 +118,8 @@ mod tests {
         assert_eq!(t.add, Color::Green);
         let light = Theme::from_palette((0, 0, 0), (255, 255, 255));
         assert_eq!(light.band.bg, Some(Color::Rgb(230, 230, 230)));
+        // Hover on the band must stand out from the band itself.
+        assert_eq!(t.band_hover.bg, Some(Color::Rgb(71, 71, 71)));
     }
 
     #[test]

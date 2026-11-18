@@ -140,6 +140,11 @@ Off by default. Turn it on with `gitst -w` (or `--write`), or `write = true` in 
 | `Tab` | commit prompt | amend the last commit |
 | `Ctrl-E` | commit prompt | write the message in your editor |
 
+With the mouse, each file in Changes has a `+` at the right edge that stages
+it, or a `−` when it is fully staged, and the header's `Stage all` (or
+`Unstage all`) does what `A` does. A file's diff has `+ stage file` in the
+header and `+ stage` on each hunk.
+
 The keys that change the repository are capitals, so they are hard to hit by
 accident. Each action asks first when it needs to: before it stages everything,
 amends a pushed commit, or pushes. A confirm that names a possible secret, and

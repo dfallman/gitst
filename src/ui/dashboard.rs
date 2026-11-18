@@ -14,7 +14,7 @@ use super::layout::{Density, SectionId, SectionReq, Slot, allocate};
 use super::theme::Theme;
 use super::{age_of, leak_marker, line_lr, spans_width, truncate_spans};
 use crate::activity::{ActivityKind, merged};
-use crate::app::{Action, App, NavItem, ScrollTarget, Target};
+use crate::app::{Action, App, NavItem, ScrollTarget, Target, WriteAction, staged_only};
 use crate::model::{Change, Commit, Counts, Snapshot};
 
 /// Most activity rows kept in the section.
@@ -28,7 +28,13 @@ const AGE_RESERVE: usize = 5;
 struct Row {
     line: Line<'static>,
     target: Option<Target>,
+    /// What the button in the row's last cells does: stage or unstage.
+    button: Option<Action>,
 }
+
+/// Cells a row's button takes a click in, from the right edge: the glyph,
+/// with a cell either side.
+const BUTTON_HIT: u16 = 3;
 
 struct Section {
     id: SectionId,
@@ -187,6 +193,12 @@ pub fn draw(
         for (i, row) in section.rows.iter().enumerate().skip(start).take(shown) {
             let r = Rect::new(body.x, body.y + (i - start) as u16, body.width, 1);
             f.render_widget(Paragraph::new(row.line.clone()), r);
+            // Before the row's own click, which it sits inside.
+            if let Some(action) = &row.button {
+                let bw = BUTTON_HIT.min(r.width);
+                let b = Rect::new(r.x + r.width - bw, r.y, bw, 1);
+                app.hits.clicks.push((b, action.clone()));
+            }
             if let Some(t) = &row.target {
                 app.hits.clicks.push((r, Action::Open(t.clone())));
             }
@@ -442,7 +454,11 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
             id,
             count,
             summary,
-            rows: vec![Row { line, target: None }],
+            rows: vec![Row {
+                line,
+                target: None,
+                button: None,
+            }],
         };
     }
 
@@ -516,6 +532,16 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
                 let age = ages[i].as_deref().unwrap_or("");
                 right.push(Span::styled(format!(" {age:>age_w$}"), theme.dim));
             }
+            // `+` stages what is left to stage, `−` unstages a staged file.
+            let button = (app.write.enabled && !c.conflicted()).then(|| {
+                let glyph = if staged_only(c) { "−" } else { "+" };
+                right.push(Span::raw(" "));
+                right.push(Span::styled(
+                    glyph,
+                    Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+                ));
+                Action::Write(WriteAction::ToggleFile(c.path.clone()))
+            });
             let display = match &c.orig_path {
                 Some(orig) => format!("{orig} → {}", c.path),
                 None => c.path.clone(),
@@ -525,6 +551,7 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
             Row {
                 line: row(left, middle, right, w),
                 target: Some(Target::File(c.path.clone())),
+                button,
             }
         })
         .collect();
@@ -533,7 +560,11 @@ fn changes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> S
             format!(" … {} more files", snap.changes_omitted),
             theme.dim,
         ));
-        rows.push(Row { line, target: None });
+        rows.push(Row {
+            line,
+            target: None,
+            button: None,
+        });
     }
     Section {
         id,
@@ -547,6 +578,7 @@ fn activity(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> 
     let events = merged(&snap.reflog, &app.live, ACTIVITY_ROWS);
     if events.is_empty() {
         return vec![Row {
+            button: None,
             line: Line::from(Span::styled(" no activity yet", theme.dim)),
             target: None,
         }];
@@ -576,6 +608,7 @@ fn activity(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> 
                 Span::raw(format!(" {rest}")),
             ];
             Row {
+                button: None,
                 line: row(left, middle, age_span(e.time, app, theme, d), w),
                 target: e.rev.map(Target::Commit).or_else(|| {
                     e.path
@@ -598,6 +631,7 @@ fn age_span(time: i64, app: &App, theme: &Theme, d: Density) -> Vec<Span<'static
 fn commits(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> Vec<Row> {
     if snap.commits.is_empty() {
         return vec![Row {
+            button: None,
             line: Line::from(Span::styled(" no commits yet", theme.dim)),
             target: None,
         }];
@@ -605,6 +639,7 @@ fn commits(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> V
     snap.commits
         .iter()
         .map(|c| Row {
+            button: None,
             line: commit_row(c, app, theme, w, d),
             target: Some(Target::Commit(c.oid.clone())),
         })
@@ -696,6 +731,7 @@ fn branches(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> 
             let middle = vec![Span::styled(b.name.clone(), name_style)];
             let upstream = if b.gone { None } else { b.upstream.clone() };
             Row {
+                button: None,
                 line: row(vec![dot], middle, right, w),
                 target: Some(Target::Branch {
                     name: b.name.clone(),
@@ -716,6 +752,7 @@ fn stashes(snap: &Snapshot, app: &App, theme: &Theme, w: usize, d: Density) -> V
             ];
             let middle = vec![Span::raw(s.message.clone())];
             Row {
+                button: None,
                 line: row(left, middle, age_span(s.time, app, theme, d), w),
                 target: Some(Target::Stash(s.index)),
             }

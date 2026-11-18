@@ -21,6 +21,8 @@ pub(super) struct Label {
     dimmed: bool,
     /// Bold, for the one thing the view is there for.
     strong: bool,
+    /// Drawn first in its group, wherever it comes in the drop order.
+    lead: bool,
     action: Action,
 }
 
@@ -35,12 +37,15 @@ fn label(text: &str, dimmed: bool, action: WriteAction) -> Label {
         text: text.into(),
         dimmed,
         strong: false,
+        lead: false,
         action: Action::Write(action),
     }
 }
 
-/// `Commit · Push · Pull · Stash`, in the order they drop out from the
-/// right. The running one shows the spinner.
+/// `Stage all · Commit · Push · Pull · Stash`, in the reverse of the order
+/// they drop out in: `Stage all` is drawn first but goes first, as `A`
+/// and the rows' own buttons do the same. The running one shows the
+/// spinner.
 pub(super) fn action_labels(app: &App, snap: &Snapshot) -> Vec<Label> {
     // The Outgoing view shows what a push sends, so pushing is all its
     // header offers. Over the push confirm, a click answers it.
@@ -104,7 +109,19 @@ pub(super) fn action_labels(app: &App, snap: &Snapshot) -> Vec<Label> {
             l.dimmed = false;
         }
     }
-    labels.into_iter().map(|(_, l)| l).collect()
+    let mut labels: Vec<Label> = labels.into_iter().map(|(_, l)| l).collect();
+    if app.stack.is_empty() && !clean {
+        let all_staged = snap.changes_omitted == 0 && snap.changes.iter().all(staged_only);
+        let text = if all_staged {
+            "Unstage all"
+        } else {
+            "Stage all"
+        };
+        let mut l = label(text, false, WriteAction::ToggleAll);
+        l.lead = true;
+        labels.push(l);
+    }
+    labels
 }
 
 /// The labels of the open detail view: stage a file, or act on a stash.
@@ -145,7 +162,12 @@ pub(super) fn group_spans(
     let mut spans = Vec::new();
     let mut hits = Vec::new();
     let mut x = 0;
-    for (i, l) in labels.iter().take(n).enumerate() {
+    let taken = &labels[..n.min(labels.len())];
+    let ordered = taken
+        .iter()
+        .filter(|l| l.lead)
+        .chain(taken.iter().filter(|l| !l.lead));
+    for (i, l) in ordered.enumerate() {
         if i > 0 {
             spans.push(Span::styled(SEP, theme.dim));
             x += width(SEP);

@@ -2,14 +2,14 @@
 source: tests/render.rs
 expression: out
 ---
- spritz · main ↑2 ↓0 ●                      Commit · Push · Pull · Stash   ↻ 2m 
+ spritz · main ↑2 ↓0 ●          Stage all · Commit · Push · Pull · Stash   ↻ 2m 
  Push 3 commits to origin/main?                                           y / n 
 ╭ ▼ Changes (5) ────────────────────────────────────────────────────── +64 −12 ╮
-│ ?? notes.md                                                   +3 ■■      45s │
-│  D old.rs                                                     −2 ■■          │
-│  M src/app.rs                                             +42 −7 ■■■■■    2m │
-│  M src/git.rs                                              +9 −3 ■■■■     6d │
-│ A  src/watch.rs                                              +10 ■■■■     1h │
+│ ?? notes.md                                                 +3 ■■      45s + │
+│  D old.rs                                                   −2 ■■          + │
+│  M src/app.rs                                           +42 −7 ■■■■■    2m + │
+│  M src/git.rs                                            +9 −3 ■■■■     6d + │
+│ A  src/watch.rs                                            +10 ■■■■     1h − │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ ▼ Activity ──────────────────────────────────────────────────────────────────╮
 │ 04:43 commit 4de1e3c icons: jug on cream                                  2m │

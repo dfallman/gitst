@@ -163,7 +163,16 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         .hovered()
         .filter(|r| Some(*r) != selected && Some(*r) != band)
     {
-        f.buffer_mut().set_style(r, theme.hover);
+        if r.y == area.y && !overlay {
+            // On the header band a label lights up as a button, a cell
+            // wider each side.
+            let x = r.x.saturating_sub(1).max(area.x);
+            let end = (r.x + r.width + 1).min(area.x + area.width);
+            let padded = Rect::new(x, r.y, end - x, 1);
+            f.buffer_mut().set_style(padded, theme.band_hover);
+        } else {
+            f.buffer_mut().set_style(r, theme.hover);
+        }
     }
     if app.help {
         detail::draw_help(f, app, theme, area);

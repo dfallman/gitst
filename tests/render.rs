@@ -2129,3 +2129,88 @@ fn help_mentions_outgoing_clicks_and_review() {
     assert!(out.contains("click ↑N"), "{out}");
     assert!(out.contains("review and push"), "{out}");
 }
+
+fn written(cmds: &[gitst::app::Cmd]) -> Option<&gitst::write::WriteOp> {
+    cmds.iter().find_map(|c| match c {
+        gitst::app::Cmd::Worker(gitst::worker::WorkerMsg::Write(op)) => Some(&**op),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_change_rows_button_stages_or_unstages_it() {
+    use gitst::write::WriteOp;
+    let mut app = write_app(fixture());
+    let out = draw(&mut app, 80, 20);
+    let (y, row) = line_with(&out, "src/app.rs");
+    assert!(row.trim_end().ends_with("+ │"), "{out}");
+    let x = row.chars().count() as u16 - 3;
+    let cmds = app.handle(click(x, y));
+    assert!(
+        matches!(written(&cmds), Some(WriteOp::Stage { path }) if path == "src/app.rs"),
+        "the button stages, not opens"
+    );
+    assert!(app.stack.is_empty());
+
+    let mut app = write_app(fixture());
+    let out = draw(&mut app, 80, 20);
+    let (y, row) = line_with(&out, "src/watch.rs");
+    assert!(row.trim_end().ends_with("− │"), "staged only: {out}");
+    let cmds = app.handle(click(row.chars().count() as u16 - 3, y));
+    assert!(matches!(written(&cmds), Some(WriteOp::Unstage { .. })));
+
+    // Read-only, the row has no button.
+    let out = draw(&mut new_app(fixture()), 80, 20);
+    let (_, row) = line_with(&out, "src/app.rs");
+    assert!(!row.trim_end().ends_with("+ │"), "{out}");
+}
+
+#[test]
+fn stage_all_leads_the_labels_and_drops_first() {
+    use gitst::write::WriteOp;
+    let mut app = write_app(fixture());
+    let out = draw(&mut app, 80, 20);
+    let x = column(first_line(&out), "Stage all");
+    let cmds = app.handle(click(x, 0));
+    assert_eq!(written(&cmds), Some(&WriteOp::StageAll));
+
+    let out = draw(&mut write_app(fixture()), 66, 20);
+    let head = first_line(&out);
+    assert!(head.contains("Commit · Push · Pull · Stash"), "{out}");
+    assert!(!head.contains("Stage all"), "{out}");
+
+    let mut s = fixture();
+    s.changes.retain(|c| c.x != ' ' && c.y == ' ');
+    let out = draw(&mut write_app(s), 80, 20);
+    assert!(first_line(&out).contains("Unstage all · Commit"), "{out}");
+
+    let mut s = fixture();
+    s.changes.clear();
+    let out = draw(&mut write_app(s), 80, 20);
+    assert!(!first_line(&out).contains("tage all"), "{out}");
+}
+
+#[test]
+fn a_hovered_header_label_lights_up_as_a_button() {
+    let theme = Theme::from_palette((255, 255, 255), (0, 0, 0));
+    let mut app = write_app(fixture());
+    let out = draw(&mut app, 80, 20);
+    let x = column(first_line(&out), "Push");
+    app.handle(UiMsg::Input(Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: x + 1,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })));
+    let mut t = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    t.draw(|f| gitst::ui::draw(f, &mut app, &theme)).unwrap();
+    let buf = t.backend().buffer();
+    let bg = |x: u16| buf[(x, 0)].bg;
+    let lit = theme.band_hover.bg.unwrap();
+    // The word and a cell either side, and no further.
+    for cx in x - 1..x + 5 {
+        assert_eq!(bg(cx), lit, "column {cx}");
+    }
+    assert_ne!(bg(x - 2), lit);
+    assert_ne!(bg(x + 5), lit);
+}
