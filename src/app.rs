@@ -836,10 +836,11 @@ impl App {
         let (x, y) = (m.column, m.row);
         if matches!(m.kind, MouseEventKind::Down(_)) && self.write.prompt.is_some() {
             // A click on the prompt row is its own; elsewhere it cancels,
-            // but for the header's `‹ back` above the push confirm's view.
+            // but for the header's `‹ back` above the push confirm's view,
+            // and its `Push now`.
             if !self.in_prompt_row(x, y) {
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
-                    self.click_while_prompting(x, y);
+                    return self.click_while_prompting(x, y);
                 } else {
                     self.cancel_prompt();
                 }

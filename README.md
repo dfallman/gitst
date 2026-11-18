@@ -131,7 +131,7 @@ Off by default. Turn it on with `gitst -w` (or `--write`), or `write = true` in 
 | `a` | a file's diff | stage or unstage the current hunk |
 | `]` / `[` | a file's diff | next / previous hunk |
 | `A` | dashboard | stage all, or unstage all when everything is staged |
-| `C` | anywhere | commit what is staged |
+| `C` | anywhere | commit what is staged, or amend the last commit when nothing is |
 | `P` | anywhere | open the Outgoing view, then confirm the push |
 | `U` | anywhere | pull, fast-forward only |
 | `S` | anywhere | stash, including untracked files |
@@ -151,8 +151,12 @@ The push confirm shows the Outgoing view, which lists exactly the commits and
 files that are pushed. You can browse it while the question waits: `Enter`
 opens a commit or file, and `Esc` goes back, cancelling the push at the
 Outgoing view itself. `n` cancels from anywhere. `y` is the only key that
-pushes, at every step of the confirm. Clicking `‹ back` goes back as `Esc`
-does, and a click anywhere else cancels the push.
+pushes, at every step of the confirm. In the Outgoing view the header offers
+only `Push now`, and clicking it answers the confirm as `y` does. Clicking
+`‹ back` goes back as `Esc` does, and a click anywhere else cancels the push.
+
+Prompts, confirms, and results show black on yellow in the row under the
+header, so they are hard to miss.
 
 `Ctrl-E` suspends Gitst, runs `git commit -e` in your terminal with the text
 typed so far, and resumes when git exits. It suits long messages, and hooks or

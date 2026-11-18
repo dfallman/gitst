@@ -13,13 +13,13 @@ use crate::ui::layout::SectionId;
 use crate::worker::WorkerMsg;
 use crate::write::{Coverage, PushPlan, Verb, WriteError, WriteOp, WriteOutcome, refusal};
 
-/// How long the bottom row shows a result.
+/// How long the prompt row shows a result.
 pub const RESULT_TTL: Duration = Duration::from_secs(3);
 
 const CONFLICTED: &str = "resolve conflicts in your editor or shell";
 
 /// Failures that answer the action rather than report an error: they go to
-/// the bottom row, not the warning band.
+/// the prompt row, not the warning band.
 const SOFT: &[&str] = &[
     "nothing to commit",
     "nothing to push",
@@ -36,13 +36,13 @@ pub struct WriteState {
     /// The verb whose op is on its way or running: its label spins.
     pub running: Option<Verb>,
     pub prompt: Option<Prompt>,
-    /// The last success or soft failure, for the bottom row, and when.
+    /// The last success or soft failure, for the prompt row, and when.
     pub result: Option<(String, Instant)>,
     /// The last failed action, for the warning band; `!` opens its output.
     pub failure: Option<WriteError>,
     /// `q` was pressed while an op ran; gitst quits when it reports.
     pub quitting: bool,
-    /// Filled by draw: the bottom row while a prompt is open, so that a
+    /// Filled by draw: the prompt row while a prompt is open, so that a
     /// click on it doesn't cancel it.
     pub prompt_rect: Option<Rect>,
     /// An op is on its way or running, with a verb or not (staging has
@@ -69,7 +69,7 @@ impl WriteState {
     }
 }
 
-/// What the bottom row asks for while it takes every key.
+/// What the prompt row asks for while it takes every key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Prompt {
     Input {
@@ -81,7 +81,7 @@ pub enum Prompt {
         saved: String,
     },
     Confirm {
-        /// Without the trailing `y / n`, which the bottom row adds.
+        /// Without the trailing `y / n`, which the prompt row adds.
         question: String,
         /// Only `y` accepts, not `Enter`.
         y_only: bool,
@@ -357,10 +357,17 @@ impl App {
                 if self.refused(Verb::Commit, &snap) {
                     return Vec::new();
                 }
-                if unborn && snap.changes.is_empty() {
-                    self.show_result("nothing to commit");
-                } else {
+                if !snap.changes.is_empty() {
                     self.open_input(InputPurpose::Commit);
+                } else if let Some(subject) = self.amend_subject() {
+                    // Nothing to commit, so the header says Amend.
+                    self.open_input(InputPurpose::Commit);
+                    if let Some(Prompt::Input { input, amend, .. }) = &mut self.write.prompt {
+                        *input = LineInput::new(&subject);
+                        *amend = true;
+                    }
+                } else {
+                    self.show_result("nothing to commit");
                 }
                 Vec::new()
             }
@@ -958,16 +965,26 @@ impl App {
 
     /// A click at `(x, y)`, outside the prompt row, while a prompt is
     /// open. The header's `‹ back` above the push confirm's Outgoing view
-    /// goes back and keeps the confirm; any other click cancels the
-    /// prompt (with that view), as `‹ back` at the view itself does.
-    pub(super) fn click_while_prompting(&mut self, x: u16, y: u16) {
-        let back = self.hits.click_at(x, y) == Some(&Action::Back);
+    /// goes back and keeps the confirm, and `Push now` at that view
+    /// answers it; any other click cancels the prompt (with that view), as
+    /// `‹ back` at the view itself does.
+    pub(super) fn click_while_prompting(&mut self, x: u16, y: u16) -> Vec<Cmd> {
+        let hit = self.hits.click_at(x, y);
+        let back = hit == Some(&Action::Back);
+        let push_now = hit == Some(&Action::Write(WriteAction::Push));
         let above_outgoing = self.pinned_at().is_some_and(|at| at + 1 < self.stack.len());
-        if back && above_outgoing {
-            self.perform(Action::Back);
-        } else {
-            self.cancel_prompt();
+        let at_outgoing = self.stack.last().is_some_and(DetailView::pinned);
+        if push_now && at_outgoing {
+            // `Push now` over the push confirm answers it, as `y` does.
+            if let Some(Prompt::Confirm { on_yes, .. }) = self.write.prompt.take() {
+                return self.accept_push(on_yes);
+            }
         }
+        if back && above_outgoing {
+            return self.perform(Action::Back);
+        }
+        self.cancel_prompt();
+        Vec::new()
     }
 
     /// A click while a prompt is open cancels it, and does nothing else.
@@ -1343,7 +1360,13 @@ mod tests {
         empty.changes.clear();
         let mut a = wapp(empty.clone());
         a.handle(ch('C'));
-        assert!(input(&a).is_some(), "opens so amend can be used");
+        assert_eq!(
+            input(&a),
+            Some(("first commit", true)),
+            "a clean tree opens to amend HEAD"
+        );
+        a.handle(key(KeyCode::Tab));
+        assert_eq!(input(&a), Some(("", false)), "⇥ goes to a new commit");
         assert!(a.handle(key(KeyCode::Enter)).is_empty(), "empty text");
         assert!(input(&a).is_some());
         typed(&mut a, "x");
@@ -1491,7 +1514,7 @@ mod tests {
         s.changes.clear();
         let mut a = wapp(s);
         a.handle(ch('C'));
-        a.handle(key(KeyCode::Tab));
+        assert_eq!(input(&a), Some(("first commit", true)), "already amending");
         assert!(a.handle(key(KeyCode::Enter)).is_empty());
         assert_eq!(
             confirm(&a),

@@ -1298,6 +1298,11 @@ fn last_line(out: &str) -> &str {
     out.lines().last().unwrap()
 }
 
+/// The row under the header, where a prompt, confirm, or result shows.
+fn prompt_line(out: &str) -> &str {
+    out.lines().nth(1).unwrap()
+}
+
 #[test]
 fn header_shows_write_labels() {
     let out = draw(&mut write_app(fixture()), 80, 20);
@@ -1360,7 +1365,7 @@ fn the_running_verb_spins() {
 }
 
 #[test]
-fn commit_prompt_in_bottom_row() {
+fn commit_prompt_under_the_header() {
     let mut app = write_app(fixture());
     app.handle(key('C'));
     for c in "fix it".chars() {
@@ -1370,14 +1375,24 @@ fn commit_prompt_in_bottom_row() {
     t.draw(|f| gitst::ui::draw(f, &mut app, &Theme::ansi()))
         .unwrap();
     let out = text(&t);
-    assert!(last_line(&out).starts_with(" commit: fix it"), "{out}");
+    assert!(prompt_line(&out).starts_with(" commit: fix it"), "{out}");
     assert!(
-        last_line(&out)
+        prompt_line(&out)
             .trim_end()
             .ends_with("⏎ commit · ⇥ amend · esc")
     );
+    assert!(
+        last_line(&out).contains("quit"),
+        "the hint row stays: {out}"
+    );
     let pos = t.get_cursor_position().unwrap();
-    assert_eq!((pos.x, pos.y), (" commit: fix it".len() as u16, 19));
+    assert_eq!((pos.x, pos.y), (" commit: fix it".len() as u16, 1));
+    let row = t.backend().buffer().content()[80..160].to_vec();
+    assert!(
+        row.iter()
+            .all(|c| c.bg == ratatui::style::Color::Yellow && c.fg == ratatui::style::Color::Black),
+        "black on yellow"
+    );
     insta::assert_snapshot!(out);
 }
 
@@ -1386,9 +1401,9 @@ fn stash_prompt_hint() {
     let mut app = write_app(fixture());
     app.handle(key('S'));
     let out = draw(&mut app, 80, 20);
-    assert!(last_line(&out).starts_with(" stash: "), "{out}");
+    assert!(prompt_line(&out).starts_with(" stash: "), "{out}");
     assert!(
-        last_line(&out).trim_end().ends_with("⏎ stash · esc"),
+        prompt_line(&out).trim_end().ends_with("⏎ stash · esc"),
         "{out}"
     );
 }
@@ -1409,7 +1424,7 @@ fn y_only_confirm_shows_y() {
     let mut app = write_app(fixture());
     app.write.prompt = Some(confirm("Drop stash@{0}?", true));
     let out = draw(&mut app, 80, 20);
-    let last = last_line(&out);
+    let last = prompt_line(&out);
     assert!(last.starts_with(" Drop stash@{0}?"), "{out}");
     assert!(
         last.trim_end().ends_with(" y") && !last.contains("y / n"),
@@ -1417,18 +1432,20 @@ fn y_only_confirm_shows_y() {
     );
     app.write.prompt = Some(confirm("Push 3 commits to origin/main?", false));
     let out = draw(&mut app, 80, 20);
-    assert!(last_line(&out).trim_end().ends_with("y / n"), "{out}");
+    assert!(prompt_line(&out).trim_end().ends_with("y / n"), "{out}");
     insta::assert_snapshot!(out);
 }
 
 #[test]
-fn the_prompt_replaces_the_hint_row_or_takes_the_last_row() {
+fn the_prompt_takes_the_row_under_the_header() {
     let mut app = write_app(fixture());
     app.write.prompt = Some(confirm("Push?", false));
-    // Too short for the hint row, so the prompt takes the last row.
     let out = draw(&mut app, 40, 6);
-    assert!(last_line(&out).starts_with(" Push?"), "{out}");
-    assert!(!out.contains("quit"), "{out}");
+    assert!(prompt_line(&out).starts_with(" Push?"), "{out}");
+    // On the dashboard it stands in for the info line.
+    let out = draw(&mut app, 80, 20);
+    assert!(prompt_line(&out).starts_with(" Push?"), "{out}");
+    assert!(!out.contains("origin/main ·"), "{out}");
 }
 
 #[test]
@@ -1437,18 +1454,18 @@ fn finishing_while_quitting() {
     app.write.running = Some(gitst::write::Verb::Commit);
     app.write.quitting = true;
     let out = draw(&mut app, 80, 20);
-    assert!(last_line(&out).contains("finishing commit…"), "{out}");
+    assert!(prompt_line(&out).contains("finishing commit…"), "{out}");
     app.write.running = None;
     let out = draw(&mut app, 80, 20);
-    assert!(last_line(&out).contains("finishing…"), "{out}");
+    assert!(prompt_line(&out).contains("finishing…"), "{out}");
 }
 
 #[test]
-fn a_result_shows_in_the_bottom_row() {
+fn a_result_shows_under_the_header() {
     let mut app = write_app(fixture());
     app.write.result = Some(("committed a1b2c3d".into(), std::time::Instant::now()));
     let out = draw(&mut app, 80, 20);
-    assert!(last_line(&out).starts_with(" committed a1b2c3d"), "{out}");
+    assert!(prompt_line(&out).starts_with(" committed a1b2c3d"), "{out}");
     app.write.result = Some((
         "expired result".into(),
         std::time::Instant::now() - Duration::from_secs(4),
@@ -1639,9 +1656,9 @@ fn pane_too_small_shows_in_the_header() {
             "{w}x{h}\n{out}"
         );
     }
-    // Too narrow for a prompt but tall enough for a bottom row.
+    // Too narrow for a prompt but tall enough for a row under the header.
     let (_, out) = after_write_key(29, 10);
-    assert!(last_line(&out).contains("pane too small"), "{out}");
+    assert!(prompt_line(&out).contains("pane too small"), "{out}");
 }
 
 #[test]
@@ -2066,13 +2083,42 @@ fn sized_push_confirm_over_outgoing_view() {
         Ok(WriteOutcome::PushReady(plan)),
     ));
     let out = draw(&mut app, 60, 12);
-    let last = last_line(&out);
+    let last = prompt_line(&out);
     assert!(
         last.contains("Push 1 commit, 2 files (+3 −1) to origin/main?"),
         "{out}"
     );
     assert!(last.trim_end().ends_with("y / n"), "{out}");
+    assert!(first_line(&out).contains("Push now"), "{out}");
+    assert!(!first_line(&out).contains("Commit"), "{out}");
     insta::assert_snapshot!(out);
+    // A click on `Push now` answers the confirm, as `y` does.
+    let x = column(first_line(&out), "Push now");
+    let cmds = app.handle(click(x, 0));
+    let op = cmds.iter().find_map(|c| match c {
+        gitst::app::Cmd::Worker(gitst::worker::WorkerMsg::Write(op)) => Some(&**op),
+        _ => None,
+    });
+    assert!(matches!(op, Some(WriteOp::Push(_))), "{op:?}");
+    assert!(app.write.prompt.is_none());
+}
+
+#[test]
+fn a_clean_tree_offers_amend() {
+    let mut s = fixture();
+    s.changes.clear();
+    let mut app = write_app(s);
+    let out = draw(&mut app, 80, 20);
+    assert!(first_line(&out).contains("Amend · Push"), "{out}");
+    app.handle(key('C'));
+    let out = draw(&mut app, 80, 20);
+    assert!(prompt_line(&out).starts_with(" amend: "), "{out}");
+    assert!(
+        prompt_line(&out)
+            .trim_end()
+            .ends_with("⏎ amend · ⇥ new commit · esc"),
+        "{out}"
+    );
 }
 
 #[test]

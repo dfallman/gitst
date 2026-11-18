@@ -1,5 +1,5 @@
 //! What write mode puts on screen: the action labels on the header row,
-//! the prompt, confirm, and result in the bottom row, and the failure's
+//! the prompt, confirm, and result in the row under it, and the failure's
 //! output.
 
 use ratatui::Frame;
@@ -12,13 +12,15 @@ use super::fmt::{truncate_right, width};
 use super::line_lr;
 use super::theme::Theme;
 use crate::app::{Action, App, InputPurpose, Prompt, Target, WriteAction, staged_only};
-use crate::model::Snapshot;
+use crate::model::{Head, Snapshot};
 use crate::write::{Verb, refusal};
 
 /// A clickable word on the header row.
 pub(super) struct Label {
     text: String,
     dimmed: bool,
+    /// Bold, for the one thing the view is there for.
+    strong: bool,
     action: Action,
 }
 
@@ -32,6 +34,7 @@ fn label(text: &str, dimmed: bool, action: WriteAction) -> Label {
     Label {
         text: text.into(),
         dimmed,
+        strong: false,
         action: Action::Write(action),
     }
 }
@@ -39,13 +42,33 @@ fn label(text: &str, dimmed: bool, action: WriteAction) -> Label {
 /// `Commit · Push · Pull · Stash`, in the order they drop out from the
 /// right. The running one shows the spinner.
 pub(super) fn action_labels(app: &App, snap: &Snapshot) -> Vec<Label> {
-    let no_work = snap.changes.is_empty() && snap.commits.is_empty();
+    // The Outgoing view shows what a push sends, so pushing is all its
+    // header offers. Over the push confirm, a click answers it.
+    if let Some(Target::Outgoing { .. }) = app.stack.last().map(|v| &v.target) {
+        let nothing_ahead = snap.upstream.as_ref().is_some_and(|u| u.ahead == 0);
+        let mut l = label(
+            "Push now",
+            refusal(Verb::Push, snap).is_some() || nothing_ahead,
+            WriteAction::Push,
+        );
+        if app.write.running == Some(Verb::Push) {
+            l.text = format!("{} {}", super::spinner(app), l.text);
+            l.dimmed = false;
+        }
+        l.strong = !l.dimmed;
+        return vec![l];
+    }
+    let unborn = matches!(snap.head, Head::Unborn(_));
+    let clean = snap.changes.is_empty();
+    // A clean tree has nothing to commit, but HEAD can still be amended.
+    let can_amend = clean && !unborn && !snap.commits.is_empty();
+    let no_work = clean && !can_amend;
     let nothing_ahead = snap.upstream.as_ref().is_some_and(|u| u.ahead == 0);
     let mut labels = vec![
         (
             Verb::Commit,
             label(
-                "Commit",
+                if can_amend { "Amend" } else { "Commit" },
                 refusal(Verb::Commit, snap).is_some() || no_work,
                 WriteAction::Commit,
             ),
@@ -129,6 +152,8 @@ pub(super) fn group_spans(
         }
         let style = if l.dimmed {
             theme.dim
+        } else if l.strong {
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(theme.accent)
         };
@@ -150,21 +175,27 @@ fn verb_word(verb: Verb) -> &'static str {
     }
 }
 
-/// Whether the bottom row has something to say: a prompt or confirm, the
+/// Whether the prompt row has something to say: a prompt or confirm, the
 /// wait for an op at quit, or a result still on show.
-pub(super) fn bottom_row_active(app: &App) -> bool {
+pub(super) fn prompt_row_active(app: &App) -> bool {
     app.write.prompt.is_some() || app.write.quitting || app.write.live_result().is_some()
 }
 
-/// Draws the bottom row into `r`, which is one row, and records it.
-pub(super) fn bottom_row(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
+/// Draws the prompt row into `r`, which is one row, and records it.
+pub(super) fn prompt_row(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
     let w = r.width as usize;
     let key_style = Style::new().add_modifier(Modifier::BOLD);
     if let Some(prompt) = &app.write.prompt {
         app.write.prompt_rect = Some(r);
         match prompt {
-            Prompt::Input { purpose, input, .. } => {
+            Prompt::Input {
+                purpose,
+                input,
+                amend,
+                ..
+            } => {
                 let (word, hint) = match purpose {
+                    InputPurpose::Commit if *amend => ("amend", "⏎ amend · ⇥ new commit · esc"),
                     InputPurpose::Commit => ("commit", "⏎ commit · ⇥ amend · esc"),
                     InputPurpose::Stash => ("stash", "⏎ stash · esc"),
                 };
@@ -180,11 +211,11 @@ pub(super) fn bottom_row(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
                 } else {
                     Vec::new()
                 };
-                let left = vec![
-                    Span::styled(lead.clone(), Style::new().fg(theme.accent)),
-                    Span::raw(view),
-                ];
-                f.render_widget(Paragraph::new(line_lr(left, right, w)), r);
+                let left = vec![Span::styled(lead.clone(), key_style), Span::raw(view)];
+                f.render_widget(
+                    Paragraph::new(line_lr(left, right, w)).style(theme.prompt),
+                    r,
+                );
                 let x = (width(&lead) + offset).min(w.saturating_sub(1));
                 f.set_cursor_position(Position::new(r.x + x as u16, r.y));
             }
@@ -195,7 +226,10 @@ pub(super) fn bottom_row(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
                 let right = vec![Span::styled(keys, key_style), Span::raw(" ")];
                 let room = w.saturating_sub(width(keys) + 3);
                 let left = vec![Span::raw(format!(" {}", truncate_right(question, room)))];
-                f.render_widget(Paragraph::new(line_lr(left, right, w)), r);
+                f.render_widget(
+                    Paragraph::new(line_lr(left, right, w)).style(theme.prompt),
+                    r,
+                );
             }
         }
         return;
@@ -209,5 +243,5 @@ pub(super) fn bottom_row(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
         format!(" {}", app.write.live_result().unwrap_or_default())
     };
     let line = Line::from(Span::raw(truncate_right(&text, w)));
-    f.render_widget(Paragraph::new(line), r);
+    f.render_widget(Paragraph::new(line).style(theme.prompt), r);
 }

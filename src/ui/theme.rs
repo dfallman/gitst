@@ -15,6 +15,8 @@ pub struct Theme {
     pub err: Color,
     /// The possible-secrets band.
     pub leak: Style,
+    /// The prompt, confirm, and result row.
+    pub prompt: Style,
     pub modified: Color,
     pub untracked: Color,
     /// Header band.
@@ -46,6 +48,7 @@ impl Theme {
                 .fg(Color::White)
                 .bg(Color::Red)
                 .add_modifier(Modifier::BOLD),
+            prompt: Style::new().fg(Color::Black).bg(Color::Yellow),
             modified: Color::Yellow,
             untracked: Color::Magenta,
             band: Style::new().add_modifier(Modifier::BOLD),

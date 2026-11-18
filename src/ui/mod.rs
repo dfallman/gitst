@@ -51,7 +51,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // and the one-line summary would hide it while keys still went to it.
     if density.tiny && !in_detail {
         draw_tiny(f, area, &snap, theme);
-        if app.write.enabled && write::bottom_row_active(app) {
+        if app.write.enabled && write::prompt_row_active(app) {
             header_overlay(f, app, theme, Rect::new(area.x, area.y, area.width, 1));
         }
         if app.help {
@@ -81,11 +81,18 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     y += 1;
     left -= 1;
     // With no row below to spare, a prompt or result takes the header's.
-    let overlay = app.write.enabled && write::bottom_row_active(app) && left < 2;
+    let overlay = app.write.enabled && write::prompt_row_active(app) && left < 2;
     if overlay {
         header_overlay(f, app, theme, Rect::new(area.x, area.y, area.width, 1));
     }
-    if !in_detail && area.height >= 14 {
+    // A prompt, confirm, or result takes the row under the header, in
+    // place of the info line, where it can't be missed.
+    let prompt_row = app.write.enabled && write::prompt_row_active(app) && !overlay;
+    if prompt_row {
+        write::prompt_row(f, app, theme, Rect::new(area.x, y, area.width, 1));
+        y += 1;
+        left -= 1;
+    } else if !in_detail && area.height >= 14 {
         let line = Line::from(Span::styled(
             truncate_right(&info_text(&snap), area.width as usize),
             theme.dim,
@@ -94,9 +101,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         y += 1;
         left -= 1;
     }
-    // A prompt, confirm, or result takes the hint row, or the last row.
-    let bottom = app.write.enabled && write::bottom_row_active(app) && !overlay;
-    let hint_rows = u16::from((density.hints || bottom) && left >= 2);
+    let hint_rows = u16::from(density.hints && left >= 2);
     let mut band = None;
     let mut error_shown = false;
     let rows = max_warnings.min((left - hint_rows) as usize);
@@ -151,11 +156,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     }
     if hint_rows == 1 {
         let r = Rect::new(area.x, body.y + body.height, area.width, 1);
-        if bottom {
-            write::bottom_row(f, app, theme, r);
-        } else {
-            hint_bar(f, app, theme, r);
-        }
+        hint_bar(f, app, theme, r);
     }
     // The hover tint would hide the band's red.
     if let Some(r) = app
@@ -299,12 +300,12 @@ fn branch_spans(snap: &Snapshot, theme: &Theme) -> (Vec<Span<'static>>, Option<(
     (spans, ahead)
 }
 
-/// Draws the bottom row over the header row `r`, which then takes no
+/// Draws the prompt row over the header row `r`, which then takes no
 /// clicks of its own.
 fn header_overlay(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
     app.hits.clicks.retain(|(c, _)| !c.intersects(r));
     f.render_widget(Clear, r);
-    write::bottom_row(f, app, theme, r);
+    write::prompt_row(f, app, theme, r);
 }
 
 /// The spinner's frame for `app.now`, the one fetch uses.

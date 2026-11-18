@@ -95,7 +95,7 @@ pub struct PushPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
-    /// Shown in the bottom row for about three seconds.
+    /// Shown in the prompt row for about three seconds.
     Done {
         summary: String,
         warning: Option<String>,
@@ -127,7 +127,7 @@ impl WriteError {
     }
 
     /// A refusal: the action was declined before or instead of running,
-    /// rather than failing. It answers in the bottom row.
+    /// rather than failing. It answers in the prompt row.
     pub fn is_refusal(&self) -> bool {
         REFUSALS.contains(&self.summary.as_str())
     }

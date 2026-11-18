@@ -1,10 +1,9 @@
 ---
 source: tests/render.rs
-assertion_line: 1413
 expression: out
 ---
  spritz · main ↑2 ↓0 ●                      Commit · Push · Pull · Stash   ↻ 2m 
- origin/main · v0.1.9+4 · stash 1                                               
+ Push 3 commits to origin/main?                                           y / n 
 ╭ ▼ Changes (5) ────────────────────────────────────────────────────── +64 −12 ╮
 │ ?? notes.md                                                   +3 ■■      45s │
 │  D old.rs                                                     −2 ■■          │
@@ -22,4 +21,4 @@ expression: out
 ╰──────────────────────────────────────────────────────────────────────────────╯
   ▶ Branches (4)                                                                
   ▶ Stashes (1)                                                                 
- Push 3 commits to origin/main?                                           y / n
+ ? help  f fetch  q quit
