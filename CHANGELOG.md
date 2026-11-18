@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- An opt-in write mode, with `-w`/`--write` or `write = true` in the
+  config. Gitst stays read-only without it. In write mode it stages files
+  and single hunks (`a`, `A`), commits and amends (`C`, with `Ctrl-E` for
+  your editor), pushes (`P`), pulls fast-forward only (`U`), and stashes
+  (`S`), and pops, applies, and drops stashes (`p`, `o`, `D`). The actions
+  run as ordinary git commands, with your hooks and config. Reads stay
+  guarded.
+- The header offers `Push · Write ▾`. `Write ▾` opens a menu with
+  `Stage all`, `Commit`, `Pull`, and `Stash`, so write mode fits a narrow
+  pane. Each file in Changes has a `+` or `−` button, and a diff has
+  `+ stage file` and `+ stage` on each hunk.
+- An Outgoing view lists the commits and files a push sends, with `+`/`−`
+  counts. Press `r` or click `↑N` to open it, in read-only mode too.
+- Commit and push act on exactly what was checked: the staged tree, HEAD,
+  and the pushed commit are pinned, and a fresh secret scan covers what
+  goes out.
+
+### Changed
+
+- A push goes out at once, unless the secret scan found something, the
+  scan was partial, or the push creates the branch on the remote. Then
+  the Outgoing view opens and asks first, and a possible secret takes `y`
+  only.
+- A failed write action stays in the warning band until cleared, and
+  `!` opens git's output when there is any.
+
 ## 0.1.16 (2026-10-23)
 
 ### Added
