@@ -17,6 +17,9 @@ fn writable() -> TestRepo {
     r.git(&["config", "user.name", "T"]);
     r.git(&["config", "user.email", "t@t"]);
     r.git(&["config", "commit.gpgsign", "false"]);
+    // The helper's git ignores system config but gitst's does not, so pin
+    // line endings here: Windows runners set core.autocrlf=true system-wide.
+    r.git(&["config", "core.autocrlf", "false"]);
     r
 }
 
@@ -117,20 +120,24 @@ fn stage_all_and_unstage_all() {
     );
 }
 
+/// A path full of pathspec magic: a leading dash, a space, and glob
+/// characters. Windows forbids `*` in file names, so it gets brackets only.
+#[cfg(not(windows))]
+const ODD: &str = "-x *[a].rs";
+#[cfg(windows)]
+const ODD: &str = "-x [a].rs";
+/// What `ODD` would match if it were read as a glob instead of literally.
+const ODD_GLOB_MATCH: &str = "-x a.rs";
+
 #[test]
 fn odd_paths_are_literal() {
     let r = writable();
-    r.write("-x *[a].rs", "1\n");
+    r.write(ODD, "1\n");
+    r.write(ODD_GLOB_MATCH, "1\n");
     r.write("ä b.txt", "1\n");
     r.write("x.rs", "1\n");
-    run(
-        &r,
-        WriteOp::Stage {
-            path: "-x *[a].rs".into(),
-        },
-    )
-    .unwrap();
-    assert_eq!(staged(&r), "-x *[a].rs");
+    run(&r, WriteOp::Stage { path: ODD.into() }).unwrap();
+    assert_eq!(staged(&r), ODD);
 }
 
 const BUSY: &str = "repository is busy (index.lock held), try again";
@@ -1169,15 +1176,15 @@ fn crlf_and_no_newline_hunks_apply() {
 #[test]
 fn hunk_in_odd_path() {
     let r = writable();
-    r.write("-x *[a].rs", &numbered(false));
+    r.write(ODD, &numbered(false));
     r.write("x.rs", "1\n");
-    r.git(&["add", "--", "-x *[a].rs", "x.rs"]);
+    r.git(&["add", "--", ODD, "x.rs"]);
     r.git(&["commit", "-q", "-m", "first"]);
-    r.write("-x *[a].rs", &numbered(true));
+    r.write(ODD, &numbered(true));
     r.write("x.rs", "2\n");
-    let hunks = shown_hunks(&r, "-x *[a].rs");
-    apply(&r, "-x *[a].rs", hunks[0].1.clone(), false).unwrap();
-    assert_eq!(staged(&r), "-x *[a].rs");
+    let hunks = shown_hunks(&r, ODD);
+    apply(&r, ODD, hunks[0].1.clone(), false).unwrap();
+    assert_eq!(staged(&r), ODD);
 }
 
 #[test]
