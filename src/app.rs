@@ -124,6 +124,8 @@ pub enum Action {
     /// Hides these warnings until they change.
     Clear(Vec<String>),
     Write(WriteAction),
+    /// Opens or closes the `Write ▾` menu.
+    WriteMenu,
     /// Opens the last failed write action's output.
     ShowOutput,
 }
@@ -138,18 +140,23 @@ pub enum ScrollTarget {
 #[derive(Default, Debug)]
 pub struct HitMap {
     pub clicks: Vec<(Rect, Action)>,
+    /// What is drawn over the rest, such as the `Write ▾` menu's items:
+    /// searched before `clicks`.
+    pub overlay: Vec<(Rect, Action)>,
     pub scrolls: Vec<(Rect, ScrollTarget)>,
 }
 
 impl HitMap {
     pub fn clear(&mut self) {
         self.clicks.clear();
+        self.overlay.clear();
         self.scrolls.clear();
     }
 
     pub fn click_at(&self, x: u16, y: u16) -> Option<&Action> {
-        self.clicks
+        self.overlay
             .iter()
+            .chain(&self.clicks)
             .find(|(r, _)| r.contains(Position::new(x, y)))
             .map(|(_, a)| a)
     }
@@ -412,11 +419,19 @@ impl App {
     /// The clickable area under the mouse pointer.
     pub(crate) fn hovered(&self) -> Option<Rect> {
         let (x, y) = self.hover?;
+        let at = Position::new(x, y);
+        if let Some((r, _)) = self.hits.overlay.iter().find(|(r, _)| r.contains(at)) {
+            return Some(*r);
+        }
+        // Over the menu's border, nothing under it lights up.
+        if self.write.menu && self.write.menu_rect.is_some_and(|r| r.contains(at)) {
+            return None;
+        }
         self.hits
             .clicks
             .iter()
             .map(|(r, _)| *r)
-            .find(|r| r.contains(Position::new(x, y)))
+            .find(|r| r.contains(at))
     }
 
     pub fn handle(&mut self, msg: UiMsg) -> Vec<Cmd> {
@@ -602,7 +617,14 @@ impl App {
                 self.cleared.extend(keys);
                 Vec::new()
             }
-            Action::Write(action) => self.write_action(action),
+            Action::Write(action) => {
+                self.close_menu();
+                self.write_action(action)
+            }
+            Action::WriteMenu => {
+                self.write.menu = self.write.enabled && !self.write.menu;
+                Vec::new()
+            }
             Action::ShowOutput => self.show_output(),
         }
     }
@@ -640,6 +662,27 @@ impl App {
         }
     }
 
+    /// Closes the `Write ▾` menu, with its items' click areas, so that a
+    /// click before the next draw cannot land on one. Whether it was open.
+    pub(crate) fn close_menu(&mut self) -> bool {
+        self.hits.overlay.clear();
+        self.write.menu_rect = None;
+        std::mem::take(&mut self.write.menu)
+    }
+
+    /// Opens the Outgoing view, as a click on `↑N` does, unless one is
+    /// already on top.
+    fn open_outgoing(&mut self) -> Vec<Cmd> {
+        let on_top = self
+            .stack
+            .last()
+            .is_some_and(|v| matches!(v.target, Target::Outgoing { .. }));
+        if on_top {
+            return Vec::new();
+        }
+        self.perform(Action::Open(Target::Outgoing { pinned: false }))
+    }
+
     fn key(&mut self, k: KeyEvent) -> Vec<Cmd> {
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             // Raw mode turns these keys into input instead of signals.
@@ -651,6 +694,11 @@ impl App {
         }
         if self.write.prompt.is_some() {
             return self.prompt_key(k);
+        }
+        // A key closes the menu. `Esc` does only that; any other key then
+        // does what it always does.
+        if self.close_menu() && k.code == KeyCode::Esc {
+            return Vec::new();
         }
         if self.help {
             self.help = false;
@@ -666,6 +714,7 @@ impl App {
             KeyCode::Char('f') => return self.perform(Action::Fetch),
             KeyCode::Char('?') => return self.perform(Action::Help),
             KeyCode::Char('s') => return self.open_leaks(),
+            KeyCode::Char('r') => return self.open_outgoing(),
             KeyCode::Char('c') => return self.perform(Action::Clear(self.clearable.clone())),
             _ => {}
         }
@@ -846,6 +895,22 @@ impl App {
                 }
             }
             return Vec::new();
+        }
+        // A click closes the menu, and acts only on the menu's own items:
+        // whatever is under the menu, or beside it, is left alone.
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.write.menu {
+            let left = m.kind == MouseEventKind::Down(MouseButton::Left);
+            let item = self
+                .hits
+                .overlay
+                .iter()
+                .find(|(r, _)| r.contains(Position::new(x, y)))
+                .map(|(_, a)| a.clone());
+            self.close_menu();
+            return match item {
+                Some(action) if left => self.perform(action),
+                _ => Vec::new(),
+            };
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {

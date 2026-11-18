@@ -51,7 +51,8 @@ The dashboard has five sections:
 - **Branches** and **Stashes**: folded by default.
 
 Warnings appear under the header for possible secrets, conflicts, an
-`index.lock` held for more than 10 seconds, failed fetches, and config errors.
+`index.lock` held for more than 10 seconds, failed fetches, config errors, and,
+in write mode, failed actions.
 A long warning wraps onto up to three rows when there is room. When there are
 more than fit, the last row lists the rest.
 
@@ -96,8 +97,9 @@ warning says so, and the last findings stay.
 - **Click** a file, commit, branch, stash, or activity row to open it full-pane
   (diffs, commit details, ahead/behind lists). Click `‹ back`, press `Esc`, or
   right-click to return.
-- **Click** `↑N` (in the header or on the Commits border) to list the commits
-  and files a push would send. This works in read-only mode too.
+- **Click** `↑N` (in the header or on the Commits border), or press `r`, to list
+  the commits and files a push would send. This works in read-only mode too. In write mode,
+  `Push now` in its header pushes them.
 - **Click** a section title to fold it. The **wheel** scrolls what is under the pointer.
 - **Click** `↻` (or press `f`) to fetch now.
 - **Click** a warning to clear it.
@@ -115,6 +117,7 @@ warning says so, and the last findings stay.
 | `g` / `G` / `Home` / `End` | top / bottom | top / bottom |
 | `w` | | wrap long lines |
 | `f` | fetch now | fetch now |
+| `r` | outgoing commits and files | outgoing commits and files |
 | `s` | possible secrets | possible secrets |
 | `c` | clear warnings | clear warnings |
 | `?` | help | help |
@@ -132,7 +135,7 @@ Off by default. Turn it on with `gitst -w` (or `--write`), or `write = true` in 
 | `]` / `[` | a file's diff | next / previous hunk |
 | `A` | dashboard | stage all, or unstage all when everything is staged |
 | `C` | anywhere | commit what is staged, or amend the last commit when nothing is |
-| `P` | anywhere | open the Outgoing view, then confirm the push |
+| `P` | anywhere | push, or review first when something needs a look |
 | `U` | anywhere | pull, fast-forward only |
 | `S` | anywhere | stash, including untracked files |
 | `p` / `o` / `D` | a stash, or its view | pop / apply / drop |
@@ -140,28 +143,56 @@ Off by default. Turn it on with `gitst -w` (or `--write`), or `write = true` in 
 | `Tab` | commit prompt | amend the last commit |
 | `Ctrl-E` | commit prompt | write the message in your editor |
 
-With the mouse, each file in Changes has a `+` at the right edge that stages
-it, or a `−` when it is fully staged, and the header's `Stage all` (or
-`Unstage all`) does what `A` does. A file's diff has `+ stage file` in the
-header and `+ stage` on each hunk.
+With the mouse, the header offers `Push · Write ▾`, so write mode fits in a
+narrow pane. `Push` is dimmed when there is nothing to push. `Write ▾` opens a
+menu with `Stage all`, `Commit`, `Pull`, and `Stash`, each with the key that
+does the same. `Stage all` reads `Unstage all` when everything is staged, and
+appears on the dashboard only. `Commit` reads `Amend` when the tree is clean.
+An item that cannot run is dimmed, and clicking it says why. When the pane is
+too narrow for both, `Push` moves into the menu, and `Write ▾` keeps its place
+before the repository's name. A click outside the menu, or any key, closes it,
+and a confirm that comes up closes it too.
+
+Each file in Changes has a `+` at the right edge that stages it, or a `−` when
+it is fully staged. A file's diff has `+ stage file` in the header and
+`+ stage` on each hunk, and a stash's view has `pop`, `apply`, and `drop`.
 
 The keys that change the repository are capitals, so they are hard to hit by
 accident. Each action asks first when it needs to: before it stages everything,
-amends a pushed commit, or pushes. A confirm that names a possible secret, and
-stash drop, accept `y` only. `n` or `Esc` declines. Commit and push re-scan
-what they are about to change, so the secret check covers exactly that, not the
-last snapshot.
+amends a pushed commit, or pushes something that needs a look (see below). A
+confirm that names a possible secret, and stash drop, accept `y` only. `n` or
+`Esc` declines. Commit and push re-scan what they are about to change, so the
+secret check covers exactly that, not the last snapshot.
 
-The push confirm shows the Outgoing view, which lists exactly the commits and
-files that are pushed. You can browse it while the question waits: `Enter`
-opens a commit or file, and `Esc` goes back, cancelling the push at the
-Outgoing view itself. `n` cancels from anywhere. `y` is the only key that
-pushes, at every step of the confirm. In the Outgoing view the header offers
-only `Push now`, and clicking it answers the confirm as `y` does. Clicking
-`‹ back` goes back as `Esc` does, and a click anywhere else cancels the push.
+`P`, `Push`, and `Push now` push at once, unless the secret re-scan found
+something, the scan was partial, or the push creates the branch on the remote:
+a new branch, or one deleted there since this clone last fetched. Then Gitst
+opens the Outgoing view, which lists exactly the commits and files that are
+pushed, and asks before it pushes. To look before any push, press `r` or click
+`↑N`.
+
+You can browse the Outgoing view while the question waits: `Enter` opens a
+commit or file, and `Esc` goes back, cancelling the push at the Outgoing view
+itself. `n` cancels from anywhere. `y` is the only key that pushes, at every
+step of the confirm. In the Outgoing view the header offers only `Push now`,
+and clicking it answers the confirm as `y` does. Clicking `‹ back` goes back
+as `Esc` does, and a click anywhere else cancels the push.
+
+A push sends the current branch, as it was when you pushed (commits made while
+it runs stay behind), to the remote and branch that git's own push config names. With no push target set, a
+repository with a single remote, or with `origin`, pushes there. On a detached
+HEAD, with several remotes and none of them `origin`, or when the config names a
+target that is not a branch, Gitst says so and leaves the push to your shell.
 
 Prompts, confirms, and results show black on yellow in the row under the
-header, so they are hard to miss.
+header, so they are hard to miss. A refusal, such as `HEAD moved, review
+again`, shows there too. An action that fails, for example a push that times
+out or a hook that exits with an error, stays in the warning band until you
+clear it. When git printed something, the warning ends in `! for output`, and
+`!` or a click opens it.
+
+Quitting while an action runs waits for it to finish. Press `q` again to quit
+at once.
 
 `Ctrl-E` suspends Gitst, runs `git commit -e` in your terminal with the text
 typed so far, and resumes when git exits. It suits long messages, and hooks or

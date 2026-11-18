@@ -2,7 +2,7 @@
 source: tests/render.rs
 expression: out
 ---
- ‹ back  src/app.rs   + stage file     Commit · Push   ↻ 2m 
+ ‹ back  src/app.rs   + stage file    Push · Write ▾   ↻ 2m 
 ── Staged ──────────────────────────────────────────────────
 ▌@@ -1 +1 @@ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ − unstage 
 -use a;                                                     

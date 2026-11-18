@@ -494,6 +494,7 @@ impl CliBackend {
             oid,
             count: oids.len(),
             set_upstream: upstream.is_empty(),
+            creates_branch: !have_tracking,
             findings,
             coverage,
             outgoing,

@@ -45,6 +45,13 @@ pub struct WriteState {
     /// Filled by draw: the prompt row while a prompt is open, so that a
     /// click on it doesn't cancel it.
     pub prompt_rect: Option<Rect>,
+    /// The `Write ▾` menu is open.
+    pub menu: bool,
+    /// Filled by draw: the open menu's box, the `Write ▾` label it hangs
+    /// from, and whether `Push` went into the menu for want of room.
+    pub menu_rect: Option<Rect>,
+    pub menu_anchor: Option<Rect>,
+    pub push_in_menu: bool,
     /// An op is on its way or running, with a verb or not (staging has
     /// none). Write keys wait for it.
     busy: bool,
@@ -147,6 +154,15 @@ pub(crate) fn count(n: usize, word: &str) -> String {
     } else {
         format!("{n} {word}s")
     }
+}
+
+/// A push that needs no look first: no possible secrets, a scan that
+/// covered everything (or was turned off), and a branch the remote has
+/// already. Anything else opens the Outgoing view with the confirm.
+fn routine(plan: &PushPlan) -> bool {
+    plan.findings.is_empty()
+        && !matches!(plan.coverage, Coverage::Partial(_))
+        && !plan.creates_branch
 }
 
 /// Staged, with nothing unstaged: `a` unstages such a file.
@@ -847,6 +863,9 @@ impl App {
                 self.confirm_steps(steps, op)
             }
             Ok(WriteOutcome::PushReady(plan)) => {
+                if routine(&plan) {
+                    return self.send_write(WriteOp::Push(plan));
+                }
                 self.open_pinned_outgoing(&plan);
                 let target = format!("{}/{}", plan.remote, plan.branch);
                 let track = if plan.set_upstream {
@@ -1157,9 +1176,19 @@ mod tests {
             oid: "c1".into(),
             count: 3,
             set_upstream: false,
+            creates_branch: false,
             findings: vec![],
             coverage: Coverage::Full,
             outgoing: Default::default(),
+        }
+    }
+
+    /// A plan that needs the confirm: it creates the branch on the remote.
+    fn risky() -> PushPlan {
+        PushPlan {
+            set_upstream: true,
+            creates_branch: true,
+            ..plan()
         }
     }
 
@@ -1394,15 +1423,18 @@ mod tests {
         reply(
             &mut a,
             WriteOp::PreparePush,
-            Ok(WriteOutcome::PushReady(plan())),
+            Ok(WriteOutcome::PushReady(risky())),
         );
         assert_eq!(
             confirm(&a),
-            Some(("Push 3 commits, 0 files (+0 −0) to origin/main?", false))
+            Some((
+                "Push 3 commits, 0 files (+0 −0) to origin/main and track it?",
+                false
+            ))
         );
         assert!(a.handle(ch('U')).is_empty(), "confirm takes the key");
         let cmds = a.handle(ch('y'));
-        assert_eq!(sent(&cmds), Some(&WriteOp::Push(plan())));
+        assert_eq!(sent(&cmds), Some(&WriteOp::Push(risky())));
         assert_eq!(a.write.running, Some(Verb::Push));
     }
 
@@ -1412,6 +1444,7 @@ mod tests {
         a.handle(ch('P'));
         let p = PushPlan {
             set_upstream: true,
+            creates_branch: true,
             findings: vec![leak("a"), leak("b")],
             coverage: Coverage::Partial("scan skipped".into()),
             ..plan()
@@ -2341,12 +2374,12 @@ mod tests {
         reply(
             &mut a,
             WriteOp::PreparePush,
-            Ok(WriteOutcome::PushReady(plan())),
+            Ok(WriteOutcome::PushReady(risky())),
         );
         assert!(!a.help, "the confirm is not behind the help box");
         assert_eq!(
             sent(&a.handle(ch('y'))),
-            Some(&WriteOp::Push(plan())),
+            Some(&WriteOp::Push(risky())),
             "the key answers the confirm"
         );
 
@@ -2489,10 +2522,13 @@ mod tests {
         }
     }
 
-    /// Two commits and three files, +10 −2, from `b0` to `c1`.
+    /// Two commits and three files, +10 −2, from `b0` to `c1`, to a new
+    /// remote branch, so it confirms.
     fn sized_plan() -> PushPlan {
         PushPlan {
             count: 2,
+            set_upstream: true,
+            creates_branch: true,
             outgoing: Box::new(Outgoing {
                 target: "origin/main".into(),
                 base: "b0".into(),
@@ -2565,7 +2601,10 @@ mod tests {
         );
         assert_eq!(
             confirm(&a),
-            Some(("Push 2 commits, 3 files (+10 −2) to origin/main?", false))
+            Some((
+                "Push 2 commits, 3 files (+10 −2) to origin/main and track it?",
+                false
+            ))
         );
 
         let mut one = sized_plan();
@@ -2868,5 +2907,67 @@ mod tests {
             changed: vec!["src/b.rs".into()],
         });
         assert!(detail_req(&cmds).is_none(), "a range diff never changes");
+    }
+
+    #[test]
+    fn a_routine_push_sends_without_asking() {
+        let mut a = wapp(snap());
+        let cmds = push_ready(&mut a, &plan());
+        assert_eq!(sent(&cmds), Some(&WriteOp::Push(plan())));
+        assert!(a.write.prompt.is_none());
+        assert!(!pinned(&a), "no Outgoing view");
+        assert_eq!(a.write.running, Some(Verb::Push));
+    }
+
+    #[test]
+    fn a_risky_push_still_confirms() {
+        for p in [
+            PushPlan {
+                findings: vec![leak("a")],
+                ..plan()
+            },
+            PushPlan {
+                coverage: Coverage::Partial("scan skipped".into()),
+                ..plan()
+            },
+            PushPlan {
+                creates_branch: true,
+                ..plan()
+            },
+        ] {
+            let mut a = wapp(snap());
+            let cmds = push_ready(&mut a, &p);
+            assert!(sent(&cmds).is_none(), "{p:?}");
+            assert!(confirm(&a).is_some(), "{p:?}");
+            assert!(pinned(&a), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn setting_an_upstream_alone_is_routine() {
+        // The remote has the branch: the push only records tracking.
+        let p = PushPlan {
+            set_upstream: true,
+            ..plan()
+        };
+        let mut a = wapp(snap());
+        let cmds = push_ready(&mut a, &p);
+        assert_eq!(sent(&cmds), Some(&WriteOp::Push(p)));
+        assert!(a.write.prompt.is_none());
+    }
+
+    #[test]
+    fn push_now_from_unpinned_outgoing_sends_at_once() {
+        let mut a = wapp(snap());
+        a.perform(Action::Open(Target::Outgoing { pinned: false }));
+        a.perform(Action::Write(WriteAction::Push));
+        let cmds = reply(
+            &mut a,
+            WriteOp::PreparePush,
+            Ok(WriteOutcome::PushReady(plan())),
+        );
+        assert_eq!(sent(&cmds), Some(&WriteOp::Push(plan())));
+        assert_eq!(a.stack.len(), 1, "only the view the user opened");
+        assert!(!pinned(&a));
     }
 }

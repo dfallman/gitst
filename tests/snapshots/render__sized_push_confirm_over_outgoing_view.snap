@@ -2,15 +2,15 @@
 source: tests/render.rs
 expression: out
 ---
- ‹ back  Outgoing → origin/main             Push now   ↻ 2m 
- Push 1 commit, 2 files (+3 −1) to origin/main?       y / n 
-── 1 commit ────────────────────────────────────────────────
- 4de1e3c ↑ icons: jug on cream                           5m 
-── 2 files  +3 −1 ──────────────────────────────────────────
- M src/a.rs                                           +2 −1 
- A src/b.rs                                              +1 
-                                                            
-                                                            
-                                                            
-                                                            
+ ‹ back  Outgoing → origin/main                         Push now   ↻ 2m 
+ Push 1 commit, 2 files (+3 −1) to origin/main and track it?      y / n 
+── 1 commit ────────────────────────────────────────────────────────────
+ 4de1e3c ↑ icons: jug on cream                                       5m 
+── 2 files  +3 −1 ──────────────────────────────────────────────────────
+ M src/a.rs                                                       +2 −1 
+ A src/b.rs                                                          +1 
+                                                                        
+                                                                        
+                                                                        
+                                                                        
  esc back  w wrap  q quit

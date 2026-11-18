@@ -1304,37 +1304,6 @@ fn prompt_line(out: &str) -> &str {
 }
 
 #[test]
-fn header_shows_write_labels() {
-    let out = draw(&mut write_app(fixture()), 80, 20);
-    assert!(
-        first_line(&out).contains("Commit · Push · Pull · Stash"),
-        "{out}"
-    );
-    assert!(first_line(&out).contains("↻"), "{out}");
-    insta::assert_snapshot!(out);
-}
-
-#[test]
-fn labels_narrow_before_fetch() {
-    let out = draw(&mut write_app(fixture()), 50, 20);
-    let head = first_line(&out);
-    assert!(
-        head.contains("Commit · Push") && head.contains('↻'),
-        "{out}"
-    );
-    assert!(!head.contains("Stash"), "{out}");
-    let out = draw(&mut write_app(fixture()), 40, 20);
-    let head = first_line(&out);
-    assert!(
-        head.contains("Commit") && !head.contains("Push") && head.contains('↻'),
-        "{out}"
-    );
-    let out = draw(&mut write_app(fixture()), 24, 20);
-    let head = first_line(&out);
-    assert!(!head.contains("Commit") && head.contains('↻'), "{out}");
-}
-
-#[test]
 fn read_only_header_unchanged() {
     let out = render(80, 20, fixture());
     assert!(!first_line(&out).contains("Commit"), "{out}");
@@ -1348,20 +1317,14 @@ fn a_dimmed_label_still_takes_the_click() {
     s.upstream = None;
     let mut app = write_app(s);
     let out = draw(&mut app, 80, 20);
-    let x = column(first_line(&out), "Pull");
-    app.handle(click(x, 0));
+    app.handle(click(column(first_line(&out), "Write"), 0));
+    let out = draw(&mut app, 80, 20);
+    let (y, row) = line_with(&out, "Pull");
+    app.handle(click(column(row, "Pull"), y));
     assert_eq!(
         app.write.result.as_ref().map(|r| r.0.as_str()),
         Some("no upstream to pull from")
     );
-}
-
-#[test]
-fn the_running_verb_spins() {
-    let mut app = write_app(fixture());
-    app.write.running = Some(gitst::write::Verb::Push);
-    let out = draw(&mut app, 80, 20);
-    assert!(first_line(&out).contains("Commit · ⠋ Push · Pull"), "{out}");
 }
 
 #[test]
@@ -2071,7 +2034,8 @@ fn sized_push_confirm_over_outgoing_view() {
         branch: "main".into(),
         oid: o.oid.clone(),
         count: 1,
-        set_upstream: false,
+        set_upstream: true,
+        creates_branch: true,
         findings: Vec::new(),
         coverage: Coverage::Full,
         outgoing: Box::new(o),
@@ -2082,10 +2046,10 @@ fn sized_push_confirm_over_outgoing_view() {
         WriteOp::PreparePush,
         Ok(WriteOutcome::PushReady(plan)),
     ));
-    let out = draw(&mut app, 60, 12);
+    let out = draw(&mut app, 72, 12);
     let last = prompt_line(&out);
     assert!(
-        last.contains("Push 1 commit, 2 files (+3 −1) to origin/main?"),
+        last.contains("Push 1 commit, 2 files (+3 −1) to origin/main and track it?"),
         "{out}"
     );
     assert!(last.trim_end().ends_with("y / n"), "{out}");
@@ -2109,7 +2073,7 @@ fn a_clean_tree_offers_amend() {
     s.changes.clear();
     let mut app = write_app(s);
     let out = draw(&mut app, 80, 20);
-    assert!(first_line(&out).contains("Amend · Push"), "{out}");
+    assert!(first_line(&out).contains("Push · Write ▾"), "{out}");
     app.handle(key('C'));
     let out = draw(&mut app, 80, 20);
     assert!(prompt_line(&out).starts_with(" amend: "), "{out}");
@@ -2122,12 +2086,13 @@ fn a_clean_tree_offers_amend() {
 }
 
 #[test]
-fn help_mentions_outgoing_clicks_and_review() {
+fn help_mentions_outgoing_clicks_and_push() {
     let mut app = write_app(fixture());
     app.handle(key('?'));
     let out = draw(&mut app, 80, 40);
     assert!(out.contains("click ↑N"), "{out}");
-    assert!(out.contains("review and push"), "{out}");
+    let (_, row) = line_with(&out, " P ");
+    assert!(row.contains("push") && !row.contains("review"), "{out}");
 }
 
 fn written(cmds: &[gitst::app::Cmd]) -> Option<&gitst::write::WriteOp> {
@@ -2166,31 +2131,6 @@ fn a_change_rows_button_stages_or_unstages_it() {
 }
 
 #[test]
-fn stage_all_leads_the_labels_and_drops_first() {
-    use gitst::write::WriteOp;
-    let mut app = write_app(fixture());
-    let out = draw(&mut app, 80, 20);
-    let x = column(first_line(&out), "Stage all");
-    let cmds = app.handle(click(x, 0));
-    assert_eq!(written(&cmds), Some(&WriteOp::StageAll));
-
-    let out = draw(&mut write_app(fixture()), 66, 20);
-    let head = first_line(&out);
-    assert!(head.contains("Commit · Push · Pull · Stash"), "{out}");
-    assert!(!head.contains("Stage all"), "{out}");
-
-    let mut s = fixture();
-    s.changes.retain(|c| c.x != ' ' && c.y == ' ');
-    let out = draw(&mut write_app(s), 80, 20);
-    assert!(first_line(&out).contains("Unstage all · Commit"), "{out}");
-
-    let mut s = fixture();
-    s.changes.clear();
-    let out = draw(&mut write_app(s), 80, 20);
-    assert!(!first_line(&out).contains("tage all"), "{out}");
-}
-
-#[test]
 fn a_hovered_header_label_lights_up_as_a_button() {
     let theme = Theme::from_palette((255, 255, 255), (0, 0, 0));
     let mut app = write_app(fixture());
@@ -2213,4 +2153,281 @@ fn a_hovered_header_label_lights_up_as_a_button() {
     }
     assert_ne!(bg(x - 2), lit);
     assert_ne!(bg(x + 5), lit);
+}
+
+/// Draws `app` at `w`×`h`, clicks `Write ▾`, and draws it again.
+fn open_menu(app: &mut App, w: u16, h: u16) -> String {
+    let out = draw(app, w, h);
+    app.handle(click(column(first_line(&out), "Write"), 0));
+    let out = draw(app, w, h);
+    assert!(app.write.menu, "{out}");
+    out
+}
+
+#[test]
+fn header_shows_push_and_write_menu() {
+    let out = draw(&mut write_app(fixture()), 80, 20);
+    let head = first_line(&out);
+    assert!(
+        head.contains("Push · Write ▾") && head.contains('↻'),
+        "{out}"
+    );
+    for gone in ["Stage all", "Commit", "Pull", "Stash"] {
+        assert!(!head.contains(gone), "{out}");
+    }
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn push_drops_before_write_and_moves_into_the_menu() {
+    let mut app = write_app(fixture());
+    let out = draw(&mut app, 40, 20);
+    let head = first_line(&out);
+    assert!(head.contains("Write ▾") && !head.contains("Push"), "{out}");
+    let out = open_menu(&mut app, 40, 20);
+    let (_, row) = line_with(&out, "Push");
+    assert!(row.contains(" P "), "{out}");
+    // With room for both, Push stays out of the menu.
+    let mut app = write_app(fixture());
+    let out = open_menu(&mut app, 60, 20);
+    assert_eq!(
+        out.lines().filter(|l| l.contains("Push")).count(),
+        1,
+        "{out}"
+    );
+}
+
+#[test]
+fn the_menu_lists_actions_with_keys() {
+    let mut app = write_app(fixture());
+    let out = open_menu(&mut app, 50, 20);
+    for (word, k) in [
+        ("Stage all", 'A'),
+        ("Commit", 'C'),
+        ("Pull", 'U'),
+        ("Stash", 'S'),
+    ] {
+        let (_, row) = line_with(&out, word);
+        assert!(row.contains(&format!(" {k} ")), "{out}");
+    }
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn the_menu_names_unstage_all_and_amend() {
+    let mut s = fixture();
+    s.changes.retain(|c| c.x != ' ' && c.y == ' ');
+    let out = open_menu(&mut write_app(s), 50, 20);
+    assert!(out.contains("Unstage all"), "{out}");
+    let mut s = fixture();
+    s.changes.clear();
+    let out = open_menu(&mut write_app(s), 50, 20);
+    assert!(out.contains("Amend") && !out.contains("tage all"), "{out}");
+}
+
+#[test]
+fn clicking_a_menu_item_runs_it_and_closes_the_menu() {
+    use gitst::write::WriteOp;
+    let mut app = write_app(fixture());
+    let out = open_menu(&mut app, 50, 20);
+    let (y, row) = line_with(&out, "Stage all");
+    let cmds = app.handle(click(column(row, "Stage all"), y));
+    assert_eq!(written(&cmds), Some(&WriteOp::StageAll));
+    assert!(!app.write.menu);
+
+    // An item that opens a prompt leaves the prompt row in charge.
+    let mut app = write_app(fixture());
+    let out = open_menu(&mut app, 50, 20);
+    let (y, row) = line_with(&out, "Commit");
+    app.handle(click(column(row, "Commit"), y));
+    assert!(!app.write.menu);
+    assert!(app.write.prompt.is_some());
+}
+
+#[test]
+fn a_click_outside_the_menu_only_closes_it() {
+    let mut app = write_app(fixture());
+    let out = open_menu(&mut app, 50, 28);
+    let (y, _) = line_with(&out, "src/app.rs");
+    app.handle(click(3, y));
+    assert!(!app.write.menu);
+    assert!(app.stack.is_empty(), "the row under the click did not open");
+    // So does a second click on `Write ▾`.
+    let out = open_menu(&mut app, 50, 28);
+    app.handle(click(column(first_line(&out), "Write"), 0));
+    assert!(!app.write.menu);
+}
+
+#[test]
+fn esc_closes_the_menu_and_does_nothing_else() {
+    let mut app = write_app(fixture());
+    open_menu(&mut app, 50, 28);
+    app.handle(key('j'));
+    open_menu(&mut app, 50, 28);
+    let selected = app.selected;
+    app.handle(UiMsg::Input(Event::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))));
+    assert!(!app.write.menu);
+    assert_eq!(app.selected, selected, "Esc did not clear the selection");
+}
+
+#[test]
+fn a_key_closes_the_menu_and_still_acts() {
+    let mut app = write_app(fixture());
+    open_menu(&mut app, 50, 20);
+    app.handle(key('?'));
+    assert!(!app.write.menu);
+    assert!(app.help);
+}
+
+#[test]
+fn the_menu_stays_inside_a_narrow_pane() {
+    let mut app = write_app(fixture());
+    open_menu(&mut app, 50, 20);
+    let out = draw(&mut app, 30, 20);
+    assert!(out.lines().all(|l| l.chars().count() <= 30), "{out}");
+    assert!(out.contains("Commit"), "the menu is still drawn\n{out}");
+    let (y, row) = line_with(&out, "Commit");
+    app.handle(click(column(row, "Commit"), y));
+    assert!(app.write.prompt.is_some(), "its rows match what is drawn");
+
+    // In the one-line layout there is no header to hang it from: nothing
+    // is drawn, and a click only closes it.
+    let mut app = write_app(fixture());
+    open_menu(&mut app, 50, 20);
+    let out = draw(&mut app, 22, 20);
+    assert!(!out.contains("Commit"), "{out}");
+    app.handle(click(5, 0));
+    assert!(!app.write.menu);
+    assert!(app.stack.is_empty() && app.write.prompt.is_none());
+}
+
+#[test]
+fn read_only_has_no_write_menu() {
+    let out = draw(&mut new_app(fixture()), 80, 20);
+    assert!(!first_line(&out).contains("Write"), "{out}");
+}
+
+#[test]
+fn write_spins_for_other_verbs_and_push_for_push() {
+    let mut app = write_app(fixture());
+    app.write.running = Some(gitst::write::Verb::Stash);
+    let out = draw(&mut app, 80, 20);
+    assert!(first_line(&out).contains("Push · ⠋ Write ▾"), "{out}");
+    app.write.running = Some(gitst::write::Verb::Push);
+    let out = draw(&mut app, 80, 20);
+    assert!(first_line(&out).contains("⠋ Push · Write ▾"), "{out}");
+}
+
+#[test]
+fn write_menu_keeps_its_place_before_the_repo_name() {
+    let out = draw(&mut write_app(fixture()), 30, 20);
+    let head = first_line(&out);
+    assert!(
+        head.contains("Write ▾") && !head.contains("spritz"),
+        "{out}"
+    );
+    // Read-only, the name still shows at that width.
+    let out = draw(&mut new_app(fixture()), 30, 20);
+    assert!(first_line(&out).contains("spritz"), "{out}");
+}
+
+#[test]
+fn a_confirm_that_arrives_later_closes_the_menu() {
+    // The menu was opened while a commit's scan ran; its confirm arrives.
+    let mut app = write_app(fixture());
+    open_menu(&mut app, 80, 20);
+    app.write.prompt = Some(confirm(
+        "Possible AWS access key in config/dev.env. Commit anyway?",
+        true,
+    ));
+    let out = draw(&mut app, 80, 20);
+    assert!(!app.write.menu);
+    assert!(
+        prompt_line(&out).contains("config/dev.env. Commit anyway?"),
+        "{out}"
+    );
+    assert!(
+        !prompt_line(&out).contains('╭'),
+        "the box does not cover it\n{out}"
+    );
+}
+
+#[test]
+fn a_view_without_the_menu_label_closes_the_menu() {
+    use gitst::write::{Coverage, PushPlan, WriteOp, WriteOutcome};
+    let plan = PushPlan {
+        local: "main".into(),
+        remote: "origin".into(),
+        branch: "main".into(),
+        oid: "c1".into(),
+        count: 1,
+        set_upstream: true,
+        creates_branch: true,
+        findings: Vec::new(),
+        coverage: Coverage::Full,
+        outgoing: Default::default(),
+    };
+    let mut app = write_app(fixture());
+    app.handle(key('P'));
+    open_menu(&mut app, 50, 28);
+    app.handle(UiMsg::Write(
+        WriteOp::PreparePush,
+        Ok(WriteOutcome::PushReady(plan)),
+    ));
+    draw(&mut app, 50, 28);
+    app.handle(key('n'));
+    let out = draw(&mut app, 50, 28);
+    assert!(!app.write.menu, "{out}");
+    let (y, _) = line_with(&out, "src/app.rs");
+    app.handle(click(5, y));
+    assert_eq!(
+        app.stack.last().map(|v| v.target.clone()),
+        Some(Target::File("src/app.rs".into())),
+        "the click is not swallowed"
+    );
+}
+
+#[test]
+fn a_closed_menus_items_take_no_clicks_before_a_redraw() {
+    let mut app = write_app(fixture());
+    let out = open_menu(&mut app, 50, 28);
+    let (y, row) = line_with(&out, "Stage all");
+    let x = column(row, "Stage all");
+    // A second click on `Write ▾` closes it, and a quick click follows
+    // where `Stage all` was, before anything is drawn again.
+    app.handle(click(column(first_line(&out), "Write"), 0));
+    let cmds = app.handle(click(x, y));
+    assert!(written(&cmds).is_none(), "nothing was staged");
+}
+
+#[test]
+fn r_opens_the_outgoing_view_from_anywhere() {
+    let outgoing = Some(Target::Outgoing { pinned: false });
+    for mut app in [new_app(fixture()), write_app(fixture())] {
+        app.handle(key('r'));
+        assert_eq!(app.stack.last().map(|v| v.target.clone()), outgoing);
+        app.handle(key('r'));
+        assert_eq!(app.stack.len(), 1, "not opened twice");
+    }
+    // From an open view, on top of it.
+    let mut app = new_app(fixture());
+    let out = draw(&mut app, 44, 28);
+    let (y, _) = line_with(&out, "src/app.rs");
+    app.handle(click(10, y));
+    app.handle(key('r'));
+    assert_eq!(app.stack.len(), 2);
+    assert_eq!(app.stack.last().map(|v| v.target.clone()), outgoing);
+}
+
+#[test]
+fn help_lists_r_for_outgoing() {
+    let mut app = new_app(fixture());
+    app.handle(key('?'));
+    let out = draw(&mut app, 80, 40);
+    assert!(out.contains("click ↑N"), "{out}");
+    let (_, row) = line_with(&out, " r  ");
+    assert!(row.contains("outgoing commits"), "{out}");
 }

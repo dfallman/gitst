@@ -1,9 +1,8 @@
 ---
 source: tests/render.rs
-assertion_line: 1495
 expression: out
 ---
- ‹ back  output                             Commit · Push · Pull · Stash   ↻ 2m 
+ ‹ back  output                                           Push · Write ▾   ↻ 2m 
  ⚠ pre-commit hook failed · ! for output                                        
  hook: lint failed                                                              
    src/a.rs:3: bad                                                              

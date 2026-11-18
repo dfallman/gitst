@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
 use super::fmt::{truncate_right, width};
 use super::line_lr;
@@ -26,6 +26,13 @@ pub(super) struct Label {
     action: Action,
 }
 
+impl Label {
+    /// Whether this is `Write ▾`.
+    pub(super) fn opens_menu(&self) -> bool {
+        self.action == Action::WriteMenu
+    }
+}
+
 /// Where a label sits in its group: offset from the group's start, width,
 /// and what a click runs.
 pub(super) type LabelHit = (usize, usize, Action);
@@ -42,74 +49,63 @@ fn label(text: &str, dimmed: bool, action: WriteAction) -> Label {
     }
 }
 
-/// `Stage all · Commit · Push · Pull · Stash`, in the reverse of the order
-/// they drop out in: `Stage all` is drawn first but goes first, as `A`
-/// and the rows' own buttons do the same. The running one shows the
-/// spinner.
+/// Puts the spinner before `l` while `verb` runs.
+fn spin(app: &App, l: &mut Label, verb: Verb) {
+    if app.write.running == Some(verb) {
+        l.text = format!("{} {}", super::spinner(app), l.text);
+        l.dimmed = false;
+    }
+}
+
+/// The `Push` label, dimmed when there is nothing it can send.
+fn push_label(app: &App, snap: &Snapshot, text: &str) -> Label {
+    let nothing_ahead = snap.upstream.as_ref().is_some_and(|u| u.ahead == 0);
+    let mut l = label(
+        text,
+        refusal(Verb::Push, snap).is_some() || nothing_ahead,
+        WriteAction::Push,
+    );
+    spin(app, &mut l, Verb::Push);
+    l
+}
+
+/// `Push · Write ▾`, in the reverse of the order they drop out in: `Push`
+/// is drawn first but goes first, into the menu, which keeps every action
+/// in reach.
 pub(super) fn action_labels(app: &App, snap: &Snapshot) -> Vec<Label> {
     // The Outgoing view shows what a push sends, so pushing is all its
     // header offers. Over the push confirm, a click answers it.
     if let Some(Target::Outgoing { .. }) = app.stack.last().map(|v| &v.target) {
-        let nothing_ahead = snap.upstream.as_ref().is_some_and(|u| u.ahead == 0);
-        let mut l = label(
-            "Push now",
-            refusal(Verb::Push, snap).is_some() || nothing_ahead,
-            WriteAction::Push,
-        );
-        if app.write.running == Some(Verb::Push) {
-            l.text = format!("{} {}", super::spinner(app), l.text);
-            l.dimmed = false;
-        }
+        let mut l = push_label(app, snap, "Push now");
         l.strong = !l.dimmed;
         return vec![l];
     }
+    let other = app.write.running.filter(|v| *v != Verb::Push);
+    let menu = Label {
+        text: match other {
+            Some(_) => format!("{} Write ▾", super::spinner(app)),
+            None => "Write ▾".into(),
+        },
+        dimmed: false,
+        strong: false,
+        lead: false,
+        action: Action::WriteMenu,
+    };
+    let mut push = push_label(app, snap, "Push");
+    push.lead = true;
+    vec![menu, push]
+}
+
+/// The menu's items, each with the key that does the same: `Stage all`
+/// on the dashboard when there are changes, `Commit`, `Pull`, `Stash`, and
+/// `Push` when the header had no room for it.
+pub(super) fn menu_items(app: &App, snap: &Snapshot) -> Vec<(Label, &'static str)> {
     let unborn = matches!(snap.head, Head::Unborn(_));
     let clean = snap.changes.is_empty();
     // A clean tree has nothing to commit, but HEAD can still be amended.
     let can_amend = clean && !unborn && !snap.commits.is_empty();
     let no_work = clean && !can_amend;
-    let nothing_ahead = snap.upstream.as_ref().is_some_and(|u| u.ahead == 0);
-    let mut labels = vec![
-        (
-            Verb::Commit,
-            label(
-                if can_amend { "Amend" } else { "Commit" },
-                refusal(Verb::Commit, snap).is_some() || no_work,
-                WriteAction::Commit,
-            ),
-        ),
-        (
-            Verb::Push,
-            label(
-                "Push",
-                refusal(Verb::Push, snap).is_some() || nothing_ahead,
-                WriteAction::Push,
-            ),
-        ),
-        (
-            Verb::Pull,
-            label(
-                "Pull",
-                refusal(Verb::Pull, snap).is_some(),
-                WriteAction::Pull,
-            ),
-        ),
-        (
-            Verb::Stash,
-            label(
-                "Stash",
-                refusal(Verb::Stash, snap).is_some(),
-                WriteAction::Stash,
-            ),
-        ),
-    ];
-    for (verb, l) in &mut labels {
-        if app.write.running == Some(*verb) {
-            l.text = format!("{} {}", super::spinner(app), l.text);
-            l.dimmed = false;
-        }
-    }
-    let mut labels: Vec<Label> = labels.into_iter().map(|(_, l)| l).collect();
+    let mut items = Vec::new();
     if app.stack.is_empty() && !clean {
         let all_staged = snap.changes_omitted == 0 && snap.changes.iter().all(staged_only);
         let text = if all_staged {
@@ -117,11 +113,80 @@ pub(super) fn action_labels(app: &App, snap: &Snapshot) -> Vec<Label> {
         } else {
             "Stage all"
         };
-        let mut l = label(text, false, WriteAction::ToggleAll);
-        l.lead = true;
-        labels.push(l);
+        items.push((label(text, false, WriteAction::ToggleAll), "A"));
     }
-    labels
+    let verbs = [
+        (
+            Verb::Commit,
+            if can_amend { "Amend" } else { "Commit" },
+            no_work,
+            WriteAction::Commit,
+            "C",
+        ),
+        (Verb::Pull, "Pull", false, WriteAction::Pull, "U"),
+        (Verb::Stash, "Stash", false, WriteAction::Stash, "S"),
+    ];
+    for (verb, text, idle, action, key) in verbs {
+        let mut l = label(text, refusal(verb, snap).is_some() || idle, action);
+        spin(app, &mut l, verb);
+        items.push((l, key));
+    }
+    if app.write.push_in_menu {
+        items.push((push_label(app, snap, "Push"), "P"));
+    }
+    items
+}
+
+/// Draws the open `Write ▾` menu under its label, right-aligned to it and
+/// kept inside `area`, and registers its items over everything else.
+pub(super) fn draw_menu(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, area: Rect) {
+    if !app.write.menu {
+        return;
+    }
+    // A prompt or confirm that arrived while it was open takes the row it
+    // would cover, and a view whose header has no `Write ▾` has nothing to
+    // hang it from: either way it closes, rather than stay open unseen.
+    let anchor = match app.write.menu_anchor {
+        Some(a) if app.write.prompt.is_none() => a,
+        _ => {
+            app.close_menu();
+            return;
+        }
+    };
+    let items = menu_items(app, snap);
+    // A cell of padding, the word, two cells, the key, and a cell.
+    let text_w = items.iter().map(|(l, _)| width(&l.text)).max().unwrap_or(0);
+    let row_w = 1 + text_w + 2 + 1 + 1;
+    let w = (row_w as u16 + 2).min(area.width);
+    let h = (items.len() as u16 + 2).min(area.height.saturating_sub(1));
+    if w < 5 || h < 3 {
+        app.close_menu();
+        return;
+    }
+    let right = (anchor.x + anchor.width).clamp(area.x + w, area.x + area.width);
+    let r = Rect::new(right - w, area.y + 1, w, h);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.accent));
+    let inner = block.inner(r);
+    f.render_widget(Clear, r);
+    f.render_widget(block, r);
+    for (i, (l, key)) in items.into_iter().take(inner.height as usize).enumerate() {
+        let style = if l.dimmed {
+            theme.dim
+        } else {
+            Style::new().fg(theme.accent)
+        };
+        let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        let left = vec![Span::raw(" "), Span::styled(l.text, style)];
+        let right = vec![Span::styled(key, theme.dim), Span::raw(" ")];
+        f.render_widget(
+            Paragraph::new(line_lr(left, right, inner.width as usize)),
+            row,
+        );
+        app.hits.overlay.push((row, l.action));
+    }
+    app.write.menu_rect = Some(r);
 }
 
 /// The labels of the open detail view: stage a file, or act on a stash.

@@ -710,6 +710,7 @@ mod tests {
             oid: "a".into(),
             count: 1,
             set_upstream: false,
+            creates_branch: false,
             findings: Vec::new(),
             coverage: crate::write::Coverage::Full,
             outgoing: Default::default(),

@@ -525,6 +525,7 @@ fn push_ahead_commits() {
         ("origin", "main")
     );
     assert!(!plan.set_upstream);
+    assert!(!plan.creates_branch);
     let head = r.git(&["rev-parse", "HEAD"]).trim().to_string();
     let short = r.git(&["rev-parse", "--short", &head]).trim().to_string();
     let out = push(&r, &plan).unwrap();
@@ -561,6 +562,7 @@ fn push_new_branch_sets_upstream() {
     r.commit_file("b.txt", "b\n", "second");
     let plan = prepare_push(&r).unwrap();
     assert!(plan.set_upstream);
+    assert!(plan.creates_branch);
     assert_eq!(plan.branch, "feat");
     assert_eq!(plan.count, 1);
     push(&r, &plan).unwrap();
@@ -570,6 +572,29 @@ fn push_new_branch_sets_upstream() {
         "origin/feat"
     );
     assert_eq!(remote_oid(&remote, "feat"), plan.oid);
+}
+
+#[test]
+fn push_to_a_deleted_remote_branch_creates_it() {
+    // Merged and deleted on the remote, then pruned here: the upstream is
+    // still set, but the push would create the branch again.
+    let (r, remote) = with_remote();
+    r.git(&["checkout", "-q", "-b", "feat"]);
+    r.commit_file("b.txt", "b\n", "second");
+    let plan = prepare_push(&r).unwrap();
+    push(&r, &plan).unwrap();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&remote)
+        .args(["branch", "-D", "feat"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    r.git(&["fetch", "-q", "--prune", "origin"]);
+    r.commit_file("c.txt", "c\n", "third");
+    let plan = prepare_push(&r).unwrap();
+    assert!(!plan.set_upstream, "the upstream is still configured");
+    assert!(plan.creates_branch);
 }
 
 #[test]

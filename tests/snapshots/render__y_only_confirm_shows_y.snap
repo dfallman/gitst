@@ -2,7 +2,7 @@
 source: tests/render.rs
 expression: out
 ---
- spritz · main ↑2 ↓0 ●          Stage all · Commit · Push · Pull · Stash   ↻ 2m 
+ spritz · main ↑2 ↓0 ●                                    Push · Write ▾   ↻ 2m 
  Push 3 commits to origin/main?                                           y / n 
 ╭ ▼ Changes (5) ────────────────────────────────────────────────────── +64 −12 ╮
 │ ?? notes.md                                                 +3 ■■      45s + │

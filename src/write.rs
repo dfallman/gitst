@@ -85,7 +85,12 @@ pub struct PushPlan {
     pub branch: String,
     pub oid: String,
     pub count: usize,
+    /// The local branch has no upstream yet: the push sets it.
     pub set_upstream: bool,
+    /// The remote has no such branch as far as this clone knows: the push
+    /// creates it, even where an upstream is set (one deleted on the
+    /// remote and pruned, say, or a push remote that is not the upstream).
+    pub creates_branch: bool,
     pub findings: Vec<Leak>,
     pub coverage: Coverage,
     /// What goes out, from the same pinned range as `oid` and `count`.

@@ -13,7 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::{Action, App, STALE_LOCK, Target};
+use crate::app::{Action, App, STALE_LOCK, Target, WriteAction};
 use crate::model::{DetailData, Head, Leak, LeakSource, NO_UPSTREAM, RepoOp, Snapshot};
 use fmt::{age_changes_in, rel_age, truncate_right, width, wrap_words};
 use layout::Density;
@@ -32,6 +32,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     app.clearable.clear();
     app.age_wake.set(None);
     app.write.prompt_rect = None;
+    app.write.menu_rect = None;
+    app.write.menu_anchor = None;
+    app.write.push_in_menu = false;
     let area = f.area();
     app.drawn_size = Some((area.width, area.height));
     if area.width == 0 || area.height == 0 {
@@ -50,6 +53,8 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // An open view is drawn at any width: it only cuts its lines shorter,
     // and the one-line summary would hide it while keys still went to it.
     if density.tiny && !in_detail {
+        // No header to hang the menu from.
+        app.close_menu();
         draw_tiny(f, area, &snap, theme);
         if app.write.enabled && write::prompt_row_active(app) {
             header_overlay(f, app, theme, Rect::new(area.x, area.y, area.width, 1));
@@ -157,6 +162,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     if hint_rows == 1 {
         let r = Rect::new(area.x, body.y + body.height, area.width, 1);
         hint_bar(f, app, theme, r);
+    }
+    if app.write.enabled {
+        write::draw_menu(f, app, &snap, theme, area);
     }
     // The hover tint would hide the band's red.
     if let Some(r) = app
@@ -380,8 +388,14 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
     if !in_detail {
         let (branch, ahead) = branch_spans(snap, theme);
         // The branch matters more, so the name goes first when room is short.
+        // So does `Write ▾`, which keeps every write action in reach.
         if let Some(name) = &app.repo_name {
-            let needed = 1 + width(name) + 3 + spans_width(&branch) + 1 + fetch_w;
+            let menu_w = if app.write.enabled {
+                1 + width("Write ▾") + 2
+            } else {
+                0
+            };
+            let needed = 1 + width(name) + 3 + spans_width(&branch) + 1 + menu_w + fetch_w;
             if needed <= w {
                 left.push(Span::styled(
                     name.clone(),
@@ -402,8 +416,9 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
         left.push(leak_icon_span(theme));
     }
     // The action labels drop from the right until they, the left side, and
-    // the fetch label fit.
+    // the fetch label fit. A `Push` that does not fit goes into the menu.
     let mut group = (Vec::new(), Vec::new());
+    let mut menu_offered = false;
     if app.write.enabled {
         let labels = write::action_labels(app, snap);
         let tail = if fetch_w > 0 { 3 + fetch_w } else { 1 };
@@ -413,6 +428,7 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
             .find(|&n| left_w + 1 + write::group_width(&labels, n) + tail <= w)
             .unwrap_or(0);
         group = write::group_spans(&labels, shown, theme);
+        menu_offered = labels.iter().any(write::Label::opens_menu);
     }
     let (label_spans, label_hits) = group;
     let mut right: Vec<Span<'static>> = label_spans;
@@ -428,11 +444,17 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
     let right_w = spans_width(&right);
     if right_w > 0 {
         let x = r.x + (w - right_w) as u16;
+        let mut push_shown = false;
         for (off, len, action) in label_hits {
-            app.hits
-                .clicks
-                .push((Rect::new(x + off as u16, r.y, len as u16, 1), action));
+            let hit = Rect::new(x + off as u16, r.y, len as u16, 1);
+            match action {
+                Action::WriteMenu => app.write.menu_anchor = Some(hit),
+                Action::Write(WriteAction::Push) => push_shown = true,
+                _ => {}
+            }
+            app.hits.clicks.push((hit, action));
         }
+        app.write.push_in_menu = menu_offered && !push_shown;
         if fetch_w > 0 {
             let fx = x + (right_w - fetch_w) as u16;
             app.hits

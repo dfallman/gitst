@@ -16,11 +16,11 @@ expression: unversioned(&out)
 \ N│ g G         top / bottom           │   
    │ w           wrap long lines        │   
    │ ] [         next / prev hunk       │   
+   │ r           outgoing commits       │   
    │ s           possible secrets       │   
    │ c           clear warnings         │   
    │ f           fetch now              │   
    │ ?           close help             │   
    │ q           quit                   │   
    ╰────────────────────────────────────╯   
-                                            
  esc back  w wrap  q quit

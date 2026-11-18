@@ -15,12 +15,12 @@ expression: unversioned(&out)
 │ 0│ tab         next section           │m │
 │ 0│ space       fold section           │h │
 │ 0│ g G         top / bottom           │h │
-│ 0│ s           possible secrets       │h │
-╰──│ c           clear warnings         │──╯
-╭ ▼│ f           fetch now              │2 ╮
-│ 4│ ?           close help             │m │
-│ +│ q           quit                   │  │
-╰──╰────────────────────────────────────╯──╯
-  ▶ Branches (4)                            
+│ 0│ r           outgoing commits       │h │
+╰──│ s           possible secrets       │──╯
+╭ ▼│ c           clear warnings         │2 ╮
+│ 4│ f           fetch now              │m │
+│ +│ ?           close help             │  │
+╰──│ q           quit                   │──╯
+  ▶╰────────────────────────────────────╯   
   ▶ Stashes (1)                             
  ? help  f fetch  q quit
