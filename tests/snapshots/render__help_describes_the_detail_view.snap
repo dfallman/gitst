@@ -3,19 +3,19 @@ source: tests/render.rs
 expression: unversioned(&out)
 ---
  ‹ back  a                             ↻ 2m 
-── Staged ──────────────────────────────────
-@@ ╭─────────── gitst xxxxxx ───────────╮╌╌╌
--us│ click       open · button          │   
-+us│ wheel       scroll                 │   
-   │ right-click back                   │   
-── │                                    │───
-@@ │ j k ↑ ↓     move · scroll          │╌╌╌
-   │ enter l     open                   │   
--  │ esc h       back                   │   
-+  │ space pgdn  page down              │   
-\ N│ pgup        page up                │   
-   │ g G         top / bottom           │   
+── ╭─────────── gitst xxxxxx ───────────╮───
+▌@@│ click       open · button          │╌╌╌
+-us│ wheel       scroll                 │   
++us│ right-click back                   │   
+   │                                    │   
+── │ j k ↑ ↓     move · scroll          │───
+@@ │ enter l     open                   │╌╌╌
+   │ esc h       back                   │   
+-  │ space pgdn  page down              │   
++  │ pgup        page up                │   
+\ N│ g G         top / bottom           │   
    │ w           wrap long lines        │   
+   │ ] [         next / prev hunk       │   
    │ s           possible secrets       │   
    │ c           clear warnings         │   
    │ f           fetch now              │   

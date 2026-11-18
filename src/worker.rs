@@ -1,6 +1,8 @@
-//! The git worker threads: one refreshes snapshots and schedules fetches,
-//! another loads details, so that opening a diff never waits on a refresh.
+//! The git worker threads: one refreshes snapshots and schedules fetches
+//! and write actions, another loads details, so that opening a diff never
+//! waits on a refresh.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -10,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::activity::{ActivityEvent, ActivityKind, diff_snapshots};
 use crate::git::{FetchError, GitBackend, SnapshotOpts};
 use crate::model::{DetailData, DetailReq, Snapshot};
+use crate::write::{WriteError, WriteOp, WriteOutcome};
 
 pub enum WorkerMsg {
     Refresh,
@@ -21,6 +24,10 @@ pub enum WorkerMsg {
         result: Result<(), FetchError>,
     },
     Detail(DetailReq),
+    /// Runs a write action once no fetch or other write is running. Boxed,
+    /// as a push plan would make every message large.
+    Write(Box<WriteOp>),
+    WriteDone(Box<(WriteOp, Result<WriteOutcome, WriteError>)>),
     Shutdown,
 }
 
@@ -43,6 +50,8 @@ pub enum UiMsg {
     RefreshError(String),
     Fetch(FetchStatus),
     Detail(DetailReq, Result<DetailData, String>),
+    /// A write action finished; a refresh follows.
+    Write(WriteOp, Result<WriteOutcome, WriteError>),
     Live(ActivityEvent),
     /// SIGTSTP from outside.
     Suspend,
@@ -64,6 +73,15 @@ pub struct WorkerConfig {
 const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a write action may run before it is stopped: two minutes for
+/// those that talk to a remote, 30 seconds for the rest.
+fn write_timeout(op: &WriteOp) -> Duration {
+    match op {
+        WriteOp::PreparePush | WriteOp::Push(_) | WriteOp::Pull => Duration::from_secs(120),
+        _ => Duration::from_secs(30),
+    }
+}
+
 /// Delay before the next timed fetch after `failures` consecutive failures:
 /// the interval doubles twice, then jumps to the cap (5 → 10 → 20 → 60 min).
 pub fn backoff(interval: Duration, failures: u32) -> Duration {
@@ -74,15 +92,27 @@ pub fn backoff(interval: Duration, failures: u32) -> Duration {
     }
 }
 
-/// The fetch in flight, shared with the handle so that shutdown can stop it
-/// even while the worker thread is busy.
+/// A fetch or write in flight, shared with the handle so that shutdown can
+/// stop it even while the worker thread is busy.
 #[derive(Default)]
-struct FetchSlot {
+struct Slot {
     cancel: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl FetchSlot {
+impl Slot {
+    /// Cancels the job, keeps another from starting, and waits for it.
+    fn stop(&self) {
+        let thread = {
+            let mut slot = self.thread();
+            self.cancel.store(true, Ordering::SeqCst);
+            slot.take()
+        };
+        if let Some(t) = thread {
+            let _ = t.join();
+        }
+    }
+
     fn thread(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
         self.thread.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -94,7 +124,8 @@ pub struct WorkerHandle {
     tx: Sender<WorkerMsg>,
     /// The detail thread's inbox; `None` stops it.
     details: Sender<Option<DetailReq>>,
-    fetch: Arc<FetchSlot>,
+    fetch: Arc<Slot>,
+    write: Arc<Slot>,
     backend: Arc<dyn GitBackend>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -115,22 +146,16 @@ impl WorkerHandle {
         self.tx.clone()
     }
 
-    /// Stops the worker and waits for it, and for any running fetch, to
-    /// exit. Git runs in its own process group or session, so nothing else
-    /// would stop it: a fetch left running can hold ref locks long after
-    /// gitst is gone, and a status can keep a hook running.
+    /// Stops the worker and waits for it, and for any running fetch or
+    /// write, to exit. Git runs in its own process group or session, so
+    /// nothing else would stop it: a fetch left running can hold ref locks
+    /// long after gitst is gone, and a status can keep a hook running.
     pub fn shutdown(&self) {
         let _ = self.tx.send(WorkerMsg::Shutdown);
         let _ = self.details.send(None);
         self.backend.stop();
-        let thread = {
-            let mut slot = self.fetch.thread();
-            self.fetch.cancel.store(true, Ordering::SeqCst);
-            slot.take()
-        };
-        if let Some(t) = thread {
-            let _ = t.join();
-        }
+        self.fetch.stop();
+        self.write.stop();
         let threads =
             std::mem::take(&mut *self.threads.lock().unwrap_or_else(PoisonError::into_inner));
         for t in threads {
@@ -184,8 +209,9 @@ pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>)
             .expect("spawn detail thread")
     };
     let worker_details = details.clone();
-    let slot = Arc::new(FetchSlot::default());
-    let fetch_slot = slot.clone();
+    let fetch_slot = Arc::new(Slot::default());
+    let write_slot = Arc::new(Slot::default());
+    let (worker_fetch, worker_write) = (fetch_slot.clone(), write_slot.clone());
     let handle_backend = backend.clone();
     let thread = std::thread::Builder::new()
         .name("gitst-worker".into())
@@ -200,12 +226,15 @@ pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>)
                 ui,
                 inbox,
                 details: worker_details,
-                slot: fetch_slot,
+                fetch_slot: worker_fetch,
+                write_slot: worker_write,
                 prev: None,
                 fetch,
                 next_fetch: None,
-                fetch_queued: false,
+                fetch_queued: None,
                 manual_pending: false,
+                writing: false,
+                writes: VecDeque::new(),
             }
             .run(rx)
         })
@@ -213,7 +242,8 @@ pub fn spawn(backend: Arc<dyn GitBackend>, cfg: WorkerConfig, ui: Sender<UiMsg>)
     WorkerHandle {
         tx,
         details,
-        fetch: slot,
+        fetch: fetch_slot,
+        write: write_slot,
         backend: handle_backend,
         threads: Mutex::new(vec![thread, detail_thread]),
     }
@@ -226,14 +256,21 @@ struct Worker {
     inbox: Sender<WorkerMsg>,
     /// For a detail request that came through `WorkerHandle::sender`.
     details: Sender<Option<DetailReq>>,
-    slot: Arc<FetchSlot>,
+    fetch_slot: Arc<Slot>,
+    write_slot: Arc<Slot>,
     prev: Option<Arc<Snapshot>>,
     fetch: FetchStatus,
     next_fetch: Option<Instant>,
-    /// A manual fetch was asked for while another was running.
-    fetch_queued: bool,
+    /// A fetch to run once the running fetch or write is done, and whether
+    /// it was asked for: a manual fetch asked for during a fetch, or any
+    /// fetch that came due or was asked for during a write.
+    fetch_queued: Option<bool>,
     /// A manual fetch succeeded and the next refresh should say whether it changed anything.
     manual_pending: bool,
+    /// A write action is running.
+    writing: bool,
+    /// Write actions waiting for the running fetch or write.
+    writes: VecDeque<WriteOp>,
 }
 
 impl Worker {
@@ -258,9 +295,18 @@ impl Worker {
                     WorkerMsg::Fetch { manual } => self.start_fetch(manual),
                     WorkerMsg::FetchDone { manual, result } => {
                         self.finish_fetch(manual, result);
-                        if std::mem::take(&mut self.fetch_queued) {
-                            self.start_fetch(true);
-                        }
+                        self.start_next();
+                        refresh = true;
+                    }
+                    WorkerMsg::Write(op) => {
+                        self.writes.push_back(*op);
+                        self.start_next();
+                    }
+                    WorkerMsg::WriteDone(done) => {
+                        self.writing = false;
+                        let (op, result) = *done;
+                        let _ = self.ui.send(UiMsg::Write(op, result));
+                        self.start_next();
                         refresh = true;
                     }
                     WorkerMsg::Detail(req) => {
@@ -323,6 +369,7 @@ impl Worker {
     fn arm_fetch_timer(&mut self, snap: &Snapshot) {
         if self.next_fetch.is_some()
             || self.fetch.running
+            || self.writing
             || self.cfg.interval.is_zero()
             || !snap.has_remote
         {
@@ -335,11 +382,49 @@ impl Worker {
         self.next_fetch = due_in(self.cfg.interval.saturating_sub(since));
     }
 
+    /// Starts what waited for the fetch or write that just finished: a
+    /// write first, since someone is waiting on it, then a queued fetch.
+    fn start_next(&mut self) {
+        if self.fetch.running || self.writing {
+            return;
+        }
+        if let Some(op) = self.writes.pop_front() {
+            self.start_write(op);
+        } else if let Some(manual) = self.fetch_queued.take() {
+            self.start_fetch(manual);
+        }
+    }
+
+    fn start_write(&mut self, op: WriteOp) {
+        // Holding the slot keeps shutdown from missing a write that starts
+        // while it runs.
+        let mut thread = self.write_slot.thread();
+        if self.write_slot.cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        self.writing = true;
+        let backend = self.backend.clone();
+        let inbox = self.inbox.clone();
+        let slot = self.write_slot.clone();
+        *thread = Some(std::thread::spawn(move || {
+            let result = backend.write(&op, write_timeout(&op), &slot.cancel);
+            let _ = inbox.send(WorkerMsg::WriteDone(Box::new((op, result))));
+        }));
+    }
+
     fn start_fetch(&mut self, manual: bool) {
+        if self.writing {
+            // A write and a fetch never overlap; this one runs after it.
+            self.fetch_queued = Some(manual || self.fetch_queued == Some(true));
+            self.next_fetch = None;
+            return;
+        }
         if self.fetch.running {
             // A manual fetch should see the remote as it is now, which the
             // running one may have read before a push.
-            self.fetch_queued |= manual;
+            if manual {
+                self.fetch_queued = Some(true);
+            }
             return;
         }
         if !self.prev.as_ref().is_some_and(|p| p.has_remote) {
@@ -349,8 +434,8 @@ impl Worker {
         }
         // Holding the slot keeps shutdown from missing a fetch that starts
         // while it runs.
-        let mut thread = self.slot.thread();
-        if self.slot.cancel.load(Ordering::SeqCst) {
+        let mut thread = self.fetch_slot.thread();
+        if self.fetch_slot.cancel.load(Ordering::SeqCst) {
             return;
         }
         self.fetch.running = true;
@@ -358,7 +443,7 @@ impl Worker {
         let _ = self.ui.send(UiMsg::Fetch(self.fetch.clone()));
         let backend = self.backend.clone();
         let inbox = self.inbox.clone();
-        let slot = self.slot.clone();
+        let slot = self.fetch_slot.clone();
         let prune = self.cfg.prune;
         *thread = Some(std::thread::spawn(move || {
             let result = backend.fetch(prune, FETCH_TIMEOUT, &slot.cancel);
@@ -391,6 +476,7 @@ mod tests {
     use super::*;
     use crate::git::{GitError, Repo};
     use crate::model::DetailData;
+    use crate::write::{WriteError, WriteOp, WriteOutcome};
 
     /// A backend whose remote comes and goes, and whose fetches report
     /// when they start and wait to be released.
@@ -403,6 +489,8 @@ mod tests {
         /// While set, a snapshot waits for `unhold`.
         hold: AtomicBool,
         unhold: Mutex<Receiver<()>>,
+        write_started: Mutex<Sender<()>>,
+        write_release: Mutex<Receiver<()>>,
     }
 
     impl GitBackend for Fake {
@@ -435,6 +523,23 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5));
             Ok(())
         }
+        fn write(
+            &self,
+            _: &WriteOp,
+            _: Duration,
+            _: &AtomicBool,
+        ) -> Result<WriteOutcome, WriteError> {
+            let _ = self.write_started.lock().unwrap().send(());
+            let _ = self
+                .write_release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            Ok(WriteOutcome::Done {
+                summary: "staged all".into(),
+                warning: None,
+            })
+        }
     }
 
     struct Harness {
@@ -444,12 +549,16 @@ mod tests {
         started: Receiver<()>,
         release: Sender<()>,
         unhold: Sender<()>,
+        write_started: Receiver<()>,
+        write_release: Sender<()>,
     }
 
     fn harness(interval: Duration, last_fetch: Option<SystemTime>) -> Harness {
         let (started_tx, started) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
         let (unhold, unhold_rx) = mpsc::channel();
+        let (write_started_tx, write_started) = mpsc::channel();
+        let (write_release, write_release_rx) = mpsc::channel();
         let fake = Arc::new(Fake {
             repo: Repo {
                 root: "/r".into(),
@@ -462,6 +571,8 @@ mod tests {
             release: Mutex::new(release_rx),
             hold: AtomicBool::new(false),
             unhold: Mutex::new(unhold_rx),
+            write_started: Mutex::new(write_started_tx),
+            write_release: Mutex::new(write_release_rx),
         });
         let (ui_tx, ui) = mpsc::channel();
         let cfg = WorkerConfig {
@@ -481,6 +592,8 @@ mod tests {
             started,
             release,
             unhold,
+            write_started,
+            write_release,
         };
         h.next_snapshot();
         h
@@ -500,6 +613,111 @@ mod tests {
         fn fetch_starts(&self, within: Duration) -> bool {
             self.started.recv_timeout(within).is_ok()
         }
+
+        fn write_starts(&self, within: Duration) -> bool {
+            self.write_started.recv_timeout(within).is_ok()
+        }
+    }
+
+    #[test]
+    fn write_waits_for_running_fetch() {
+        let h = harness(Duration::ZERO, None);
+        h.worker.send(WorkerMsg::Fetch { manual: true }).unwrap();
+        assert!(h.fetch_starts(Duration::from_secs(5)));
+        h.worker
+            .send(WorkerMsg::Write(Box::new(WriteOp::StageAll)))
+            .unwrap();
+        assert!(
+            !h.write_starts(Duration::from_millis(300)),
+            "write overlapped the fetch"
+        );
+        h.release.send(()).unwrap();
+        assert!(
+            h.write_starts(Duration::from_secs(5)),
+            "held write never ran"
+        );
+        h.write_release.send(()).unwrap();
+    }
+
+    #[test]
+    fn fetch_waits_for_running_write() {
+        let h = harness(Duration::ZERO, None);
+        h.worker
+            .send(WorkerMsg::Write(Box::new(WriteOp::StageAll)))
+            .unwrap();
+        assert!(h.write_starts(Duration::from_secs(5)));
+        h.worker.send(WorkerMsg::Fetch { manual: true }).unwrap();
+        assert!(
+            !h.fetch_starts(Duration::from_millis(300)),
+            "fetch overlapped the write"
+        );
+        h.write_release.send(()).unwrap();
+        assert!(
+            h.fetch_starts(Duration::from_secs(5)),
+            "held fetch never ran"
+        );
+        h.release.send(()).unwrap();
+    }
+
+    #[test]
+    fn timed_fetch_due_during_a_write_runs_after_it() {
+        let interval = Duration::from_millis(200);
+        let h = harness(interval, Some(SystemTime::now()));
+        h.worker
+            .send(WorkerMsg::Write(Box::new(WriteOp::StageAll)))
+            .unwrap();
+        assert!(h.write_starts(Duration::from_secs(5)));
+        assert!(
+            !h.fetch_starts(interval * 3),
+            "timed fetch overlapped the write"
+        );
+        h.write_release.send(()).unwrap();
+        assert!(
+            h.fetch_starts(Duration::from_secs(5)),
+            "timed fetch never ran"
+        );
+        for _ in 0..4 {
+            h.release.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_done_refreshes_and_reports() {
+        let h = harness(Duration::ZERO, None);
+        h.write_release.send(()).unwrap();
+        h.worker
+            .send(WorkerMsg::Write(Box::new(WriteOp::StageAll)))
+            .unwrap();
+        let reported = loop {
+            match h.ui.recv_timeout(Duration::from_secs(5)) {
+                Ok(UiMsg::Write(op, result)) => break (op, result),
+                Ok(UiMsg::Snapshot { .. }) => panic!("refreshed before reporting"),
+                Ok(_) => {}
+                Err(e) => panic!("no write result: {e}"),
+            }
+        };
+        assert_eq!(reported.0, WriteOp::StageAll);
+        assert!(matches!(reported.1, Ok(WriteOutcome::Done { .. })));
+        h.next_snapshot();
+    }
+
+    #[test]
+    fn write_timeouts() {
+        let plan = crate::write::PushPlan {
+            local: "main".into(),
+            remote: "origin".into(),
+            branch: "main".into(),
+            oid: "a".into(),
+            count: 1,
+            set_upstream: false,
+            findings: Vec::new(),
+            coverage: crate::write::Coverage::Full,
+        };
+        let long = Duration::from_secs(120);
+        assert_eq!(write_timeout(&WriteOp::PreparePush), long);
+        assert_eq!(write_timeout(&WriteOp::Push(plan)), long);
+        assert_eq!(write_timeout(&WriteOp::Pull), long);
+        assert_eq!(write_timeout(&WriteOp::StageAll), Duration::from_secs(30));
     }
 
     #[test]

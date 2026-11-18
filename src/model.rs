@@ -143,6 +143,8 @@ pub struct Stash {
     pub index: usize,
     pub time: i64,
     pub message: String,
+    /// The stash commit's full id, to catch a shifted `stash@{N}`.
+    pub oid: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +279,9 @@ pub enum DetailReq {
     },
     /// Possible secrets: drawn from the snapshot, never sent to the worker.
     Leaks,
+    /// A failed write action's output: held by the app, never sent to the
+    /// worker.
+    Output,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,6 +305,18 @@ pub struct DiffBlock {
     pub lines: Vec<DiffLine>,
 }
 
+impl DiffBlock {
+    /// Titles of a working-tree file's blocks.
+    pub const STAGED: &'static str = "Staged";
+    pub const UNSTAGED: &'static str = "Unstaged";
+    pub const UNTRACKED: &'static str = "Untracked";
+
+    /// Whether this is a working-tree file's staged block.
+    pub fn staged(&self) -> bool {
+        self.title == Self::STAGED
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitDetail {
     pub oid: String,
@@ -311,7 +328,12 @@ pub struct CommitDetail {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DetailData {
-    File(Vec<DiffBlock>),
+    File {
+        blocks: Vec<DiffBlock>,
+        /// The file has a `filter` attribute: its hunks as shown aren't
+        /// what `git add` would stage, so it is only staged as a whole.
+        filtered: bool,
+    },
     Commit(CommitDetail),
     CommitFile(Vec<DiffBlock>),
     /// The newest commits on each side (at most 50), and how many there
@@ -322,4 +344,6 @@ pub enum DetailData {
         ahead_total: usize,
         behind_total: usize,
     },
+    /// Git's stdout and stderr from a failed write action.
+    Output(String),
 }

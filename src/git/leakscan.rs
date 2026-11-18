@@ -10,7 +10,8 @@ use ignore::gitignore::Gitignore;
 use super::GitError;
 use super::parse::{self, AddedFile};
 use crate::leaks::{self, Hit};
-use crate::model::{Change, Leak, LeakSource, ReflogEntry};
+use crate::model::{Change, Counts, Leak, LeakSource, ReflogEntry};
+use crate::write::Coverage;
 
 /// Runs git with the given arguments and returns its stdout.
 pub type Runner<'a> = &'a dyn Fn(&[&str]) -> Result<Vec<u8>, GitError>;
@@ -439,6 +440,96 @@ impl LeakScanner {
         }
     }
 
+    /// Findings in what is staged now: names of added, renamed, or copied
+    /// files, and added lines. Read fresh, whatever `numstat_max_files`
+    /// says. Coverage is partial when files were too large or binary to
+    /// read, or when git could not give the changes.
+    pub fn staged_now(&self, git: Runner<'_>) -> (Vec<Leak>, Coverage) {
+        if !self.enabled() {
+            return (Vec::new(), Coverage::Off);
+        }
+        let unreadable =
+            || Coverage::Partial("secret scan could not read the staged changes".into());
+        let mut args = BIG_FILES_AS_BINARY.to_vec();
+        args.extend([
+            "diff",
+            "--cached",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--diff-filter=d",
+        ]);
+        let Ok(numstat) = git(&args) else {
+            return (Vec::new(), unreadable());
+        };
+        let skipped = parse::parse_numstat(&numstat)
+            .iter()
+            .filter(|(path, counts)| matches!(counts, Counts::Binary) && !self.allowed(path))
+            .count();
+        let mut args = BIG_FILES_AS_BINARY.to_vec();
+        args.extend(["diff", "--cached"]);
+        args.extend(PATCH_ARGS);
+        let Ok(patch) = git(&args) else {
+            return (Vec::new(), unreadable());
+        };
+        let found = self.scan_files(parse::parse_added_lines(&patch), &LeakSource::Staged, true);
+        let coverage = if skipped == 0 {
+            Coverage::Full
+        } else {
+            let s = if skipped == 1 { "" } else { "s" };
+            Coverage::Partial(format!(
+                "secret scan skipped {skipped} large or binary file{s}"
+            ))
+        };
+        (found, coverage)
+    }
+
+    /// Findings in the given commits, newest first; scans at most
+    /// `MAX_SCANNED_COMMITS` of them, through the same cache as the
+    /// unpushed-commit scan.
+    pub fn range(&self, git: Runner<'_>, oids: &[String]) -> (Vec<Leak>, Coverage) {
+        if !self.enabled() {
+            return (Vec::new(), Coverage::Off);
+        }
+        let mut notes = Vec::new();
+        if oids.len() > MAX_SCANNED_COMMITS {
+            notes.push(format!(
+                "secret scan covered the newest {MAX_SCANNED_COMMITS} of {} commits",
+                oids.len()
+            ));
+        }
+        let oids = &oids[..oids.len().min(MAX_SCANNED_COMMITS)];
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let cache = &mut *cache;
+        let new: Vec<&str> = oids
+            .iter()
+            .map(String::as_str)
+            .filter(|o| !cache.commits.contains_key(*o) && !cache.too_large.contains(*o))
+            .collect();
+        let mut errors = Vec::new();
+        if !new.is_empty() {
+            self.scan_commits(cache, git, &new, &mut errors);
+        }
+        let too_large = oids.iter().filter(|o| cache.too_large.contains(*o)).count();
+        if too_large > 0 {
+            let s = if too_large == 1 { "" } else { "s" };
+            notes.push(format!("{too_large} commit{s} too large to read"));
+        }
+        notes.extend(errors);
+        let found = oids
+            .iter()
+            .filter_map(|o| cache.commits.get(o))
+            .flatten()
+            .cloned()
+            .collect();
+        let coverage = if notes.is_empty() {
+            Coverage::Full
+        } else {
+            Coverage::Partial(notes.join(" · "))
+        };
+        (found, coverage)
+    }
+
     /// Content findings in added lines, and, with `filenames`, filename
     /// findings for files the patch creates.
     fn scan_files(&self, files: Vec<AddedFile>, source: &LeakSource, filenames: bool) -> Vec<Leak> {
@@ -575,6 +666,50 @@ mod tests {
             counts: Default::default(),
             modified: None,
         }
+    }
+
+    #[test]
+    fn range_caps_at_limit() {
+        let list: Vec<String> = (0..51).map(|i| format!("{i:040}")).collect();
+        let fake = Fake::with(&[]);
+        let s = LeakScanner::new(LeakScanConfig::default());
+        let (found, cov) = s.range(&|a| fake.run(a), &list);
+        assert!(found.is_empty());
+        assert_eq!(
+            cov,
+            Coverage::Partial("secret scan covered the newest 50 of 51 commits".into())
+        );
+        assert!(!fake.calls_to("log").join(" ").contains(&list[50]));
+    }
+
+    #[test]
+    fn range_finds_secrets_and_says_when_a_commit_is_too_large() {
+        let fake = Fake {
+            max_patches: Some(0),
+            ..Fake::with(&[("aaa", patch("aaa", "x.txt", &key()))])
+        };
+        let s = LeakScanner::new(LeakScanConfig::default());
+        let (found, cov) = s.range(&|a| fake.run(a), &oids(&["aaa"]));
+        assert!(found.is_empty());
+        assert_eq!(cov, Coverage::Partial("1 commit too large to read".into()));
+        let fake = Fake::with(&[("bbb", patch("bbb", "x.txt", &key()))]);
+        let (found, cov) = s.range(&|a| fake.run(a), &oids(&["bbb"]));
+        assert_eq!(found.len(), 1);
+        assert_eq!(cov, Coverage::Full);
+    }
+
+    #[test]
+    fn range_is_off_when_disabled() {
+        let s = LeakScanner::new(LeakScanConfig {
+            enabled: false,
+            ..LeakScanConfig::default()
+        });
+        let fake = Fake::with(&[]);
+        assert_eq!(
+            s.range(&|a| fake.run(a), &oids(&["a"])),
+            (vec![], Coverage::Off)
+        );
+        assert!(fake.calls.borrow().is_empty());
     }
 
     #[test]

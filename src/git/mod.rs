@@ -1,13 +1,16 @@
 pub mod cli;
 mod guard;
+mod hunk;
 pub mod leakscan;
 pub mod parse;
+mod write;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::model::{DetailData, DetailReq, Snapshot};
+use crate::write::{WriteError, WriteOp, WriteOutcome};
 
 pub use cli::CliBackend;
 pub use leakscan::LeakScanConfig;
@@ -186,6 +189,13 @@ pub trait GitBackend: Send + Sync {
     fn detail(&self, req: &DetailReq) -> Result<DetailData, GitError>;
     /// Runs `git fetch`, stopping it after `timeout` or once `cancel` is set.
     fn fetch(&self, prune: bool, timeout: Duration, cancel: &AtomicBool) -> Result<(), FetchError>;
+    /// Runs a write op as plain git. Stops it after `timeout` or once `cancel` is set.
+    fn write(
+        &self,
+        op: &WriteOp,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<WriteOutcome, WriteError>;
     /// Stops any git command running for a snapshot or detail, and fails
     /// every later one, for a quit.
     fn stop(&self) {}

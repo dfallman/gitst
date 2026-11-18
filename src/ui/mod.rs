@@ -3,6 +3,7 @@ pub mod detail;
 pub mod fmt;
 pub mod layout;
 pub mod theme;
+mod write;
 
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -10,7 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::app::{Action, App, STALE_LOCK, Target};
 use crate::model::{Head, Leak, LeakSource, RepoOp, Snapshot};
@@ -30,7 +31,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     app.detail_targets.clear();
     app.clearable.clear();
     app.age_wake.set(None);
+    app.write.prompt_rect = None;
     let area = f.area();
+    app.drawn_size = Some((area.width, area.height));
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -48,6 +51,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     // and the one-line summary would hide it while keys still went to it.
     if density.tiny && !in_detail {
         draw_tiny(f, area, &snap, theme);
+        if app.write.enabled && write::bottom_row_active(app) {
+            header_overlay(f, app, theme, Rect::new(area.x, area.y, area.width, 1));
+        }
         if app.help {
             detail::draw_short_help(f, theme, area);
         }
@@ -74,6 +80,11 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     );
     y += 1;
     left -= 1;
+    // With no row below to spare, a prompt or result takes the header's.
+    let overlay = app.write.enabled && write::bottom_row_active(app) && left < 2;
+    if overlay {
+        header_overlay(f, app, theme, Rect::new(area.x, area.y, area.width, 1));
+    }
     if !in_detail && area.height >= 14 {
         let line = Line::from(Span::styled(
             truncate_right(&info_text(&snap), area.width as usize),
@@ -83,7 +94,9 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
         y += 1;
         left -= 1;
     }
-    let hint_rows = u16::from(density.hints && left >= 2);
+    // A prompt, confirm, or result takes the hint row, or the last row.
+    let bottom = app.write.enabled && write::bottom_row_active(app) && !overlay;
+    let hint_rows = u16::from((density.hints || bottom) && left >= 2);
     let mut band = None;
     let mut error_shown = false;
     let rows = max_warnings.min((left - hint_rows) as usize);
@@ -94,7 +107,7 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
     all.retain(|w| !w.key.as_ref().is_some_and(|k| app.cleared.contains(k)));
     app.clearable = all.iter().filter_map(|w| w.key.clone()).collect();
     for w in &mut all {
-        if let Some(k) = &w.key {
+        if let (Some(k), None) = (&w.key, &w.action) {
             w.action = Some(Action::Clear(vec![k.clone()]));
         }
     }
@@ -137,12 +150,12 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme) {
             .set_style(body, Style::new().add_modifier(Modifier::DIM));
     }
     if hint_rows == 1 {
-        hint_bar(
-            f,
-            app,
-            theme,
-            Rect::new(area.x, body.y + body.height, area.width, 1),
-        );
+        let r = Rect::new(area.x, body.y + body.height, area.width, 1);
+        if bottom {
+            write::bottom_row(f, app, theme, r);
+        } else {
+            hint_bar(f, app, theme, r);
+        }
     }
     // The hover tint would hide the band's red.
     if let Some(r) = app
@@ -279,16 +292,29 @@ fn branch_spans(snap: &Snapshot, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
+/// Draws the bottom row over the header row `r`, which then takes no
+/// clicks of its own.
+fn header_overlay(f: &mut Frame, app: &mut App, theme: &Theme, r: Rect) {
+    app.hits.clicks.retain(|(c, _)| !c.intersects(r));
+    f.render_widget(Clear, r);
+    write::bottom_row(f, app, theme, r);
+}
+
+/// The spinner's frame for `app.now`, the one fetch uses.
+fn spinner(app: &App) -> &'static str {
+    let millis = app
+        .now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    SPINNER[(millis / 100) as usize % SPINNER.len()]
+}
+
 fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: Rect, leak: bool) {
     let w = r.width as usize;
-    let mut right: Vec<Span<'static>> = Vec::new();
+    let mut fetch: Vec<Span<'static>> = Vec::new();
     if snap.has_remote {
         let label = if app.fetch.running {
-            let millis = app
-                .now
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis());
-            format!("{} fetch", SPINNER[(millis / 100) as usize % SPINNER.len()])
+            format!("{} fetch", spinner(app))
         } else {
             match snap.last_fetch.and_then(|t| app.now.duration_since(t).ok()) {
                 Some(age) => format!("↻ {}", age_for(app, age)),
@@ -296,10 +322,14 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
                 None => "↻ –".into(),
             }
         };
-        right.push(Span::styled(label, Style::new().fg(theme.accent)));
-        right.push(Span::raw(" "));
+        fetch.push(Span::styled(label, Style::new().fg(theme.accent)));
+        fetch.push(Span::raw(" "));
     }
+    let fetch_w = spans_width(&fetch);
     let mut left: Vec<Span<'static>> = vec![Span::raw(" ")];
+    // Clicks on the left side, as (offset, width, action).
+    let mut left_hits: Vec<(usize, usize, Action)> = Vec::new();
+    let in_detail = !app.stack.is_empty();
     if let Some(view) = app.stack.last() {
         left.push(Span::styled(
             "‹ back",
@@ -316,11 +346,24 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
         app.hits
             .clicks
             .push((Rect::new(r.x, r.y, 7.min(r.width), 1), Action::Back));
-    } else {
+        if app.write.enabled {
+            let context = write::context_labels(app, snap);
+            let n = context.len();
+            let ctx_w = write::group_width(&context, n);
+            if n > 0 && spans_width(&left) + 3 + ctx_w + 1 + fetch_w <= w {
+                left.push(Span::raw("   "));
+                let at = spans_width(&left);
+                let (spans, hits) = write::group_spans(&context, n, theme);
+                left.extend(spans);
+                left_hits.extend(hits.into_iter().map(|(x, w, a)| (at + x, w, a)));
+            }
+        }
+    }
+    if !in_detail {
         let branch = branch_spans(snap, theme);
         // The branch matters more, so the name goes first when room is short.
         if let Some(name) = &app.repo_name {
-            let needed = 1 + width(name) + 3 + spans_width(&branch) + 1 + spans_width(&right);
+            let needed = 1 + width(name) + 3 + spans_width(&branch) + 1 + fetch_w;
             if needed <= w {
                 left.push(Span::styled(
                     name.clone(),
@@ -335,14 +378,49 @@ fn header_line(f: &mut Frame, app: &mut App, snap: &Snapshot, theme: &Theme, r: 
         left.push(Span::raw(" "));
         left.push(leak_icon_span(theme));
     }
+    // The action labels drop from the right until they, the left side, and
+    // the fetch label fit.
+    let mut group = (Vec::new(), Vec::new());
+    if app.write.enabled {
+        let labels = write::action_labels(app, snap);
+        let tail = if fetch_w > 0 { 3 + fetch_w } else { 1 };
+        let left_w = spans_width(&left);
+        let shown = (1..=labels.len())
+            .rev()
+            .find(|&n| left_w + 1 + write::group_width(&labels, n) + tail <= w)
+            .unwrap_or(0);
+        group = write::group_spans(&labels, shown, theme);
+    }
+    let (label_spans, label_hits) = group;
+    let mut right: Vec<Span<'static>> = label_spans;
+    let labels_w = spans_width(&right);
+    if labels_w > 0 {
+        right.push(Span::raw(if fetch_w > 0 { "   " } else { " " }));
+    }
+    right.extend(fetch);
     let right_w = spans_width(&right);
-    if right_w > 0 && right_w + 8 <= w {
+    if labels_w == 0 && !(right_w > 0 && right_w + 8 <= w) {
+        right.clear();
+    }
+    let right_w = spans_width(&right);
+    if right_w > 0 {
         let x = r.x + (w - right_w) as u16;
+        for (off, len, action) in label_hits {
+            app.hits
+                .clicks
+                .push((Rect::new(x + off as u16, r.y, len as u16, 1), action));
+        }
+        if fetch_w > 0 {
+            let fx = x + (right_w - fetch_w) as u16;
+            app.hits
+                .clicks
+                .push((Rect::new(fx, r.y, fetch_w as u16, 1), Action::Fetch));
+        }
+    }
+    for (off, len, action) in left_hits {
         app.hits
             .clicks
-            .push((Rect::new(x, r.y, right_w as u16, 1), Action::Fetch));
-    } else {
-        right.clear();
+            .push((Rect::new(r.x + off as u16, r.y, len as u16, 1), action));
     }
     f.render_widget(Paragraph::new(line_lr(left, right, w)).style(theme.band), r);
 }
@@ -402,10 +480,16 @@ fn fit_warnings(mut warnings: Vec<Warning>, rows: usize) -> Vec<Warning> {
                 .filter_map(|w| w.text.as_ref().map(|t| t.0.as_str()))
                 .collect();
             let keys: Vec<String> = rest.iter().filter_map(|w| w.key.clone()).collect();
+            // A failure in the row keeps its click: it opens the output.
+            let action = if rest.iter().any(|w| w.action == Some(Action::ShowOutput)) {
+                Some(Action::ShowOutput)
+            } else {
+                (!keys.is_empty()).then_some(Action::Clear(keys))
+            };
             warnings.push(Warning {
                 line: Line::from(Span::styled(format!(" ⚠ {}", joined.join(" · ")), style)),
                 fill: Style::new(),
-                action: (!keys.is_empty()).then_some(Action::Clear(keys)),
+                action,
                 text: None,
                 error: rest.iter().any(|w| w.error),
                 key: None,
@@ -486,6 +570,12 @@ fn warnings(app: &App, snap: &Snapshot, theme: &Theme, cols: usize) -> Vec<Warni
     }
     if let Some(w) = &app.config_warning {
         out.push(line(w.clone(), warn));
+    }
+    if let Some(e) = &app.write.failure {
+        out.push(Warning {
+            action: Some(Action::ShowOutput),
+            ..line(e.warning(), err)
+        });
     }
     if let Some(n) = snap.leak_scan_skipped {
         out.push(line(format!("secret scan skipped · {n} changes"), warn));

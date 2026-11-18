@@ -4,6 +4,8 @@ pub mod config;
 pub mod git;
 pub mod leaks;
 pub mod model;
+pub mod prompt;
 pub mod ui;
 pub mod watch;
 pub mod worker;
+pub mod write;

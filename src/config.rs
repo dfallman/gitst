@@ -21,6 +21,8 @@ pub struct Config {
     pub max_changes: usize,
     pub numstat_max_files: usize,
     pub leak_scan: bool,
+    /// Allow commit, push, pull, stash, and staging from gitst.
+    pub write: bool,
     /// Paths never warned about, in gitignore syntax.
     pub leak_allow: Vec<String>,
 }
@@ -36,6 +38,7 @@ impl Default for Config {
             max_changes: 1000,
             numstat_max_files: 500,
             leak_scan: true,
+            write: false,
             leak_allow: Vec::new(),
         }
     }
@@ -108,6 +111,7 @@ impl Config {
                 "max_changes" => set(&mut c.max_changes, value),
                 "numstat_max_files" => set(&mut c.numstat_max_files, value),
                 "leak_scan" => set(&mut c.leak_scan, value),
+                "write" => set(&mut c.write, value),
                 "leak_allow" => match value.try_into::<Vec<String>>() {
                     Ok(patterns) => {
                         for p in patterns {
@@ -272,6 +276,15 @@ mod tests {
         let (c, warning) = Config::from_toml("fetch_prune = ");
         assert_eq!(c, Config::default());
         assert!(warning.is_some());
+    }
+
+    #[test]
+    fn write_defaults_off_and_parses() {
+        assert!(!Config::default().write);
+        let (c, w) = Config::from_toml("write = true");
+        assert!(c.write && w.is_none());
+        let (c, w) = Config::from_toml("write = \"yes\"");
+        assert!(!c.write && w.unwrap().contains("write"));
     }
 
     #[test]

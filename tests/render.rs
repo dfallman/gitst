@@ -134,6 +134,7 @@ fn fixture() -> Snapshot {
             index: 0,
             time: at(7200),
             message: "WIP on main: 4de1e3c icons".into(),
+            oid: "0".repeat(40),
         }],
         reflog: vec![
             reflog("HEAD", "4de1e3c", 120, "commit: icons: jug on cream"),
@@ -645,8 +646,16 @@ fn diff_block(title: &str, lines: &[(DiffKind, &str)]) -> DiffBlock {
     }
 }
 
+/// A working-tree file's diff, unfiltered.
+fn file(blocks: Vec<DiffBlock>) -> DetailData {
+    DetailData::File {
+        blocks,
+        filtered: false,
+    }
+}
+
 fn file_data() -> DetailData {
-    DetailData::File(vec![
+    file(vec![
         diff_block(
             "Staged",
             &[
@@ -688,7 +697,7 @@ fn clean_file_shows_no_changes() {
     open(&mut app, Target::File("a".into()));
     app.handle(UiMsg::Detail(
         DetailReq::File { path: "a".into() },
-        Ok(DetailData::File(vec![])),
+        Ok(file(vec![])),
     ));
     assert!(draw(&mut app, 44, 10).contains("✓ no changes"));
 }
@@ -773,7 +782,7 @@ fn the_scrollbar_has_a_column_of_its_own() {
     let lines: Vec<(DiffKind, &str)> = (0..30).map(|_| (DiffKind::Add, line.as_str())).collect();
     app.handle(UiMsg::Detail(
         DetailReq::File { path: "a".into() },
-        Ok(DetailData::File(vec![diff_block("Unstaged", &lines)])),
+        Ok(file(vec![diff_block("Unstaged", &lines)])),
     ));
     app.handle(key('w'));
     let out = draw(&mut app, 30, 12);
@@ -821,7 +830,7 @@ fn wrap_toggle_changes_output() {
     let mut app = new_app(fixture());
     open(&mut app, Target::File("a".into()));
     let long = "x".repeat(70);
-    let data = DetailData::File(vec![diff_block("Unstaged", &[(DiffKind::Add, &long)])]);
+    let data = file(vec![diff_block("Unstaged", &[(DiffKind::Add, &long)])]);
     app.handle(UiMsg::Detail(
         DetailReq::File { path: "a".into() },
         Ok(data),
@@ -910,7 +919,7 @@ fn wheel_still_scrolls_after_keyboard_selection() {
     let long: Vec<(DiffKind, &str)> = (0..40).map(|_| (DiffKind::Add, "line")).collect();
     app.handle(UiMsg::Detail(
         DetailReq::File { path: "a".into() },
-        Ok(DetailData::File(vec![diff_block("Unstaged", &long)])),
+        Ok(file(vec![diff_block("Unstaged", &long)])),
     ));
     draw(&mut app, 44, 16);
     app.handle(key('j'));
@@ -1250,4 +1259,539 @@ fn ages_wake_the_ui_when_they_next_read_differently() {
     let mut app = new_app(s);
     draw(&mut app, 120, 40);
     assert_eq!(app.next_wakeup(), Duration::from_secs(30));
+}
+
+// ---- write mode ----
+
+fn write_app(snap: Snapshot) -> App {
+    utc();
+    let mut app = App::new(
+        &Config {
+            write: true,
+            ..Config::default()
+        },
+        FetchStatus {
+            enabled: true,
+            ..FetchStatus::default()
+        },
+    );
+    app.now = UNIX_EPOCH + Duration::from_secs(NOW as u64);
+    app.repo_name = Some("spritz".into());
+    app.handle(UiMsg::Snapshot {
+        snap: Arc::new(snap),
+        events: vec![],
+        changed: vec![],
+    });
+    app
+}
+
+fn first_line(out: &str) -> &str {
+    out.lines().next().unwrap()
+}
+
+/// The screen column `word` starts at in `line`.
+fn column(line: &str, word: &str) -> u16 {
+    line[..line.find(word).unwrap()].chars().count() as u16
+}
+
+fn last_line(out: &str) -> &str {
+    out.lines().last().unwrap()
+}
+
+#[test]
+fn header_shows_write_labels() {
+    let out = draw(&mut write_app(fixture()), 80, 20);
+    assert!(
+        first_line(&out).contains("Commit · Push · Pull · Stash"),
+        "{out}"
+    );
+    assert!(first_line(&out).contains("↻"), "{out}");
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn labels_narrow_before_fetch() {
+    let out = draw(&mut write_app(fixture()), 50, 20);
+    let head = first_line(&out);
+    assert!(
+        head.contains("Commit · Push") && head.contains('↻'),
+        "{out}"
+    );
+    assert!(!head.contains("Stash"), "{out}");
+    let out = draw(&mut write_app(fixture()), 40, 20);
+    let head = first_line(&out);
+    assert!(
+        head.contains("Commit") && !head.contains("Push") && head.contains('↻'),
+        "{out}"
+    );
+    let out = draw(&mut write_app(fixture()), 24, 20);
+    let head = first_line(&out);
+    assert!(!head.contains("Commit") && head.contains('↻'), "{out}");
+}
+
+#[test]
+fn read_only_header_unchanged() {
+    let out = render(80, 20, fixture());
+    assert!(!first_line(&out).contains("Commit"), "{out}");
+    let out = draw(&mut new_app(fixture()), 80, 20);
+    assert!(!first_line(&out).contains("Push"), "{out}");
+}
+
+#[test]
+fn a_dimmed_label_still_takes_the_click() {
+    let mut s = fixture();
+    s.upstream = None;
+    let mut app = write_app(s);
+    let out = draw(&mut app, 80, 20);
+    let x = column(first_line(&out), "Pull");
+    app.handle(click(x, 0));
+    assert_eq!(
+        app.write.result.as_ref().map(|r| r.0.as_str()),
+        Some("no upstream to pull from")
+    );
+}
+
+#[test]
+fn the_running_verb_spins() {
+    let mut app = write_app(fixture());
+    app.write.running = Some(gitst::write::Verb::Push);
+    let out = draw(&mut app, 80, 20);
+    assert!(first_line(&out).contains("Commit · ⠋ Push · Pull"), "{out}");
+}
+
+#[test]
+fn commit_prompt_in_bottom_row() {
+    let mut app = write_app(fixture());
+    app.handle(key('C'));
+    for c in "fix it".chars() {
+        app.handle(key(c));
+    }
+    let mut t = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    t.draw(|f| gitst::ui::draw(f, &mut app, &Theme::ansi()))
+        .unwrap();
+    let out = text(&t);
+    assert!(last_line(&out).starts_with(" commit: fix it"), "{out}");
+    assert!(
+        last_line(&out)
+            .trim_end()
+            .ends_with("⏎ commit · ⇥ amend · esc")
+    );
+    let pos = t.get_cursor_position().unwrap();
+    assert_eq!((pos.x, pos.y), (" commit: fix it".len() as u16, 19));
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn stash_prompt_hint() {
+    let mut app = write_app(fixture());
+    app.handle(key('S'));
+    let out = draw(&mut app, 80, 20);
+    assert!(last_line(&out).starts_with(" stash: "), "{out}");
+    assert!(
+        last_line(&out).trim_end().ends_with("⏎ stash · esc"),
+        "{out}"
+    );
+}
+
+fn confirm(question: &str, y_only: bool) -> gitst::app::Prompt {
+    gitst::app::Prompt::Confirm {
+        question: question.into(),
+        y_only,
+        on_yes: gitst::write::WriteOp::StashDrop {
+            index: 0,
+            oid: "0".repeat(40),
+        },
+    }
+}
+
+#[test]
+fn y_only_confirm_shows_y() {
+    let mut app = write_app(fixture());
+    app.write.prompt = Some(confirm("Drop stash@{0}?", true));
+    let out = draw(&mut app, 80, 20);
+    let last = last_line(&out);
+    assert!(last.starts_with(" Drop stash@{0}?"), "{out}");
+    assert!(
+        last.trim_end().ends_with(" y") && !last.contains("y / n"),
+        "{out}"
+    );
+    app.write.prompt = Some(confirm("Push 3 commits to origin/main?", false));
+    let out = draw(&mut app, 80, 20);
+    assert!(last_line(&out).trim_end().ends_with("y / n"), "{out}");
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn the_prompt_replaces_the_hint_row_or_takes_the_last_row() {
+    let mut app = write_app(fixture());
+    app.write.prompt = Some(confirm("Push?", false));
+    // Too short for the hint row, so the prompt takes the last row.
+    let out = draw(&mut app, 40, 6);
+    assert!(last_line(&out).starts_with(" Push?"), "{out}");
+    assert!(!out.contains("quit"), "{out}");
+}
+
+#[test]
+fn finishing_while_quitting() {
+    let mut app = write_app(fixture());
+    app.write.running = Some(gitst::write::Verb::Commit);
+    app.write.quitting = true;
+    let out = draw(&mut app, 80, 20);
+    assert!(last_line(&out).contains("finishing commit…"), "{out}");
+    app.write.running = None;
+    let out = draw(&mut app, 80, 20);
+    assert!(last_line(&out).contains("finishing…"), "{out}");
+}
+
+#[test]
+fn a_result_shows_in_the_bottom_row() {
+    let mut app = write_app(fixture());
+    app.write.result = Some(("committed a1b2c3d".into(), std::time::Instant::now()));
+    let out = draw(&mut app, 80, 20);
+    assert!(last_line(&out).starts_with(" committed a1b2c3d"), "{out}");
+    app.write.result = Some((
+        "expired result".into(),
+        std::time::Instant::now() - Duration::from_secs(4),
+    ));
+    let out = draw(&mut app, 80, 20);
+    assert!(!out.contains("expired result"), "{out}");
+}
+
+fn failed(app: &mut App) {
+    app.write.failure = Some(gitst::write::WriteError {
+        summary: "pre-commit hook failed".into(),
+        output: "hook: lint failed\n  src/a.rs:3: bad\n".into(),
+    });
+}
+
+#[test]
+fn failure_warning_names_bang() {
+    let mut app = write_app(fixture());
+    failed(&mut app);
+    let out = draw(&mut app, 80, 20);
+    assert!(
+        out.contains("pre-commit hook failed · ! for output"),
+        "{out}"
+    );
+    let y = out
+        .lines()
+        .position(|l| l.contains("! for output"))
+        .unwrap() as u16;
+    app.handle(click(5, y));
+    assert_eq!(
+        app.stack.last().map(|v| v.target.clone()),
+        Some(Target::Output)
+    );
+    // And `c` clears it.
+    let mut app = write_app(fixture());
+    failed(&mut app);
+    draw(&mut app, 80, 20);
+    app.handle(key('c'));
+    let out = draw(&mut app, 80, 20);
+    assert!(!out.contains("! for output"), "{out}");
+}
+
+#[test]
+fn a_failure_shows_again_after_clearing_and_goes_with_the_next_action() {
+    use gitst::write::{WriteError, WriteOp, WriteOutcome};
+    let failed = || {
+        UiMsg::Write(
+            WriteOp::Pull,
+            Err(WriteError {
+                summary: "pull failed: auth, pull from a shell".into(),
+                output: "fatal: could not read Username".into(),
+            }),
+        )
+    };
+    let mut app = write_app(fixture());
+    app.handle(key('U'));
+    app.handle(failed());
+    assert!(draw(&mut app, 80, 20).contains("! for output"));
+    app.handle(key('c'));
+    assert!(!draw(&mut app, 80, 20).contains("! for output"));
+    // The same failure again is news, though its text is the same.
+    app.handle(key('U'));
+    draw(&mut app, 80, 20);
+    app.handle(failed());
+    let out = draw(&mut app, 80, 20);
+    assert!(out.contains("pull failed: auth"), "{out}");
+    // A success after it takes it away.
+    app.handle(key('U'));
+    app.handle(UiMsg::Write(
+        WriteOp::Pull,
+        Ok(WriteOutcome::Done {
+            summary: "pulled".into(),
+            warning: None,
+        }),
+    ));
+    let out = draw(&mut app, 80, 20);
+    assert!(!out.contains("! for output"), "{out}");
+}
+
+#[test]
+fn output_view_shows_hook_output() {
+    let mut app = write_app(fixture());
+    failed(&mut app);
+    app.handle(key('!'));
+    let out = draw(&mut app, 80, 20);
+    assert!(out.contains("‹ back") && out.contains("output"), "{out}");
+    assert!(out.contains("hook: lint failed"), "{out}");
+    assert!(out.contains("src/a.rs:3: bad"), "{out}");
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn help_lists_write_keys_only_in_write_mode() {
+    let mut app = write_app(fixture());
+    app.handle(key('?'));
+    let out = draw(&mut app, 80, 30);
+    assert!(
+        out.contains("last failure") && out.contains("stage all"),
+        "{out}"
+    );
+    assert!(out.contains("pop · apply · drop"), "{out}");
+    let mut app = new_app(fixture());
+    app.handle(key('?'));
+    let out = draw(&mut app, 80, 30);
+    assert!(
+        !out.contains("pop · apply · drop") && !out.contains("last failure"),
+        "{out}"
+    );
+}
+
+#[test]
+fn detail_headers_carry_stash_and_file_labels() {
+    let mut app = write_app(fixture());
+    open(&mut app, Target::Stash(0));
+    let out = draw(&mut app, 80, 20);
+    assert!(first_line(&out).contains("pop · apply · drop"), "{out}");
+    let x = column(first_line(&out), "apply");
+    // Nothing happens until the view has loaded the stash it acts on.
+    app.handle(click(x, 0));
+    assert_eq!(app.write.running, None);
+    app.handle(UiMsg::Detail(
+        DetailReq::Commit {
+            rev: "stash@{0}".into(),
+        },
+        Ok(DetailData::Commit(CommitDetail {
+            oid: "s0".into(),
+            author: "a".into(),
+            time: 0,
+            message: "WIP on main: x".into(),
+            files: vec![],
+        })),
+    ));
+    app.handle(click(x, 0));
+    // The stash op is on its way.
+    assert_eq!(app.write.running, Some(gitst::write::Verb::StashAction));
+
+    let mut app = write_app(fixture());
+    open(&mut app, Target::File("src/app.rs".into()));
+    let out = draw(&mut app, 80, 20);
+    assert!(first_line(&out).contains("+ stage file"), "{out}");
+    let mut app = write_app(fixture());
+    open(&mut app, Target::File("src/watch.rs".into()));
+    let out = draw(&mut app, 80, 20);
+    assert!(first_line(&out).contains("− unstage file"), "{out}");
+    let mut app = new_app(fixture());
+    open(&mut app, Target::File("src/watch.rs".into()));
+    let out = draw(&mut app, 80, 20);
+    assert!(!first_line(&out).contains("unstage"), "{out}");
+}
+
+// ---- fix round 1 ----
+
+#[test]
+fn the_header_keeps_the_band_style() {
+    use ratatui::style::{Modifier, Style};
+    utc();
+    let mut theme = Theme::ansi();
+    theme.band = Style::new().bg(Color::Blue).add_modifier(Modifier::BOLD);
+    for write in [false, true] {
+        let mut app = if write {
+            write_app(fixture())
+        } else {
+            new_app(fixture())
+        };
+        let mut t = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        t.draw(|f| gitst::ui::draw(f, &mut app, &theme)).unwrap();
+        let cell = &t.backend().buffer()[(70, 0)];
+        assert_eq!(cell.bg, Color::Blue, "write={write}");
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+}
+
+fn after_write_key(w: u16, h: u16) -> (App, String) {
+    let mut app = write_app(fixture());
+    draw(&mut app, w, h);
+    app.handle(key('C'));
+    let out = draw(&mut app, w, h);
+    (app, out)
+}
+
+#[test]
+fn pane_too_small_shows_in_the_header() {
+    // No row below the header, and the one-line layout.
+    for (w, h) in [(40, 2), (20, 10), (20, 1)] {
+        let (_, out) = after_write_key(w, h);
+        assert!(
+            first_line(&out).contains("pane too small"),
+            "{w}x{h}\n{out}"
+        );
+    }
+    // Too narrow for a prompt but tall enough for a bottom row.
+    let (_, out) = after_write_key(29, 10);
+    assert!(last_line(&out).contains("pane too small"), "{out}");
+}
+
+#[test]
+fn an_open_prompt_shows_in_the_header_when_no_row_fits() {
+    let mut app = write_app(fixture());
+    app.write.prompt = Some(confirm("Push?", false));
+    let out = draw(&mut app, 40, 2);
+    assert!(first_line(&out).starts_with(" Push?"), "{out}");
+    assert!(first_line(&out).trim_end().ends_with("y / n"), "{out}");
+    app.write.prompt = Some(gitst::app::Prompt::Input {
+        purpose: gitst::app::InputPurpose::Commit,
+        input: gitst::prompt::LineInput::new("hi"),
+        amend: false,
+        saved: String::new(),
+    });
+    let mut t = Terminal::new(TestBackend::new(40, 2)).unwrap();
+    t.draw(|f| gitst::ui::draw(f, &mut app, &Theme::ansi()))
+        .unwrap();
+    assert!(first_line(&text(&t)).starts_with(" commit: hi"));
+    let pos = t.get_cursor_position().unwrap();
+    assert_eq!((pos.x, pos.y), (" commit: hi".len() as u16, 0));
+}
+
+#[test]
+fn a_failure_in_the_shared_warning_row_still_opens_the_output() {
+    let mut s = fixture();
+    s.config_error = Some("bad".into());
+    s.leak_scan_error = Some("x".into());
+    let mut app = write_app(s);
+    failed(&mut app);
+    let out = draw(&mut app, 80, 10);
+    let y = out
+        .lines()
+        .position(|l| l.contains("! for output"))
+        .expect(&out) as u16;
+    assert_eq!(y, 2, "in the last of two warning rows\n{out}");
+    app.handle(click(5, y));
+    assert_eq!(
+        app.stack.last().map(|v| v.target.clone()),
+        Some(Target::Output)
+    );
+}
+
+// ---- hunks ----
+
+fn file_loaded(app: &mut App) {
+    open(app, Target::File("src/app.rs".into()));
+    app.handle(UiMsg::Detail(
+        DetailReq::File {
+            path: "src/app.rs".into(),
+        },
+        Ok(file_data()),
+    ));
+}
+
+fn line_with<'a>(out: &'a str, text: &str) -> (u16, &'a str) {
+    let (y, l) = out
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains(text))
+        .unwrap_or_else(|| panic!("no {text:?} in\n{out}"));
+    (y as u16, l)
+}
+
+#[test]
+fn hunk_labels_only_in_write_mode() {
+    let mut app = write_app(fixture());
+    file_loaded(&mut app);
+    let out = draw(&mut app, 60, 16);
+    let (_, staged) = line_with(&out, "@@ -1 +1 @@");
+    assert!(staged.starts_with("▌@@ -1 +1 @@"), "{out}");
+    assert!(staged.trim_end().ends_with("− unstage"), "{out}");
+    let (y, unstaged) = line_with(&out, "@@ -10,3");
+    assert!(unstaged.starts_with("@@"), "{out}");
+    assert!(unstaged.trim_end().ends_with("+ stage"), "{out}");
+    insta::assert_snapshot!(out);
+    let x = column(unstaged, "+ stage");
+    let cmds = app.handle(click(x, y));
+    let op = cmds.iter().find_map(|c| match c {
+        gitst::app::Cmd::Worker(gitst::worker::WorkerMsg::Write(op)) => Some(&**op),
+        _ => None,
+    });
+    assert!(
+        matches!(
+            op,
+            Some(gitst::write::WriteOp::ApplyHunk { reverse: false, hunk, .. })
+                if hunk.header == "@@ -10,3 +10,3 @@ fn main() {"
+        ),
+        "{op:?}"
+    );
+
+    // Read-only: the cursor, and no labels.
+    let mut app = new_app(fixture());
+    file_loaded(&mut app);
+    let out = draw(&mut app, 60, 16);
+    assert!(line_with(&out, "@@ -1 +1 @@").1.starts_with("▌@@"), "{out}");
+    assert!(
+        !out.contains("+ stage") && !out.contains("− unstage"),
+        "{out}"
+    );
+    app.handle(key(']'));
+    let out = draw(&mut app, 60, 16);
+    assert!(line_with(&out, "@@ -1 +1 @@").1.starts_with("@@"), "{out}");
+    assert!(line_with(&out, "@@ -10,3").1.starts_with("▌@@"), "{out}");
+}
+
+#[test]
+fn renamed_files_have_no_hunk_labels() {
+    let mut s = fixture();
+    s.changes[2].orig_path = Some("src/old_app.rs".into());
+    let mut app = write_app(s);
+    file_loaded(&mut app);
+    let out = draw(&mut app, 60, 16);
+    assert!(
+        !line_with(&out, "@@ -1 +1 @@").1.contains("unstage"),
+        "{out}"
+    );
+    assert!(first_line(&out).contains("+ stage file"), "{out}");
+}
+
+#[test]
+fn the_hunk_cursor_scrolls_into_view() {
+    let mut app = new_app(fixture());
+    file_loaded(&mut app);
+    let out = draw(&mut app, 60, 6);
+    assert!(!out.contains("@@ -10,3"), "{out}");
+    app.handle(key(']'));
+    let out = draw(&mut app, 60, 6);
+    assert!(line_with(&out, "@@ -10,3").1.starts_with("▌@@"), "{out}");
+}
+
+#[test]
+fn filtered_files_have_no_hunk_labels() {
+    let mut app = write_app(fixture());
+    open(&mut app, Target::File("src/app.rs".into()));
+    let DetailData::File { blocks, .. } = file_data() else {
+        unreachable!()
+    };
+    app.handle(UiMsg::Detail(
+        DetailReq::File {
+            path: "src/app.rs".into(),
+        },
+        Ok(DetailData::File {
+            blocks,
+            filtered: true,
+        }),
+    ));
+    let out = draw(&mut app, 60, 16);
+    assert!(line_with(&out, "@@ -1 +1 @@").1.starts_with("▌@@"), "{out}");
+    assert!(!line_with(&out, "@@ -10,3").1.contains("stage"), "{out}");
+    assert!(!out.contains("− unstage"), "{out}");
+    assert!(first_line(&out).contains("+ stage file"), "{out}");
 }

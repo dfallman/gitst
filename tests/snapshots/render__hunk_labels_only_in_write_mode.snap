@@ -1,0 +1,20 @@
+---
+source: tests/render.rs
+expression: out
+---
+ ‹ back  src/app.rs   + stage file     Commit · Push   ↻ 2m 
+── Staged ──────────────────────────────────────────────────
+▌@@ -1 +1 @@ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ − unstage 
+-use a;                                                     
++use b;                                                     
+                                                            
+── Unstaged ────────────────────────────────────────────────
+@@ -10,3 +10,3 @@ fn main() { ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ + stage 
+     let x = 1;                                             
+-    old();                                                 
++    new();                                                 
+\ No newline at end of file                                 
+                                                            
+                                                            
+                                                            
+ esc back  w wrap  q quit

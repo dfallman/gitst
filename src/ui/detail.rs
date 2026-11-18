@@ -9,16 +9,43 @@ use ratatui::widgets::{
 };
 
 use super::dashboard::{commit_row, meter, row, stats_spans};
-use super::fmt::{clock, clusters, truncate_left, width};
+use super::fmt::{clock, clusters, truncate_left, truncate_right, width};
 use super::layout::Density;
 use super::theme::Theme;
 use super::{age_of, spans_width};
-use crate::app::{App, ScrollTarget, Target};
+use crate::app::{Action, App, ScrollTarget, Target, WriteAction};
 use crate::model::{
     Commit, CommitDetail, DetailData, DiffBlock, DiffKind, Leak, LeakSource, Snapshot,
 };
 
 type DetailLine = (Line<'static>, Option<Target>);
+
+/// A view laid out at one width.
+#[derive(Default)]
+struct Laid {
+    lines: Vec<DetailLine>,
+    /// The line of each hunk's `@@`, in hunk order.
+    hunk_lines: Vec<usize>,
+    /// Clickable words within lines: `(line, x, width, action)`.
+    labels: Vec<(usize, usize, usize, Action)>,
+}
+
+impl From<Vec<DetailLine>> for Laid {
+    fn from(lines: Vec<DetailLine>) -> Laid {
+        Laid {
+            lines,
+            ..Laid::default()
+        }
+    }
+}
+
+/// How a diff shows its hunks: which one the cursor is on, and whether
+/// each `@@` line ends with its stage or unstage label.
+#[derive(Clone, Copy, Default)]
+struct HunkCursor {
+    selected: Option<usize>,
+    labels: bool,
+}
 
 /// Draws the top detail view into `area`; returns the selected line's rect.
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density) -> Option<Rect> {
@@ -28,10 +55,21 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density)
     }
     let height = area.height as usize;
     let mut text = area;
-    let (lines, text_width) = fit(area.width, height, |w| view_lines(app, theme, w, d))?;
+    let (laid, text_width) = fit(area.width, height, |w| view_lines(app, theme, w, d))?;
     text.width = text_width;
+    let Laid {
+        lines,
+        hunk_lines,
+        labels,
+    } = laid;
     app.page = height;
     app.detail_targets = lines.iter().map(|(_, t)| t.clone()).collect();
+    let cursor_line = app
+        .stack
+        .last()?
+        .hunk
+        .and_then(|h| hunk_lines.get(h).copied());
+    app.hunk_lines = hunk_lines;
     let view = app.stack.last_mut()?;
     let max_scroll = lines.len().saturating_sub(height);
     if let Some(sel) = view.selected {
@@ -54,9 +92,18 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density)
                 .clicks
                 .push((r, crate::app::Action::Open(t.clone())));
         }
+        if cursor_line == Some(i) {
+            f.buffer_mut().set_style(r, theme.hover);
+        }
         if selected == Some(i) {
             f.buffer_mut().set_style(r, theme.select);
             selected_rect = Some(r);
+        }
+    }
+    for (i, x, w, action) in labels {
+        if (scroll..scroll + height).contains(&i) {
+            let r = Rect::new(text.x + x as u16, text.y + (i - scroll) as u16, w as u16, 1);
+            app.hits.clicks.push((r, action));
         }
     }
     if max_scroll > 0 {
@@ -90,20 +137,20 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, d: Density)
 fn fit(
     width: u16,
     height: usize,
-    mut lines_at: impl FnMut(usize) -> Option<Vec<DetailLine>>,
-) -> Option<(Vec<DetailLine>, u16)> {
+    mut lines_at: impl FnMut(usize) -> Option<Laid>,
+) -> Option<(Laid, u16)> {
     if width <= 1 {
         return Some((lines_at(width as usize)?, width));
     }
     let narrow = lines_at(width as usize - 1)?;
-    if narrow.len() > height {
+    if narrow.lines.len() > height {
         return Some((narrow, width - 1));
     }
     Some((lines_at(width as usize)?, width))
 }
 
 /// The top detail view's lines, laid out `w` cells wide.
-fn view_lines(app: &App, theme: &Theme, w: usize, d: Density) -> Option<Vec<DetailLine>> {
+fn view_lines(app: &App, theme: &Theme, w: usize, d: Density) -> Option<Laid> {
     let view = app.stack.last()?;
     let lines: Vec<DetailLine> = if view.target == Target::Leaks {
         leak_lines(app, theme, w)
@@ -114,8 +161,15 @@ fn view_lines(app: &App, theme: &Theme, w: usize, d: Density) -> Option<Vec<Deta
                 Line::from(Span::styled(format!(" ⚠ {e}"), Style::new().fg(theme.err))),
                 None,
             )],
-            Some(Ok(DetailData::File(blocks) | DetailData::CommitFile(blocks))) => {
-                diff_lines(blocks, theme, w, app.wrap)
+            Some(Ok(DetailData::File { blocks, .. } | DetailData::CommitFile(blocks))) => {
+                let labels = app.write.enabled
+                    && matches!(view.target, Target::File(_))
+                    && !app.whole_file_only(view);
+                let cursor = HunkCursor {
+                    selected: view.hunk,
+                    labels,
+                };
+                return Some(diff_lines(blocks, theme, w, app.wrap, cursor));
             }
             Some(Ok(DetailData::Commit(c))) => commit_lines(c, app, theme, w, d),
             Some(Ok(DetailData::Branch {
@@ -136,9 +190,10 @@ fn view_lines(app: &App, theme: &Theme, w: usize, d: Density) -> Option<Vec<Deta
                 ];
                 branch_lines(sides, &upstream, app, theme, w, d)
             }
+            Some(Ok(DetailData::Output(out))) => output_lines(out, theme, w, app.wrap),
         }
     };
-    Some(lines)
+    Some(lines.into())
 }
 
 /// Splits `s` into pieces of at most `max` cells, never inside a cluster.
@@ -157,6 +212,28 @@ fn wrap_text(s: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// A failed action's output, a line each; cut at the edge, or wrapped.
+fn output_lines(output: &str, theme: &Theme, w: usize, wrap: bool) -> Vec<DetailLine> {
+    if output.trim().is_empty() {
+        return vec![(Line::from(Span::styled(" (no output)", theme.dim)), None)];
+    }
+    let mut out = Vec::new();
+    for l in output.lines() {
+        let l = l.replace('\t', "    ");
+        let pieces = if wrap {
+            wrap_text(&l, w.saturating_sub(1))
+        } else {
+            vec![l]
+        };
+        out.extend(
+            pieces
+                .into_iter()
+                .map(|p| (Line::raw(format!(" {p}")), None)),
+        );
+    }
+    out
+}
+
 fn rule(title: &str, w: usize, theme: &Theme) -> Line<'static> {
     let head = format!("── {title} ");
     let fill = "─".repeat(w.saturating_sub(width(&head)));
@@ -166,14 +243,22 @@ fn rule(title: &str, w: usize, theme: &Theme) -> Line<'static> {
     ))
 }
 
-fn diff_lines(blocks: &[DiffBlock], theme: &Theme, w: usize, wrap: bool) -> Vec<DetailLine> {
+fn diff_lines(
+    blocks: &[DiffBlock],
+    theme: &Theme,
+    w: usize,
+    wrap: bool,
+    cursor: HunkCursor,
+) -> Laid {
     if blocks.is_empty() {
         return vec![(
             Line::from(Span::styled(" ✓ no changes", Style::new().fg(theme.add))),
             None,
-        )];
+        )]
+        .into();
     }
-    let mut out = Vec::new();
+    let mut laid = Laid::default();
+    let out = &mut laid.lines;
     for block in blocks {
         out.push((rule(&block.title, w, theme), None));
         for l in &block.lines {
@@ -182,12 +267,42 @@ fn diff_lines(blocks: &[DiffBlock], theme: &Theme, w: usize, wrap: bool) -> Vec<
                 DiffKind::Del => ("-", Style::new().fg(theme.del)),
                 DiffKind::Context => (" ", Style::new()),
                 DiffKind::Hunk => {
-                    let text = format!("{} ", l.text);
-                    let fill = "╌".repeat(w.saturating_sub(width(&text)));
+                    let i = laid.hunk_lines.len();
+                    laid.hunk_lines.push(out.len());
+                    let bar = if cursor.selected == Some(i) {
+                        "▌"
+                    } else {
+                        ""
+                    };
+                    let label = if block.staged() {
+                        "− unstage"
+                    } else {
+                        "+ stage"
+                    };
+                    // Only where the label leaves the header some room.
+                    let label = (cursor.labels && w >= width(label) + 12).then_some(label);
+                    let right = label.map_or(String::new(), |l| format!(" {l} "));
+                    let head = if label.is_some() {
+                        let room = w.saturating_sub(width(bar) + width(&right) + 1);
+                        truncate_right(&l.text, room)
+                    } else {
+                        l.text.clone()
+                    };
+                    let text = format!("{head} ");
+                    let used = width(bar) + width(&text) + width(&right);
+                    let fill = "╌".repeat(w.saturating_sub(used));
+                    let accent = Style::new().fg(theme.accent);
+                    if let Some(label) = label {
+                        let x = w - width(&right) + 1;
+                        let action = Action::Write(WriteAction::ToggleHunk(i));
+                        laid.labels.push((out.len(), x, width(label), action));
+                    }
                     out.push((
                         Line::from(vec![
-                            Span::styled(text, Style::new().fg(theme.accent)),
+                            Span::styled(bar, accent),
+                            Span::styled(text, accent),
                             Span::styled(fill, theme.border),
+                            Span::styled(right, accent),
                         ]),
                         None,
                     ));
@@ -209,7 +324,7 @@ fn diff_lines(blocks: &[DiffBlock], theme: &Theme, w: usize, wrap: bool) -> Vec<
         out.push((Line::default(), None));
     }
     out.pop();
-    out
+    laid
 }
 
 fn commit_lines(
@@ -461,11 +576,38 @@ const DETAIL_HELP: &[(&str, &str)] = &[
     ("pgup", "page up"),
     ("g G", "top / bottom"),
     ("w", "wrap long lines"),
+    ("] [", "next / prev hunk"),
     ("s", "possible secrets"),
     ("c", "clear warnings"),
     ("f", "fetch now"),
     ("?", "close help"),
     ("q", "quit"),
+];
+
+/// Write mode's keys, added to the help when it is on.
+const WRITE_HELP_DASHBOARD: &[(&str, &str)] = &[
+    ("a", "stage · unstage file"),
+    ("A", "stage all"),
+    ("C", "commit"),
+    ("P", "push"),
+    ("U", "pull"),
+    ("S", "stash"),
+    ("p o D", "pop · apply · drop"),
+    ("!", "last failure's output"),
+    ("tab", "amend (in C prompt)"),
+    ("ctrl-e", "editor (in C prompt)"),
+];
+
+const WRITE_HELP_DETAIL: &[(&str, &str)] = &[
+    ("a", "stage · unstage hunk"),
+    ("C", "commit"),
+    ("P", "push"),
+    ("U", "pull"),
+    ("S", "stash"),
+    ("p o D", "pop · apply · drop"),
+    ("!", "last failure's output"),
+    ("tab", "amend (in C prompt)"),
+    ("ctrl-e", "editor (in C prompt)"),
 ];
 
 /// The keys that do something in every layout.
@@ -503,11 +645,22 @@ pub fn draw_short_help(f: &mut Frame, theme: &Theme, area: Rect) {
 
 /// Centered help box for the current view; any key or click closes it.
 pub fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
-    let help = if app.stack.is_empty() {
+    let base = if app.stack.is_empty() {
         DASHBOARD_HELP
     } else {
         DETAIL_HELP
     };
+    let mut help: Vec<(&str, &str)> = base.to_vec();
+    if app.write.enabled {
+        // Before the closing `?` and `q`, which stay last.
+        let at = help.len() - 2;
+        let extra = if app.stack.is_empty() {
+            WRITE_HELP_DASHBOARD
+        } else {
+            WRITE_HELP_DETAIL
+        };
+        help.splice(at..at, extra.iter().copied());
+    }
     let w = area.width.min(38);
     let h = area.height.min(help.len() as u16 + 2);
     if w < 10 || h < 3 {
@@ -552,7 +705,7 @@ mod tests {
 
     #[test]
     fn an_overflowing_view_is_laid_out_once_without_the_scrollbar_column() {
-        let lines = |n: usize| -> Option<Vec<DetailLine>> { Some(vec![(Line::raw(""), None); n]) };
+        let lines = |n: usize| -> Option<Laid> { Some(vec![(Line::raw(""), None); n].into()) };
         let mut widths = Vec::new();
         let (laid, w) = fit(10, 3, |w| {
             widths.push(w);
@@ -560,7 +713,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(widths, vec![9], "the heavy case is laid out once");
-        assert_eq!((laid.len(), w), (5, 9));
+        assert_eq!((laid.lines.len(), w), (5, 9));
         widths.clear();
         let (laid, w) = fit(10, 3, |w| {
             widths.push(w);
@@ -572,7 +725,7 @@ mod tests {
             vec![9, 10],
             "a view that fits takes the whole width"
         );
-        assert_eq!((laid.len(), w), (2, 10));
+        assert_eq!((laid.lines.len(), w), (2, 10));
         assert_eq!(fit(1, 3, |w| lines(w + 4)).unwrap().1, 1);
     }
 

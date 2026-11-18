@@ -18,9 +18,10 @@ use super::parse::{
 };
 use super::{FetchError, GitBackend, GitError, Repo, SnapshotOpts, classify_fetch_stderr};
 use crate::model::{
-    CommitDetail, Counts, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, RepoOp,
+    CommitDetail, Counts, DetailData, DetailReq, DiffBlock, DiffKind, DiffLine, Head, Leak, RepoOp,
     Snapshot, Upstream,
 };
+use crate::write::{Coverage, WriteError, WriteOp, WriteOutcome};
 
 /// Largest untracked file whose lines are counted for the `+N` column.
 const MAX_COUNTED_FILE: u64 = 1 << 20;
@@ -48,9 +49,17 @@ const MAX_STDERR: usize = 64 << 10;
 /// its output, whatever the user's configuration says. It does not guard
 /// against the repository's config; see `CliBackend::command`.
 pub(crate) fn base_command(cwd: &Path) -> Command {
+    let mut c = plain_command(cwd);
+    c.arg("--no-optional-locks").env("GIT_OPTIONAL_LOCKS", "0");
+    c
+}
+
+/// What every git command gitst runs shares: paths are never patterns,
+/// nothing prompts or colours, output is in English, and stdin is closed.
+/// Reads add the no-locks flags (`base_command`); writes need the locks.
+pub(crate) fn plain_command(cwd: &Path) -> Command {
     let mut c = Command::new("git");
-    c.arg("--no-optional-locks")
-        .arg("--literal-pathspecs")
+    c.arg("--literal-pathspecs")
         .arg("-C")
         .arg(cwd)
         .args([
@@ -67,14 +76,13 @@ pub(crate) fn base_command(cwd: &Path) -> Command {
         // A partial clone's status or diff fetches a missing blob itself;
         // not from a refresh (git 2.45 and newer).
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
         .stdin(Stdio::null());
     c
 }
 
 pub struct CliBackend {
-    repo: Repo,
+    pub(super) repo: Repo,
     timeout: Duration,
     leaks: LeakScanner,
     /// Overrides from the config read by the last snapshot.
@@ -109,6 +117,18 @@ impl CliBackend {
             leaks: LeakScanner::new(cfg),
             ..self
         }
+    }
+
+    /// A fresh secret scan of what is staged now.
+    pub fn scan_staged(&self) -> (Vec<Leak>, Coverage) {
+        self.leaks
+            .staged_now(&|args| self.git_capped(args, MAX_PATCH))
+    }
+
+    /// A fresh secret scan of exactly these commits, newest first.
+    pub fn scan_range(&self, oids: &[String]) -> (Vec<Leak>, Coverage) {
+        self.leaks
+            .range(&|args| self.git_capped(args, MAX_PATCH), oids)
     }
 
     fn guard(&self) -> Arc<Guard> {
@@ -152,7 +172,7 @@ impl CliBackend {
             return Err(cancelled());
         }
         let (status, stdout, stderr) =
-            match run_bounded(&mut cmd, self.timeout, Some(&self.stop), cap, false) {
+            match run_bounded(&mut cmd, self.timeout, Some(&self.stop), cap, false, None) {
                 Ok(Run::Exited {
                     status,
                     stdout,
@@ -340,7 +360,7 @@ impl CliBackend {
     }
 
     /// Staged and unstaged diffs of one path, or its contents when untracked.
-    fn file_detail(&self, path: &str) -> Result<Vec<DiffBlock>, GitError> {
+    fn file_detail(&self, path: &str) -> Result<DetailData, GitError> {
         let diff = |cached: bool| {
             // `--no-textconv`: a diff driver is a command from config.
             let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
@@ -350,8 +370,8 @@ impl CliBackend {
             args.extend(["--", path]);
             shown_diff(self.git_capped(&args, MAX_SHOWN_DIFF))
         };
-        let mut blocks = nonempty_block("Staged".into(), diff(true)?);
-        blocks.extend(nonempty_block("Unstaged".into(), diff(false)?));
+        let mut blocks = nonempty_block(DiffBlock::STAGED.into(), diff(true)?);
+        blocks.extend(nonempty_block(DiffBlock::UNSTAGED.into(), diff(false)?));
         let size = std::fs::metadata(self.repo.root.join(path))
             .map(|m| m.len())
             .ok();
@@ -364,9 +384,21 @@ impl CliBackend {
             }
         }
         if blocks.is_empty() && self.git(&["ls-files", "-z", "--", path])?.is_empty() {
-            blocks = nonempty_block("Untracked".into(), self.untracked_lines(path));
+            blocks = nonempty_block(DiffBlock::UNTRACKED.into(), self.untracked_lines(path));
         }
-        Ok(blocks)
+        let filtered = !blocks.is_empty() && self.filtered(path);
+        Ok(DetailData::File { blocks, filtered })
+    }
+
+    /// Whether `path` has a `filter` attribute. Reading it runs nothing;
+    /// a failed read counts as filtered.
+    fn filtered(&self, path: &str) -> bool {
+        // `-z`: `<path> NUL filter NUL <value> NUL`.
+        let Ok(out) = self.git(&["check-attr", "-z", "filter", "--", path]) else {
+            return true;
+        };
+        let value = out.split(|b| *b == 0).nth(2).unwrap_or_default();
+        !matches!(value, b"unspecified" | b"unset")
     }
 
     fn untracked_lines(&self, rel: &str) -> Vec<DiffLine> {
@@ -850,7 +882,7 @@ impl GitBackend for CliBackend {
 
     fn detail(&self, req: &DetailReq) -> Result<DetailData, GitError> {
         match req {
-            DetailReq::File { path } => self.file_detail(path).map(DetailData::File),
+            DetailReq::File { path } => self.file_detail(path),
             DetailReq::Commit { rev } => {
                 let meta =
                     self.git(&["show", "-s", "--format=%H%x1f%an%x1f%at%x1f%B", rev, "--"])?;
@@ -926,6 +958,7 @@ impl GitBackend for CliBackend {
                 })
             }
             DetailReq::Leaks => Err(GitError::new("possible secrets come with the snapshot")),
+            DetailReq::Output => Err(GitError::new("output comes with the failure")),
         }
     }
 
@@ -942,7 +975,7 @@ impl GitBackend for CliBackend {
         let guard = Guard::new(&config, &[], &Guard::env);
         let mut cmd = self.fetch_command(prune, &guard);
         // Fetch writes nothing to stdout; a flood is not a fetch.
-        match run_bounded(&mut cmd, timeout, Some(cancel), 0, true) {
+        match run_bounded(&mut cmd, timeout, Some(cancel), 0, true, None) {
             Ok(Run::Exited { status, .. }) if status.success() => Ok(()),
             Ok(Run::Exited { stderr, .. }) => {
                 Err(classify_fetch_stderr(&String::from_utf8_lossy(&stderr)))
@@ -954,13 +987,22 @@ impl GitBackend for CliBackend {
         }
     }
 
+    fn write(
+        &self,
+        op: &WriteOp,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<WriteOutcome, WriteError> {
+        self.run_op(op, timeout, cancel)
+    }
+
     fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
 }
 
 /// How a command run by `run_bounded` ended.
-enum Run {
+pub(crate) enum Run {
     Exited {
         status: ExitStatus,
         stdout: Vec<u8>,
@@ -976,19 +1018,33 @@ enum Run {
 /// stops it and everything it started after `timeout`, once `cancel` is
 /// set, or once stdout passes `cap` bytes. Past `MAX_STDERR`, stderr is
 /// read and dropped. `detached` cuts the command off from the terminal.
-/// On Unix `cmd` must start a process group (see `ProcessTree`).
-fn run_bounded(
+/// With `input`, stdin is a pipe that gets those bytes and is then closed;
+/// otherwise it is whatever `cmd` has. On Unix `cmd` must start a process group (see `ProcessTree`).
+pub(crate) fn run_bounded(
     cmd: &mut Command,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
     cap: usize,
     detached: bool,
+    input: Option<&[u8]>,
 ) -> std::io::Result<Run> {
     /// How often a cancel is noticed while the command runs.
     const TICK: Duration = Duration::from_millis(50);
     prepare(cmd, detached);
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     let mut child = cmd.spawn()?;
     let tree = ProcessTree::adopt(&mut child)?;
+    // On its own thread, so a command that stops reading cannot stall the
+    // timeout. It ends when git has read it all or exits.
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        });
+    }
     let (closed_tx, closed) = mpsc::channel();
     let stdout = child
         .stdout

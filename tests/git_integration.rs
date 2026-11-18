@@ -252,7 +252,8 @@ fn file_and_commit_details() {
     r.write("a", "2\n");
     r.write("u.txt", "hi\n");
     let b = backend(&r);
-    let DetailData::File(blocks) = b.detail(&DetailReq::File { path: "a".into() }).unwrap() else {
+    let DetailData::File { blocks, .. } = b.detail(&DetailReq::File { path: "a".into() }).unwrap()
+    else {
         panic!()
     };
     assert_eq!(blocks.len(), 1);
@@ -263,7 +264,7 @@ fn file_and_commit_details() {
             .iter()
             .any(|l| l.kind == DiffKind::Add && l.text == "2")
     );
-    let DetailData::File(u) = b
+    let DetailData::File { blocks: u, .. } = b
         .detail(&DetailReq::File {
             path: "u.txt".into(),
         })
@@ -302,7 +303,7 @@ fn staged_and_unstaged_blocks() {
     r.write("a", "2\n");
     r.git(&["add", "a"]);
     r.write("a", "3\n");
-    let DetailData::File(blocks) = backend(&r)
+    let DetailData::File { blocks, .. } = backend(&r)
         .detail(&DetailReq::File { path: "a".into() })
         .unwrap()
     else {
@@ -670,7 +671,7 @@ fn diff_details_survive_colour_and_blank_line_config() {
     r.write("a", "1\n\n4\n");
     r.git(&["config", "color.diff", "always"]);
     r.git(&["config", "diff.suppressBlankEmpty", "true"]);
-    let DetailData::File(blocks) = backend(&r)
+    let DetailData::File { blocks, .. } = backend(&r)
         .detail(&DetailReq::File { path: "a".into() })
         .unwrap()
     else {
@@ -715,7 +716,7 @@ fn untracked_fifo_and_symlink_do_not_hang_detail() {
         let got = rx
             .recv_timeout(Duration::from_secs(3))
             .unwrap_or_else(|_| panic!("{path}: detail hung"));
-        let DetailData::File(blocks) = got.unwrap() else {
+        let DetailData::File { blocks, .. } = got.unwrap() else {
             panic!()
         };
         assert_eq!(

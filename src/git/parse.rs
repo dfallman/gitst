@@ -6,7 +6,7 @@ use crate::model::{
 
 pub const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%at%x1f%an%x1f%D%x1f%s%x1e";
 pub const BRANCH_FORMAT: &str = "%(refname:short)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(committerdate:unix)%1f%(HEAD)%1e";
-pub const STASH_FORMAT: &str = "%gd%x1f%ct%x1f%gs%x1e";
+pub const STASH_FORMAT: &str = "%gd%x1f%ct%x1f%H%x1f%gs%x1e";
 pub const REFLOG_FORMAT: &str = "%h%x1f%gd%x1f%gs%x1e";
 
 /// `git log -g` output format for several refs at once: the full hash,
@@ -262,11 +262,12 @@ pub fn parse_branches(raw: &[u8]) -> Vec<Branch> {
 /// Parses `git stash list --format=STASH_FORMAT`.
 pub fn parse_stashes(raw: &[u8]) -> Vec<Stash> {
     records(raw)
-        .filter(|f| f.len() >= 3)
+        .filter(|f| f.len() >= 4)
         .map(|f| Stash {
             index: braced_number(&f[0]).unwrap_or(0) as usize,
             time: f[1].parse().unwrap_or(0),
-            message: f[2..].join("\x1f"),
+            oid: f[2].clone(),
+            message: f[3..].join("\x1f"),
         })
         .collect()
 }
@@ -564,8 +565,9 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
 
     #[test]
     fn stash_and_reflog() {
-        let s = parse_stashes(b"stash@{1}\x1f1790484333\x1fWIP on main: ce2 x\x1e\n");
+        let s = parse_stashes(b"stash@{1}\x1f1790484333\x1fabc123\x1fWIP on main: ce2 x\x1e\n");
         assert_eq!((s[0].index, s[0].time), (1, 1790484333));
+        assert_eq!(s[0].oid, "abc123");
         assert_eq!(s[0].message, "WIP on main: ce2 x");
         let r = parse_reflog(
             "refs/remotes/origin/main",
@@ -577,6 +579,13 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         );
         assert_eq!(r[0].refname, "refs/remotes/origin/main");
         assert_eq!(r[0].short, "730d813");
+    }
+
+    #[test]
+    fn parse_stashes_reads_oid() {
+        let s = parse_stashes(b"stash@{0}\x1f5\x1f0123abcd\x1fmsg\x1fwith unit sep\x1e\n");
+        assert_eq!(s[0].oid, "0123abcd");
+        assert_eq!(s[0].message, "msg\x1fwith unit sep");
     }
 
     #[test]

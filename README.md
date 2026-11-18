@@ -11,6 +11,8 @@ Gitst typically sits in one pane of a multi-pane terminal setup (using tools lik
 
 By design, Gitst **monitors** git, it doesn't **manipulate** it. This comes with a few benefits, especially for team work scenarios when there's a lot of team activity on the repo, and also for personal use in conjunction with coding agents. Being a git monitor, Gitst never changes your git repository (apart from `git fetch`), and it never takes over git's `index.lock`, so it cannot (by design) get in the way or obstruct git commands run elsewhere. This is useful for at least two scenarios: 1) when you might want the coding agent to control git but still see what's going on, or 2), like me, you just want to control git manually.
 
+If you want Gitst to stage, commit, push, pull, and stash for you too, there is an opt-in write mode (`gitst --write`, see [Write mode](#write-mode)). Everything above holds unless you turn it on.
+
 ## Install
 
 With Homebrew (macOS and Linux):
@@ -117,16 +119,56 @@ warning says so, and the last findings stay.
 | `q` / `Ctrl-C` | quit | quit |
 | `Ctrl-Z` | suspend (`fg` resumes; not on Windows) | suspend |
 
+### Write mode
+
+Off by default. Turn it on with `gitst -w` (or `--write`), or `write = true` in the config. Without it, the keys below do nothing and show nothing, apart from `]` and `[`, which also move between hunks in a read-only diff.
+
+| Key | Where | Action |
+|---|---|---|
+| `a` | a file in Changes | stage or unstage the file |
+| `a` | a file's diff | stage or unstage the current hunk |
+| `]` / `[` | a file's diff | next / previous hunk |
+| `A` | dashboard | stage all, or unstage all when everything is staged |
+| `C` | anywhere | commit what is staged |
+| `P` | anywhere | push HEAD |
+| `U` | anywhere | pull, fast-forward only |
+| `S` | anywhere | stash, including untracked files |
+| `p` / `o` / `D` | a stash, or its view | pop / apply / drop |
+| `!` | anywhere | open the last failed action's output |
+| `Tab` | commit prompt | amend the last commit |
+| `Ctrl-E` | commit prompt | write the message in your editor |
+
+The keys that change the repository are capitals, so they are hard to hit by
+accident. Each action asks first when it needs to: before it stages everything,
+amends a pushed commit, or pushes. A confirm that names a possible secret, and
+stash drop, accept `y` only. `n` or `Esc` declines. Commit and push re-scan
+what they are about to change, so the secret check covers exactly that, not the
+last snapshot.
+
+`Ctrl-E` suspends Gitst, runs `git commit -e` in your terminal with the text
+typed so far, and resumes when git exits. It suits long messages, and hooks or
+signing that need a terminal. With amend, it starts from the subject you typed,
+not the previous message's body. As on the other commit path, the editor only
+opens if the staged changes and HEAD are still what you confirmed, and Gitst
+warns afterwards if the commit includes changes staged after your review.
+
+Files with a git `filter` attribute (for example LFS or `nbstripout`) stage as
+whole files only. Hunk staging matches what the view shows, so a change the view
+cannot show, such as tabs against spaces or a CR, is staged as it is on disk.
+
 ### Options
 
 ```
-gitst [PATH] [--no-fetch] [--interval <DURATION>]
+gitst [PATH] [--no-fetch] [--interval <DURATION>] [-w | --write]
 gitst --version
 ```
 
 - `--no-fetch` turns off background fetching. `↻` and `f` still fetch. It wins
   over `--interval`.
 - `--interval 10m` sets the time between background fetches (`30s`, `5m`, `1h`).
+- `-w`, `--write` turns on write mode. With `--write`, the actions you choose
+  run as ordinary git commands, with your hooks and the repository's config, as
+  if you ran them in your shell. Reads stay guarded.
 - `-V` / `--version` prints the version.
 
 ## Config
@@ -146,6 +188,7 @@ max_changes = 1000                  # most changed files to list
 numstat_max_files = 500             # skip +/− counts above this many changes
 leak_scan = true                    # warn about possible secrets
 leak_allow = []                     # paths never warned about (.gitignore syntax)
+write = false                       # allow commit, push, pull, stash, and staging
 ```
 
 Section names for `collapsed` are `changes`, `activity`, `commits`, `branches`,
@@ -176,6 +219,9 @@ in the UI and keep their defaults; the rest of the file still applies.
   `timeout`, or git's message) and retries with backoff, doubling from the fetch
   interval up to an hour (5, 10, 20, then 60 minutes by default). A fetch that
   runs longer than a minute is stopped.
+- With `--write`, the actions you choose run as ordinary git commands, with your
+  hooks and the repository's config, as if you ran them in your shell. Reads
+  stay guarded.
 - Pushes appear in Activity when they were made from this clone. Git only
   records them in the remote-tracking reflog.
 - Changes are picked up by watching the working tree and `.git`, skipping

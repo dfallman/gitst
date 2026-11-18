@@ -13,9 +13,15 @@ use ratatui::layout::{Position, Rect};
 
 use crate::activity::{ActivityEvent, ActivityKind, files_event};
 use crate::config::Config;
-use crate::model::{DetailData, DetailReq, Snapshot};
+use crate::model::{DetailData, DetailReq, DiffBlock, DiffKind, Snapshot};
 use crate::ui::layout::SectionId;
 use crate::worker::{FetchStatus, UiMsg, WorkerMsg};
+use crate::write::ShownHunk;
+
+mod write_flow;
+
+pub(crate) use write_flow::staged_only;
+pub use write_flow::{InputPurpose, Prompt, WriteAction, WriteState};
 
 /// An `index.lock` older than this is reported.
 pub const STALE_LOCK: Duration = Duration::from_secs(10);
@@ -41,6 +47,8 @@ pub enum Target {
     Stash(usize),
     /// Possible secrets, drawn from the current snapshot.
     Leaks,
+    /// The last failed write action's output, drawn from the failure.
+    Output,
 }
 
 impl Target {
@@ -67,6 +75,7 @@ impl Target {
                 rev: format!("stash@{{{i}}}"),
             },
             Target::Leaks => DetailReq::Leaks,
+            Target::Output => DetailReq::Output,
         }
     }
 
@@ -80,6 +89,7 @@ impl Target {
             Target::Branch { name, .. } => format!("branch {name}"),
             Target::Stash(i) => format!("stash@{{{i}}}"),
             Target::Leaks => "possible secrets".into(),
+            Target::Output => "output".into(),
         }
     }
 }
@@ -95,6 +105,9 @@ pub enum Action {
     ToggleWrap,
     /// Hides these warnings until they change.
     Clear(Vec<String>),
+    Write(WriteAction),
+    /// Opens the last failed write action's output.
+    ShowOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +158,82 @@ pub struct DetailView {
     pub data: Option<Result<DetailData, String>>,
     pub scroll: usize,
     pub selected: Option<usize>,
+    /// The hunk cursor of a file diff: an index into `hunks`.
+    pub hunk: Option<usize>,
+    /// The hunk just staged or unstaged, as its block (staged or not) and
+    /// its index there: the reload selects the hunk nearest to it.
+    pub reselect: Option<(bool, usize)>,
+}
+
+impl DetailView {
+    /// The diff blocks a file or commit-file view shows, once loaded.
+    pub fn blocks(&self) -> Option<&[DiffBlock]> {
+        match &self.data {
+            Some(Ok(DetailData::File { blocks: b, .. } | DetailData::CommitFile(b))) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Whether the file has a `filter` attribute.
+    pub fn filtered(&self) -> bool {
+        matches!(self.data, Some(Ok(DetailData::File { filtered: true, .. })))
+    }
+
+    /// The hunk to select once the view has (re)loaded: the first when it
+    /// opens, the same index, clamped, when it reloads, and after a hunk
+    /// was applied, the nearest to it in the block it left.
+    fn place_cursor(&mut self) {
+        let blocks = self.blocks().map(hunk_blocks).unwrap_or_default();
+        let n = blocks.len();
+        let reselect = self.reselect.take();
+        if n == 0 {
+            self.hunk = None;
+            return;
+        }
+        self.hunk = Some(match reselect {
+            Some((staged, k)) => {
+                let same: Vec<usize> = (0..n).filter(|i| blocks[*i] == staged).collect();
+                match same.get(k.min(same.len().saturating_sub(1))) {
+                    Some(i) => *i,
+                    // The block is gone: the staged block comes first.
+                    None if staged => 0,
+                    None => n - 1,
+                }
+            }
+            None => self.hunk.unwrap_or(0).min(n - 1),
+        });
+    }
+}
+
+/// For each hunk `data` shows, in order, whether it is in the staged block.
+fn hunk_blocks(data: &[DiffBlock]) -> Vec<bool> {
+    data.iter()
+        .flat_map(|b| b.lines.iter().map(move |l| (b.staged(), l)))
+        .filter(|(_, l)| l.kind == DiffKind::Hunk)
+        .map(|(staged, _)| staged)
+        .collect()
+}
+
+/// Hunks of the open file view, in display order, with whether each is in the staged block.
+fn hunks(data: &[DiffBlock]) -> Vec<(bool, ShownHunk)> {
+    let mut out: Vec<(bool, ShownHunk)> = Vec::new();
+    for block in data {
+        let staged = block.staged();
+        let mut in_hunk = false;
+        for line in &block.lines {
+            if line.kind == DiffKind::Hunk {
+                let hunk = ShownHunk {
+                    header: line.text.clone(),
+                    lines: Vec::new(),
+                };
+                out.push((staged, hunk));
+                in_hunk = true;
+            } else if in_hunk && let Some((_, hunk)) = out.last_mut() {
+                hunk.lines.push(line.clone());
+            }
+        }
+    }
+    out
 }
 
 pub enum Cmd {
@@ -152,6 +241,15 @@ pub enum Cmd {
     /// Hand the terminal back to the shell and stop until `fg`.
     Suspend,
     Worker(WorkerMsg),
+    /// Commit through `git commit` and the user's editor in the terminal,
+    /// starting from `text`, unless the index or HEAD moved from the
+    /// confirmed `tree` and `head` (spec §7.5).
+    Editor {
+        amend: bool,
+        text: String,
+        tree: String,
+        head: Option<String>,
+    },
 }
 
 pub struct App {
@@ -166,6 +264,7 @@ pub struct App {
     /// The work tree's folder name, shown before the branch.
     pub repo_name: Option<String>,
     pub fetch: FetchStatus,
+    pub write: WriteState,
     pub live: Vec<ActivityEvent>,
     pub pulses: HashMap<String, Instant>,
     /// Paths edited in the current burst of file events.
@@ -193,12 +292,17 @@ pub struct App {
     pub row_targets: HashMap<(SectionId, usize), Target>,
     /// Filled by draw: targets of the top detail view's lines.
     pub detail_targets: Vec<Option<Target>>,
+    /// Filled by draw: the line of each hunk's `@@` in the top detail view.
+    pub hunk_lines: Vec<usize>,
     /// Filled by draw: rows of the section or detail body, for paging.
     pub page: usize,
     /// Filled by draw: how long until an age on screen reads differently.
     pub age_wake: Cell<Option<Duration>>,
     /// Whether something on screen may have changed since the last draw.
     pub redraw: bool,
+    /// Filled by draw: the size of the pane, as `(width, height)`. `None`
+    /// before the first draw.
+    pub drawn_size: Option<(u16, u16)>,
 }
 
 /// Whether an open view of `req` may be out of date once `next` replaces
@@ -234,6 +338,7 @@ impl App {
             clearable: Vec::new(),
             repo_name: None,
             fetch,
+            write: WriteState::new(cfg.write),
             live: Vec::new(),
             pulses: HashMap::new(),
             burst: BTreeSet::new(),
@@ -252,9 +357,11 @@ impl App {
             nav: Vec::new(),
             row_targets: HashMap::new(),
             detail_targets: Vec::new(),
+            hunk_lines: Vec::new(),
             page: 10,
             age_wake: Cell::new(None),
             redraw: true,
+            drawn_size: None,
         }
     }
 
@@ -294,6 +401,7 @@ impl App {
         match msg {
             UiMsg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => self.key(k),
             UiMsg::Input(Event::Mouse(m)) => self.mouse(m),
+            UiMsg::Input(Event::Paste(text)) => self.paste(&text),
             UiMsg::Input(_) => Vec::new(),
             UiMsg::Snapshot {
                 snap,
@@ -339,12 +447,14 @@ impl App {
             UiMsg::Detail(req, data) => {
                 for v in self.stack.iter_mut().filter(|v| v.req == req) {
                     v.data = Some(data.clone());
+                    v.place_cursor();
                 }
                 Vec::new()
             }
             UiMsg::Suspend => vec![Cmd::Suspend],
             UiMsg::Quit => vec![Cmd::Quit],
             UiMsg::Wake => Vec::new(),
+            UiMsg::Write(op, result) => self.write_done(&op, result),
         }
     }
 
@@ -358,6 +468,7 @@ impl App {
             .map(|a| (STALE_LOCK - a).max(Duration::from_millis(200)));
         let wake = self.base_wakeup(ttl);
         let wake = self.age_wake.get().map_or(wake, |a| a.min(wake));
+        let wake = self.write_wakeup().map_or(wake, |w| w.min(wake));
         lock.map_or(wake, |l| l.min(wake))
     }
 
@@ -416,6 +527,8 @@ impl App {
                 }
                 Vec::new()
             }
+            // Gated on write mode, and filled from the failure.
+            Action::Open(Target::Output) => self.show_output(),
             Action::Open(target) => {
                 let req = target.request();
                 // The leaks view draws from the snapshot; nothing to load.
@@ -426,8 +539,11 @@ impl App {
                     data: None,
                     scroll: 0,
                     selected: None,
+                    hunk: None,
+                    reselect: None,
                 });
                 self.detail_targets.clear();
+                self.hunk_lines.clear();
                 if load {
                     vec![Cmd::Worker(WorkerMsg::Detail(req))]
                 } else {
@@ -440,6 +556,7 @@ impl App {
                 } else {
                     self.stack.pop();
                     self.detail_targets.clear();
+                    self.hunk_lines.clear();
                 }
                 Vec::new()
             }
@@ -457,6 +574,8 @@ impl App {
                 self.cleared.extend(keys);
                 Vec::new()
             }
+            Action::Write(action) => self.write_action(action),
+            Action::ShowOutput => self.show_output(),
         }
     }
 
@@ -476,27 +595,33 @@ impl App {
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             // Raw mode turns these keys into input instead of signals.
             match k.code {
-                KeyCode::Char('c') => return vec![Cmd::Quit],
+                KeyCode::Char('c') => return self.quit(),
                 KeyCode::Char('z') => return vec![Cmd::Suspend],
                 _ => {}
             }
+        }
+        if self.write.prompt.is_some() {
+            return self.prompt_key(k);
         }
         if self.help {
             self.help = false;
             // The help box lists `q` as quit, so it quits from there too.
             return if k.code == KeyCode::Char('q') {
-                vec![Cmd::Quit]
+                self.quit()
             } else {
                 Vec::new()
             };
         }
         match k.code {
-            KeyCode::Char('q') => return vec![Cmd::Quit],
+            KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('f') => return self.perform(Action::Fetch),
             KeyCode::Char('?') => return self.perform(Action::Help),
             KeyCode::Char('s') => return self.open_leaks(),
             KeyCode::Char('c') => return self.perform(Action::Clear(self.clearable.clone())),
             _ => {}
+        }
+        if let Some(cmds) = self.write_key(k) {
+            return cmds;
         }
         if self.stack.is_empty() {
             self.dashboard_key(k.code)
@@ -579,6 +704,7 @@ impl App {
             .filter(|i| self.detail_targets[*i].is_some())
             .collect();
         let page = self.page.max(1);
+        let hunk_lines = &self.hunk_lines;
         let Some(view) = self.stack.last_mut() else {
             return Vec::new();
         };
@@ -625,6 +751,24 @@ impl App {
                 view.selected = None;
                 view.scroll = usize::MAX / 2;
             }
+            KeyCode::Char(']') | KeyCode::Char('[') => {
+                let n = view.blocks().map_or(0, |b| hunk_blocks(b).len());
+                let Some(cur) = view.hunk.filter(|_| n > 0) else {
+                    return Vec::new();
+                };
+                let next = if code == KeyCode::Char(']') {
+                    (cur + 1).min(n - 1)
+                } else {
+                    cur.saturating_sub(1)
+                };
+                view.hunk = Some(next);
+                // Out of view, its `@@` line goes to the top.
+                if let Some(&line) = hunk_lines.get(next)
+                    && (line < view.scroll || line >= view.scroll + page)
+                {
+                    view.scroll = line;
+                }
+            }
             KeyCode::Char('w') => return self.perform(Action::ToggleWrap),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 let target = view
@@ -641,6 +785,13 @@ impl App {
 
     fn mouse(&mut self, m: MouseEvent) -> Vec<Cmd> {
         let (x, y) = (m.column, m.row);
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.write.prompt.is_some() {
+            // A click on the prompt row is its own; elsewhere it cancels.
+            if !self.in_prompt_row(x, y) {
+                self.cancel_prompt();
+            }
+            return Vec::new();
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.help {
@@ -699,6 +850,16 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_mode_follows_config() {
+        let cfg = Config {
+            write: true,
+            ..Config::default()
+        };
+        assert!(App::new(&cfg, FetchStatus::default()).write.enabled);
+        assert!(!app().write.enabled);
+    }
 
     fn app() -> App {
         App::new(&Config::default(), FetchStatus::default())
@@ -906,6 +1067,78 @@ mod tests {
             changed: vec![],
         };
         assert!(detail_req(&a.handle(committed)).is_some(), "committed");
+    }
+
+    /// A staged hunk, then two unstaged ones.
+    fn three_hunks() -> DetailData {
+        use crate::model::{DiffBlock, DiffKind, DiffLine};
+        let block = |title: &str, headers: &[&str]| DiffBlock {
+            title: title.into(),
+            lines: headers
+                .iter()
+                .flat_map(|h| {
+                    [
+                        DiffLine {
+                            kind: DiffKind::Hunk,
+                            text: h.to_string(),
+                        },
+                        DiffLine {
+                            kind: DiffKind::Add,
+                            text: "x".into(),
+                        },
+                    ]
+                })
+                .collect(),
+        };
+        file(vec![
+            block(DiffBlock::STAGED, &["@@ -1 +1 @@"]),
+            block(DiffBlock::UNSTAGED, &["@@ -5 +5 @@", "@@ -9 +9 @@"]),
+        ])
+    }
+
+    fn file(blocks: Vec<crate::model::DiffBlock>) -> DetailData {
+        DetailData::File {
+            blocks,
+            filtered: false,
+        }
+    }
+
+    #[test]
+    fn bracket_keys_move_hunk_in_read_only() {
+        let mut a = app();
+        let req = DetailReq::File { path: "a".into() };
+        a.perform(Action::Open(Target::File("a".into())));
+        assert!(a.handle(ch(']')).is_empty(), "nothing loaded yet");
+        assert_eq!(a.stack[0].hunk, None);
+        a.handle(UiMsg::Detail(req.clone(), Ok(three_hunks())));
+        assert_eq!(a.stack[0].hunk, Some(0), "opening selects the first hunk");
+        for (k, want) in [(']', 1), (']', 2), (']', 2), ('[', 1), ('[', 0), ('[', 0)] {
+            assert!(a.handle(ch(k)).is_empty(), "{k}");
+            assert_eq!(a.stack[0].hunk, Some(want), "{k}");
+        }
+        assert!(a.handle(ch('a')).is_empty(), "no write in read-only mode");
+        // Moving scrolls the `@@` line into view, as the last draw laid it out.
+        a.hunk_lines = vec![1, 30, 60];
+        a.page = 10;
+        a.handle(ch(']'));
+        assert_eq!(a.stack[0].scroll, 30);
+        a.handle(ch('['));
+        assert_eq!(a.stack[0].scroll, 1);
+        // A reload keeps the index, clamped to the hunks there are now.
+        a.stack[0].hunk = Some(2);
+        let one = match three_hunks() {
+            DetailData::File { mut blocks, .. } => {
+                blocks.truncate(1);
+                file(blocks)
+            }
+            _ => unreachable!(),
+        };
+        a.handle(UiMsg::Detail(req.clone(), Ok(one)));
+        assert_eq!(a.stack[0].hunk, Some(0));
+        a.handle(UiMsg::Detail(req, Ok(file(vec![]))));
+        assert_eq!(a.stack[0].hunk, None);
+        assert!(a.handle(ch(']')).is_empty());
+        assert_eq!(a.stack[0].hunk, None, "no hunks: the keys do nothing");
     }
 
     #[test]
