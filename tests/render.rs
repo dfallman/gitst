@@ -260,8 +260,38 @@ fn draw(app: &mut App, w: u16, h: u16) -> String {
 /// `out` with the app's version, which changes each release, masked at
 /// the same width so the snapshot stays put.
 fn unversioned(out: &str) -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    out.replace(version, &"x".repeat(version.len()))
+    mask_version(out, env!("CARGO_PKG_VERSION"))
+}
+
+/// `out` with the help box's ` gitst <version> ` title redrawn as
+/// ` gitst VERSION `, centered in the same run of `─`, so a snapshot does
+/// not change with the version or with its length.
+fn mask_version(out: &str, version: &str) -> String {
+    let title = format!(" gitst {version} ");
+    let mask = " gitst VERSION ";
+    out.lines()
+        .map(|line| {
+            let Some(at) = line.find(&title) else {
+                return line.to_string();
+            };
+            let (before, rest) = line.split_at(at);
+            let after = &rest[title.len()..];
+            let head = before.trim_end_matches('─');
+            let tail = after.trim_start_matches('─');
+            let run = before[head.len()..].chars().count()
+                + title.chars().count()
+                + after[..after.len() - tail.len()].chars().count();
+            let left = (run - mask.chars().count()) / 2;
+            let right = run - mask.chars().count() - left;
+            format!(
+                "{head}{}{mask}{}{tail}",
+                "─".repeat(left),
+                "─".repeat(right)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if out.ends_with('\n') { "\n" } else { "" }
 }
 
 fn render(w: u16, h: u16, snap: Snapshot) -> String {
@@ -2430,4 +2460,18 @@ fn help_lists_r_for_outgoing() {
     assert!(out.contains("click ↑N"), "{out}");
     let (_, row) = line_with(&out, " r  ");
     assert!(row.contains("outgoing commits"), "{out}");
+}
+
+#[test]
+fn the_version_mask_ignores_how_long_the_version_is() {
+    // A centered title moves by a cell when the version's length changes.
+    let old = "x╭─────────── gitst 0.1.16 ───────────╮y";
+    let new = "x╭──────────── gitst 0.2.0 ───────────╮y";
+    assert_eq!(old.chars().count(), new.chars().count());
+    assert_eq!(mask_version(old, "0.1.16"), mask_version(new, "0.2.0"));
+    assert!(
+        mask_version(old, "0.1.16").starts_with("x╭"),
+        "the box stays"
+    );
+    assert!(!mask_version(old, "0.1.16").contains("0.1.16"));
 }

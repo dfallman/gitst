@@ -8,11 +8,11 @@ repository = "https://github.com/dfallman/gitst"
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
 ignore = "0.4"
+jiff = "1.0.1"
 notify = "8"
 ratatui = "0.30"
 regex = "1"

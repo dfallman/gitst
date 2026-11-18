@@ -386,6 +386,7 @@ fn secret_staged_after_last_refresh_is_found() {
     assert_eq!(plan.coverage, Coverage::Full);
 }
 
+#[cfg(unix)]
 #[test]
 fn failing_pre_commit_hook_surfaces_output() {
     use std::os::unix::fs::PermissionsExt;
@@ -402,6 +403,7 @@ fn failing_pre_commit_hook_surfaces_output() {
     assert!(e.output.contains("lint failed"), "{}", e.output);
 }
 
+#[cfg(unix)]
 #[test]
 fn commit_timeout_says_commit_failed() {
     use std::os::unix::fs::PermissionsExt;
@@ -781,6 +783,7 @@ fn push_refusals_on_unborn_and_detached() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn push_timeout_says_timeout() {
     let (r, _remote) = with_remote();
@@ -1266,6 +1269,7 @@ fn a_hunk_is_cut_from_the_diff_git_add_would_stage() {
     assert_eq!(staged(&r), "");
 }
 
+#[cfg(unix)]
 #[test]
 fn staging_a_hunk_leaves_the_mode_change() {
     use std::os::unix::fs::PermissionsExt;

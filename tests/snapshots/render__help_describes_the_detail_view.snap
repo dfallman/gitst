@@ -3,7 +3,7 @@ source: tests/render.rs
 expression: unversioned(&out)
 ---
  ‹ back  a                             ↻ 2m 
-── ╭─────────── gitst xxxxxx ───────────╮───
+── ╭────────── gitst VERSION ───────────╮───
 ▌@@│ click       open · button          │╌╌╌
 -us│ wheel       scroll                 │   
 +us│ right-click back                   │   

@@ -1,6 +1,5 @@
 //! Text fitting and time formatting, all measured in terminal cells.
 
-use chrono::{Local, TimeZone};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -169,13 +168,15 @@ fn unit_of(secs: i64) -> i64 {
     }
 }
 
-/// Local wall-clock `HH:MM` for a unix time.
+/// Local wall-clock `HH:MM` for a unix time, or `--:--` for one out of
+/// range.
 pub fn clock(unix: i64) -> String {
-    match Local.timestamp_opt(unix, 0) {
-        chrono::LocalResult::Single(t) | chrono::LocalResult::Ambiguous(t, _) => {
-            t.format("%H:%M").to_string()
-        }
-        chrono::LocalResult::None => "--:--".into(),
+    match jiff::Timestamp::from_second(unix) {
+        Ok(t) => t
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
+            .strftime("%H:%M")
+            .to_string(),
+        Err(_) => "--:--".into(),
     }
 }
 
@@ -304,5 +305,11 @@ mod tests {
         let c = clock(1_790_484_333);
         assert_eq!(c.len(), 5);
         assert_eq!(&c[2..3], ":");
+    }
+
+    #[test]
+    fn clock_out_of_range_is_dashes() {
+        assert_eq!(clock(i64::MAX), "--:--");
+        assert_eq!(clock(i64::MIN), "--:--");
     }
 }

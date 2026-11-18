@@ -4,7 +4,7 @@ expression: unversioned(&out)
 ---
  spritz · main ↑2 ↓0 ●                 ↻ 2m 
  origin/main · v0.1.9+4 · stash 1           
-╭ ▼╭─────────── gitst xxxxxx ───────────╮2 ╮
+╭ ▼╭────────── gitst VERSION ───────────╮2 ╮
 │ ?│ click       open · fold · button   │  │
 │  │ click ↑N    outgoing commits       │  │
 │  │ wheel       scroll                 │  │
