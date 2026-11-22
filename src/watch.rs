@@ -1,10 +1,11 @@
 //! Filesystem watching: turns relevant file events into refresh signals.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::ModifyKind;
@@ -35,6 +36,13 @@ pub struct Relevance {
 const DEBOUNCE: Duration = Duration::from_millis(150);
 /// A continuous burst still refreshes at least this often.
 const MAX_BURST: Duration = Duration::from_secs(1);
+/// How often `.git` state is checked directly so a dropped watcher event
+/// never leaves the view stale until the next timed fetch.
+const SAFETY_POLL: Duration = Duration::from_secs(2);
+/// Upper bound on a small ref or reftable-list file read by `GitStamp`.
+const MAX_STAMP_FILE: u64 = 4096;
+/// Most remotes inspected per safety-net check under `refs/remotes/`.
+const MAX_REMOTES: usize = 16;
 
 /// How the work tree is watched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,16 +189,31 @@ impl Relevance {
 
 /// Whether a path inside a git directory reflects a change in repo state.
 pub fn git_internal_relevant(rel: &Path) -> bool {
+    // A coalesced or directory-level event on `.git` itself may cover any
+    // ref, HEAD, or index change inside it.
+    if rel.as_os_str().is_empty() {
+        return true;
+    }
     // A submodule's git directory is `modules/<name>/`, and the name may
     // contain slashes, so any tail of the path may be the part that counts.
     if let Ok(sub) = rel.strip_prefix("modules") {
         let comps: Vec<_> = sub.components().collect();
+        if comps.is_empty() {
+            return true;
+        }
         return (1..comps.len()).any(|i| {
             let tail: PathBuf = comps[i..].iter().collect();
             own_git_path_relevant(&tail)
         });
     }
     own_git_path_relevant(rel)
+}
+
+/// Whether `s` is `dir` itself or a path beneath `dir/`.
+fn under(s: &str, dir: &str) -> bool {
+    s == dir
+        || s.strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn own_git_path_relevant(rel: &Path) -> bool {
@@ -212,14 +235,150 @@ fn own_git_path_relevant(rel: &Path) -> bool {
             | "info/exclude"
     ) || (s.ends_with("_HEAD") && !s.contains('/'))
         || [
-            "refs/",
-            "logs/",
+            "refs",
+            "logs",
+            "reftable",
             "rebase-merge",
             "rebase-apply",
             "sequencer",
         ]
         .iter()
-        .any(|p| s.starts_with(p))
+        .any(|dir| under(&s, dir))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    is_dir: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Cheap fingerprint of a repository's `.git` state, taken without spawning
+/// git, so the watcher thread can catch external commits, pushes, checkouts,
+/// staging, or ref updates even if the OS watcher drops an event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitStamp {
+    head: Option<Vec<u8>>,
+    head_ref: Option<Vec<u8>>,
+    head_ref_log: Option<FileStamp>,
+    remote_refs: Vec<(String, Option<FileStamp>, Option<Vec<u8>>)>,
+    stash: Option<Vec<u8>>,
+    reftable: Option<Vec<u8>>,
+    stats: [Option<FileStamp>; 17],
+}
+
+fn stat_file(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(FileStamp {
+        is_dir: meta.is_dir(),
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
+}
+
+/// Reads a small regular file (never a symlink, directory, or FIFO), capped
+/// at `MAX_STAMP_FILE` bytes.
+fn read_small(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_STAMP_FILE {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_STAMP_FILE + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX_STAMP_FILE).then_some(buf)
+}
+
+/// The target of `HEAD` when it is a safe relative `ref: <path>` line.
+fn head_symref(head: &[u8]) -> Option<&str> {
+    let target = std::str::from_utf8(head)
+        .ok()?
+        .lines()
+        .next()?
+        .strip_prefix("ref:")?
+        .trim();
+    if target.is_empty() {
+        return None;
+    }
+    let safe = Path::new(target)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)));
+    safe.then_some(target)
+}
+
+fn remote_branch_refs(
+    common_dir: &Path,
+    branch: &str,
+) -> Vec<(String, Option<FileStamp>, Option<Vec<u8>>)> {
+    let remotes_dir = common_dir.join("refs/remotes");
+    let Ok(entries) = std::fs::read_dir(&remotes_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            e.file_type()
+                .ok()?
+                .is_dir()
+                .then(|| e.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    names.sort();
+    names.truncate(MAX_REMOTES);
+    names
+        .into_iter()
+        .map(|remote| {
+            let dir = remotes_dir.join(&remote);
+            let dir_stamp = stat_file(&dir);
+            let ref_bytes = read_small(&dir.join(branch));
+            (remote, dir_stamp, ref_bytes)
+        })
+        .collect()
+}
+
+impl GitStamp {
+    fn take(git_dir: &Path, common_dir: &Path) -> Self {
+        let head = read_small(&git_dir.join("HEAD"));
+        let (head_ref, head_ref_log, remote_refs) = match head.as_deref().and_then(head_symref) {
+            Some(target) => {
+                let hr = read_small(&common_dir.join(target));
+                let log = stat_file(&common_dir.join("logs").join(target));
+                let remotes = target
+                    .strip_prefix("refs/heads/")
+                    .map(|branch| remote_branch_refs(common_dir, branch))
+                    .unwrap_or_default();
+                (hr, log, remotes)
+            }
+            None => (None, None, Vec::new()),
+        };
+        GitStamp {
+            head,
+            head_ref,
+            head_ref_log,
+            remote_refs,
+            stash: read_small(&common_dir.join("refs/stash")),
+            reftable: read_small(&common_dir.join("reftable/tables.list")),
+            stats: [
+                stat_file(&git_dir.join("index")),
+                stat_file(&git_dir.join("index.lock")),
+                stat_file(&git_dir.join("FETCH_HEAD")),
+                stat_file(&git_dir.join("logs/HEAD")),
+                stat_file(&git_dir.join("MERGE_HEAD")),
+                stat_file(&git_dir.join("CHERRY_PICK_HEAD")),
+                stat_file(&git_dir.join("REVERT_HEAD")),
+                stat_file(&git_dir.join("BISECT_LOG")),
+                stat_file(&git_dir.join("rebase-merge")),
+                stat_file(&git_dir.join("rebase-merge/msgnum")),
+                stat_file(&git_dir.join("rebase-apply")),
+                stat_file(&git_dir.join("rebase-apply/next")),
+                stat_file(&git_dir.join("sequencer")),
+                stat_file(&git_dir.join("config.worktree")),
+                stat_file(&common_dir.join("packed-refs")),
+                stat_file(&common_dir.join("config")),
+                stat_file(&common_dir.join("info/exclude")),
+            ],
+        }
+    }
 }
 
 fn watcher(tx: Sender<notify::Result<notify::Event>>) -> notify::Result<RecommendedWatcher> {
@@ -278,78 +437,121 @@ fn spawn_with(repo: &Repo, out: Sender<WorkerMsg>, mode: Mode) -> notify::Result
     // The thread must not keep the watcher alive, or dropping the handle
     // would never end it.
     let weak = Arc::downgrade(&watcher);
-    let root = repo.root.clone();
-    let mut relevance = Relevance::new(repo);
+    let repo = repo.clone();
     std::thread::Builder::new()
         .name("gitst-watch".into())
-        .spawn(move || {
-            // Every event is looked at, even inside a burst, so that no new
-            // directory goes unwatched. Returns whether the event is
-            // relevant, and whether `.gitignore` changed.
-            let mut on_event = |ev: notify::Result<notify::Event>| -> (bool, bool) {
-                let Ok(ev) = ev else {
-                    return (true, false);
-                };
-                if matches!(ev.kind, EventKind::Access(_)) {
-                    return (false, false);
-                }
-                let relevant: Vec<&PathBuf> = ev
-                    .paths
-                    .iter()
-                    .filter(|p| relevance.is_relevant(p))
-                    .collect();
-                let gitignore = relevant
-                    .iter()
-                    .any(|p| p.file_name().is_some_and(|n| n == ".gitignore"));
-                if mode == Mode::PerDirectory && !gitignore {
-                    follow_new_dirs(&weak, &root, &ev, &relevant);
-                }
-                (!relevant.is_empty(), gitignore)
-            };
-            while let Ok(ev) = rx.recv() {
-                let (relevant, mut rewalk) = on_event(ev);
-                if !relevant {
-                    continue;
-                }
-                // The burst ends after a quiet period without relevant
-                // events: a build writing to `target/` must not hold back
-                // the refresh for an edit next to it.
-                let end = Instant::now() + MAX_BURST;
-                let mut quiet = Instant::now() + DEBOUNCE;
-                loop {
-                    let wait = quiet.min(end).saturating_duration_since(Instant::now());
-                    if wait.is_zero() {
-                        break;
-                    }
-                    match rx.recv_timeout(wait) {
-                        Ok(ev) => {
-                            let (relevant, gitignore) = on_event(ev);
-                            rewalk |= gitignore;
-                            if relevant {
-                                quiet = Instant::now() + DEBOUNCE;
-                            }
+        .spawn(move || watch_loop(repo, rx, out, weak, mode, SAFETY_POLL))
+        .map_err(|e| notify::Error::generic(&e.to_string()))?;
+    Ok(WatchHandle { _watcher: watcher })
+}
+
+fn watch_loop(
+    repo: Repo,
+    rx: Receiver<notify::Result<notify::Event>>,
+    out: Sender<WorkerMsg>,
+    weak: Weak<Mutex<RecommendedWatcher>>,
+    mode: Mode,
+    safety_poll: Duration,
+) {
+    let mut relevance = Relevance::new(&repo);
+    let mut last_stamp = GitStamp::take(&repo.git_dir, &repo.common_dir);
+    let mut next_check = Instant::now() + safety_poll;
+    // Every event is looked at, even inside a burst, so that no new
+    // directory goes unwatched. Returns whether the event is
+    // relevant, and whether `.gitignore` changed (or a rescan happened).
+    let mut on_event = |ev: notify::Result<notify::Event>| -> (bool, bool) {
+        let Ok(ev) = ev else {
+            return (true, false);
+        };
+        if ev.need_rescan() {
+            return (true, true);
+        }
+        if matches!(ev.kind, EventKind::Access(_)) {
+            return (false, false);
+        }
+        let relevant: Vec<&PathBuf> = ev
+            .paths
+            .iter()
+            .filter(|p| relevance.is_relevant(p))
+            .collect();
+        let gitignore = relevant
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == ".gitignore"));
+        if mode == Mode::PerDirectory && !gitignore {
+            follow_new_dirs(&weak, &repo.root, &ev, &relevant);
+        }
+        (!relevant.is_empty(), gitignore)
+    };
+    loop {
+        let wait = next_check.saturating_duration_since(Instant::now());
+        let first = match rx.recv_timeout(wait) {
+            Ok(ev) => Some(ev),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        if let Some(ev) = first {
+            let (relevant, mut rewalk) = on_event(ev);
+            if !relevant {
+                if Instant::now() >= next_check {
+                    next_check = Instant::now() + safety_poll;
+                    let stamp = GitStamp::take(&repo.git_dir, &repo.common_dir);
+                    if stamp != last_stamp {
+                        last_stamp = stamp;
+                        if out.send(WorkerMsg::Refresh).is_err() {
+                            return;
                         }
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                // After `.gitignore` edits, once per burst: directories no
-                // longer ignored need watches. (Newly ignored ones keep
-                // theirs until restart; their events are dropped.)
-                if mode == Mode::PerDirectory
-                    && rewalk
-                    && let Some(w) = weak.upgrade()
-                {
-                    let mut w = w.lock().unwrap_or_else(PoisonError::into_inner);
-                    let _ = watch_unignored(&mut w, &root);
+                continue;
+            }
+            // The burst ends after a quiet period without relevant
+            // events: a build writing to `target/` must not hold back
+            // the refresh for an edit next to it.
+            let end = Instant::now() + MAX_BURST;
+            let mut quiet = Instant::now() + DEBOUNCE;
+            loop {
+                let wait = quiet.min(end).saturating_duration_since(Instant::now());
+                if wait.is_zero() {
+                    break;
                 }
+                match rx.recv_timeout(wait) {
+                    Ok(ev) => {
+                        let (relevant, gitignore) = on_event(ev);
+                        rewalk |= gitignore;
+                        if relevant {
+                            quiet = Instant::now() + DEBOUNCE;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            // After `.gitignore` edits or a rescan, once per burst:
+            // directories no longer ignored need watches. (Newly ignored
+            // ones keep theirs until restart; their events are dropped.)
+            if mode == Mode::PerDirectory
+                && rewalk
+                && let Some(w) = weak.upgrade()
+            {
+                let mut w = w.lock().unwrap_or_else(PoisonError::into_inner);
+                let _ = watch_unignored(&mut w, &repo.root);
+            }
+            last_stamp = GitStamp::take(&repo.git_dir, &repo.common_dir);
+            next_check = Instant::now() + safety_poll;
+            if out.send(WorkerMsg::Refresh).is_err() {
+                return;
+            }
+        } else {
+            next_check = Instant::now() + safety_poll;
+            let stamp = GitStamp::take(&repo.git_dir, &repo.common_dir);
+            if stamp != last_stamp {
+                last_stamp = stamp;
                 if out.send(WorkerMsg::Refresh).is_err() {
                     return;
                 }
             }
-        })
-        .map_err(|e| notify::Error::generic(&e.to_string()))?;
-    Ok(WatchHandle { _watcher: watcher })
+        }
+    }
 }
 
 /// Adds watches for directories that appeared (created or moved in).
@@ -497,20 +699,29 @@ mod tests {
     #[test]
     fn internal_paths() {
         for p in [
+            "",
             "HEAD",
             "index",
             "index.lock",
+            "refs",
             "refs/heads/main",
+            "logs",
             "logs/HEAD",
+            "reftable",
+            "reftable/tables.list",
             "MERGE_HEAD",
             "FETCH_HEAD",
+            "rebase-merge",
             "rebase-merge/msgnum",
             "packed-refs",
             "BISECT_LOG",
             "config",
             "info/exclude",
+            "modules",
             // Submodules' git directories, whose names may contain slashes.
             "modules/sub/HEAD",
+            "modules/sub/refs",
+            "modules/sub/reftable/tables.list",
             "modules/libs/foo/refs/heads/main",
             "modules/a/modules/b/index",
         ] {
@@ -521,6 +732,7 @@ mod tests {
         for p in [
             r"refs\heads\main",
             r"logs\HEAD",
+            r"reftable\tables.list",
             r"info\exclude",
             r"rebase-merge\msgnum",
             r"modules\libs\foo\refs\heads\main",
@@ -530,11 +742,194 @@ mod tests {
         for p in [
             "objects/ab/cdef",
             "modules/sub/objects/ab/cdef",
+            "refs-extra",
+            "logs-extra",
+            "reftable-extra",
+            "rebase-merge-extra",
             "description",
             "hooks/pre-commit",
             "COMMIT_EDITMSG",
         ] {
             assert!(!git_internal_relevant(Path::new(p)), "{p}");
         }
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    #[test]
+    fn head_symref_rejects_traversal() {
+        assert_eq!(
+            head_symref(b"ref: refs/heads/main\n"),
+            Some("refs/heads/main")
+        );
+        assert_eq!(
+            head_symref(b"ref: refs/heads/feat/one\n"),
+            Some("refs/heads/feat/one")
+        );
+        assert_eq!(head_symref(b"ref: ../outside\n"), None);
+        assert_eq!(head_symref(b"ref: /etc/passwd\n"), None);
+        assert_eq!(head_symref(b"ref: \n"), None);
+        assert_eq!(head_symref(b"0123456789abcdef\n"), None);
+    }
+
+    #[test]
+    fn git_stamp_detects_commits_amends_pushes_and_reftable() {
+        let (_d, repo) = git_repo();
+        let take = || GitStamp::take(&repo.git_dir, &repo.common_dir);
+
+        let s0 = take();
+        run_git(&repo.root, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let s1 = take();
+        assert_ne!(s0, s1, "commit should change stamp");
+
+        // Same-second amend rewrites the 41-byte loose ref with a new oid.
+        run_git(
+            &repo.root,
+            &["commit", "-q", "--amend", "--allow-empty", "-m", "one-b"],
+        );
+        let s2 = take();
+        assert_ne!(s1, s2, "amend should change stamp");
+
+        // Push to a bare remote updates refs/remotes/origin/<branch>.
+        let bare_dir = tempfile::tempdir().unwrap();
+        run_git(bare_dir.path(), &["init", "-q", "--bare"]);
+        run_git(
+            &repo.root,
+            &["remote", "add", "origin", bare_dir.path().to_str().unwrap()],
+        );
+        let s3 = take();
+        assert_ne!(s2, s3, "adding remote changes config");
+        run_git(&repo.root, &["push", "-q", "-u", "origin", "HEAD"]);
+        let s4 = take();
+        assert_ne!(s3, s4, "push updates remote-tracking ref");
+
+        // Reftable table list updates also change the stamp.
+        write(&repo.common_dir, "reftable/tables.list", "0001.ref\n");
+        let s5 = take();
+        assert_ne!(s4, s5, "reftable update should change stamp");
+        write(&repo.common_dir, "reftable/tables.list", "0002.ref\n");
+        let s6 = take();
+        assert_ne!(s5, s6, "reftable content change should change stamp");
+    }
+
+    #[test]
+    fn safety_poll_catches_missed_commit_without_fs_events() {
+        let (_d, repo) = git_repo();
+        run_git(&repo.root, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let (out_tx, out_rx) = mpsc::channel();
+        let repo_thread = repo.clone();
+        let handle = std::thread::spawn(move || {
+            watch_loop(
+                repo_thread,
+                ev_rx,
+                out_tx,
+                Weak::new(),
+                Mode::Recursive,
+                Duration::from_millis(50),
+            )
+        });
+
+        // Quiet repo: safety poll sends no spurious refreshes.
+        assert!(out_rx.recv_timeout(Duration::from_millis(180)).is_err());
+
+        // External commit with zero notify events delivered.
+        run_git(&repo.root, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        assert!(matches!(
+            out_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(WorkerMsg::Refresh)
+        ));
+        // Only one refresh for the commit.
+        assert!(out_rx.recv_timeout(Duration::from_millis(180)).is_err());
+
+        drop(ev_tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn safety_poll_not_starved_by_ignored_events() {
+        let (_d, repo) = git_repo();
+        write(&repo.root, ".gitignore", "target/\n");
+        run_git(&repo.root, &["add", ".gitignore"]);
+        run_git(&repo.root, &["commit", "-q", "-m", "init"]);
+
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let (out_tx, out_rx) = mpsc::channel();
+        let repo_thread = repo.clone();
+        let handle = std::thread::spawn(move || {
+            watch_loop(
+                repo_thread,
+                ev_rx,
+                out_tx,
+                Weak::new(),
+                Mode::Recursive,
+                Duration::from_millis(80),
+            )
+        });
+
+        run_git(&repo.root, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let ignored = repo.root.join("target/out.o");
+        let start = Instant::now();
+        let mut refreshed = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            let ev =
+                notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(ignored.clone());
+            let _ = ev_tx.send(Ok(ev));
+            if matches!(
+                out_rx.recv_timeout(Duration::from_millis(10)),
+                Ok(WorkerMsg::Refresh)
+            ) {
+                refreshed = true;
+                break;
+            }
+        }
+        assert!(refreshed, "ignored event stream starved safety poll");
+
+        drop(ev_tx);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn rescan_event_triggers_refresh() {
+        let (_d, repo) = git_repo();
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let (out_tx, out_rx) = mpsc::channel();
+        let repo_thread = repo.clone();
+        let handle = std::thread::spawn(move || {
+            watch_loop(
+                repo_thread,
+                ev_rx,
+                out_tx,
+                Weak::new(),
+                Mode::Recursive,
+                Duration::from_secs(60),
+            )
+        });
+
+        let ev = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        ev_tx.send(Ok(ev)).unwrap();
+        assert!(matches!(
+            out_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(WorkerMsg::Refresh)
+        ));
+
+        drop(ev_tx);
+        handle.join().unwrap();
     }
 }
