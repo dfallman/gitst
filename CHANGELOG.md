@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The view keeps up with commits, pushes, fetches, checkouts, staging,
+  and stashes made outside gitst, so the `↑N` count of unpushed commits
+  stays current. If the file watcher misses an event, gitst checks `.git`
+  itself every two seconds instead of waiting for the next timed fetch.
+  Repositories that store refs in reftable are covered too.
+- The clock in the header shows `--:--` for a time out of range instead
+  of failing.
+
 ## 0.2.0 (2026-11-18)
 
 ### Added
